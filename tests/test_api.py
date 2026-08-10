@@ -192,6 +192,32 @@ def test_api_add_to_tbr_creates_book_and_entry(client):
     assert len(entries) == 1
 
 
+def test_api_add_to_tbr_downloads_real_cover_even_when_search_gave_a_placeholder(client, monkeypatch):
+    # Regression test: a search result almost always carries a placeholder cover_url (e.g. an
+    # Open Library thumbnail), which used to suppress the immediate Grimmory cover download
+    # entirely - see library_check._has_local_cover.
+    _logged_in_client(client)
+    calls = []
+    monkeypatch.setattr(
+        main.library_check, "download_cover_for_book_now", lambda book_id, grimmory_id: calls.append((book_id, grimmory_id))
+    )
+
+    response = client.post(
+        "/api/tbr",
+        json={
+            "title": "Dune",
+            "author": "Frank Herbert",
+            "isbn": "9780441172719",
+            "cover_url": "https://covers.openlibrary.org/b/id/1-M.jpg",
+            "grimmory_id": "42",
+        },
+    )
+
+    assert response.status_code == 201
+    book_id = response.json()["book"]["id"]
+    assert calls == [(book_id, 42)]
+
+
 def test_api_remove_from_tbr(client):
     user = _logged_in_client(client)
     conn = models.get_connection()

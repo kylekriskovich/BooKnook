@@ -880,7 +880,11 @@ def api_add_to_tbr(
         published_date=payload.published_date or None,
     )
     entry = add_tbr_entry(db_connection, user.id, book.id)
-    if not payload.cover_url and payload.grimmory_id:
+    # Fetch the real Grimmory cover in the background whenever we know the grimmory_id, even if
+    # payload.cover_url already carried a search-result placeholder (e.g. an Open Library
+    # thumbnail) - the real cover should win over that placeholder rather than waiting for the
+    # next periodic sync to notice and replace it (see library_check._has_local_cover).
+    if payload.grimmory_id:
         try:
             grimmory_id_int = int(payload.grimmory_id)
         except ValueError:

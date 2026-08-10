@@ -198,11 +198,38 @@ def test_fetch_catalog_backfills_missing_cover_for_matched_local_book(
     assert (covers_tmp_dir / f"{book.id}.png").read_bytes() == b"png-bytes"
 
 
-def test_fetch_catalog_skips_cover_download_but_still_sets_grimmory_id_when_book_already_has_cover(
+def test_fetch_catalog_replaces_placeholder_cover_with_real_grimmory_cover(
+    conn, configured_settings, covers_tmp_dir, monkeypatch
+):
+    # A cover_url that isn't under /covers/ is a search-result placeholder (e.g. an Open Library
+    # thumbnail stored at add time, see POST /tbr) rather than an already-downloaded Grimmory
+    # cover, so it should still get replaced once the book is matched to the catalog.
+    book = models.create_book(
+        conn, title="Dune", author="Frank Herbert", isbn="9780441172719", cover_url="https://covers.openlibrary.org/b/id/1-M.jpg"
+    )
+    books_payload = [
+        {
+            "id": 42,
+            "metadata": {"title": "Dune", "isbn13": "9780441172719", "authors": ["Frank Herbert"]},
+        }
+    ]
+    books_client = FakeClient(books_payload=books_payload)
+    cover_response = FakeCoverResponse(content=b"png-bytes", content_type="image/png")
+    routing_client = RoutingFakeClient(books_client, cover_response)
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: routing_client)
+
+    library_check.fetch_catalog(conn)
+
+    updated = models.get_book(conn, book.id)
+    assert updated.cover_url == f"/covers/{book.id}.png"
+    assert updated.grimmory_book_id == 42
+
+
+def test_fetch_catalog_skips_cover_download_when_local_cover_already_downloaded(
     conn, configured_settings, covers_tmp_dir, monkeypatch
 ):
     book = models.create_book(
-        conn, title="Dune", author="Frank Herbert", isbn="9780441172719", cover_url="/static/existing.jpg"
+        conn, title="Dune", author="Frank Herbert", isbn="9780441172719", cover_url="/covers/existing.jpg"
     )
     books_payload = [
         {
@@ -217,8 +244,8 @@ def test_fetch_catalog_skips_cover_download_but_still_sets_grimmory_id_when_book
     library_check.fetch_catalog(conn)
 
     updated = models.get_book(conn, book.id)
-    assert updated.cover_url == "/static/existing.jpg"  # unchanged
-    assert updated.grimmory_book_id == 42  # set even though the cover download was skipped
+    assert updated.cover_url == "/covers/existing.jpg"  # unchanged - already a local Grimmory cover
+    assert updated.grimmory_book_id == 42  # still set even though the cover download was skipped
 
 
 # --- check_ownership ---
@@ -674,10 +701,34 @@ def test_sync_downloads_cover_for_imported_book(conn, covers_tmp_dir, monkeypatc
     assert (covers_tmp_dir / f"{entries[0].book.id}.png").read_bytes() == b"png-bytes"
 
 
-def test_sync_skips_cover_download_when_book_already_has_one(conn, covers_tmp_dir, monkeypatch):
+def test_sync_replaces_placeholder_cover_with_real_grimmory_cover(conn, covers_tmp_dir, monkeypatch):
     user = models.get_or_create_user(conn, "alice")
     book = models.create_book(
-        conn, title="Dune", author="Frank Herbert", isbn="9780441172719", cover_url="/static/existing.jpg"
+        conn, title="Dune", author="Frank Herbert", isbn="9780441172719", cover_url="https://covers.openlibrary.org/b/id/1-M.jpg"
+    )
+    models.add_tbr_entry(conn, user.id, book.id)
+    books_payload = [
+        {
+            "id": 42,
+            "metadata": {"title": "Dune", "isbn13": "9780441172719", "authors": ["Frank Herbert"]},
+            "readStatus": "READING",
+        }
+    ]
+    books_client = FakeClient(books_payload=books_payload)
+    cover_response = FakeCoverResponse(content=b"png-bytes", content_type="image/png")
+    routing_client = RoutingFakeClient(books_client, cover_response)
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: routing_client)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entries = models.list_tbr_entries_with_books(conn, user.id)
+    assert entries[0].book.cover_url == f"/covers/{book.id}.png"
+
+
+def test_sync_skips_cover_download_when_local_cover_already_downloaded(conn, covers_tmp_dir, monkeypatch):
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(
+        conn, title="Dune", author="Frank Herbert", isbn="9780441172719", cover_url="/covers/existing.jpg"
     )
     models.add_tbr_entry(conn, user.id, book.id)
     books_payload = [
@@ -694,7 +745,7 @@ def test_sync_skips_cover_download_when_book_already_has_one(conn, covers_tmp_di
     library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
 
     entries = models.list_tbr_entries_with_books(conn, user.id)
-    assert entries[0].book.cover_url == "/static/existing.jpg"  # unchanged
+    assert entries[0].book.cover_url == "/covers/existing.jpg"  # unchanged - already a local Grimmory cover
 
 
 # --- fetch_reading_sessions_for_book ---

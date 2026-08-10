@@ -42,6 +42,16 @@ COVER_PATH = "/api/v1/media/book/{book_id}/cover"
 READING_SESSIONS_PATH = "/api/v1/reading-sessions/book/{book_id}"
 READING_SESSIONS_PAGE_SIZE = 100
 
+# Prefix set_book_cover_url always writes (see _maybe_download_cover) - distinguishes an already
+#-downloaded Grimmory cover from a book/isbn-search placeholder (e.g. an Open Library thumbnail
+# stored straight off a search result, see POST /tbr), which should still be replaced once we know
+# the real Grimmory cover, rather than treated as "already has a cover, don't bother".
+COVER_URL_PREFIX = "/covers/"
+
+
+def _has_local_cover(cover_url: Optional[str]) -> bool:
+    return bool(cover_url) and cover_url.startswith(COVER_URL_PREFIX)
+
 DEFAULT_SYNC_INTERVAL_MINUTES = 60
 POLL_INTERVAL_WHEN_UNCONFIGURED_SECONDS = 60
 
@@ -158,7 +168,9 @@ def fetch_catalog(db_connection) -> list[LibraryCatalogEntry]:
 # Function Name: _apply_catalog_matches_to_local_books
 # Description: For every local book that matches a freshly-fetched Grimmory catalog entry,
 #   records the catalog entry's grimmory id (same "always overwritten from Grimmory" convention
-#   as _sync_book_metadata) and best-effort fills in a cover if the book doesn't have one yet.
+#   as _sync_book_metadata) and best-effort fills in the real Grimmory cover, unless one's already
+#   been downloaded locally (see _has_local_cover - a search-result placeholder cover doesn't count
+#   and gets replaced).
 # Parameters:
 # - db_connection: Database connection.
 # - base_url (str): Grimmory base URL.
@@ -173,7 +185,7 @@ def _apply_catalog_matches_to_local_books(
         if match is None or match.grimmory_id is None:
             continue
         set_book_grimmory_id(db_connection, book.id, match.grimmory_id)
-        if not book.cover_url:
+        if not _has_local_cover(book.cover_url):
             _maybe_download_cover(db_connection, base_url, access_token, book.id, match.grimmory_id)
 
 # Function Name: _normalize_isbn
@@ -459,8 +471,9 @@ def sync_user_reading_status(
 
     # Pass 1: match Grimmory books against existing tbr_entries (by ISBN, then fuzzy title+author)
     # and update status/finished_at, or remove a "reading" entry outright if Grimmory now says
-    # WONT_READ/ABANDONED. Also downloads a cover (see fetch_book_cover/_maybe_download_cover) for
-    # any matched book that doesn't already have one.
+    # WONT_READ/ABANDONED. Also downloads the real Grimmory cover (see
+    # fetch_book_cover/_maybe_download_cover) for any matched book that doesn't have one locally
+    # yet - see _has_local_cover.
     for entry in list_tbr_entries_with_books(db_connection, user_id):
         match = find_catalog_match(entry.book.title, entry.book.isbn, entry.book.author, catalog)
         if match is None:
@@ -480,7 +493,7 @@ def sync_user_reading_status(
         target = _target_status(book)
         if target is not None:
             _apply_status(db_connection, entry.id, entry.status, entry.started_at, target, book)
-        if not entry.book.cover_url:
+        if not _has_local_cover(entry.book.cover_url):
             _maybe_download_cover(
                 db_connection, base_url, access_token, entry.book.id, book.get("id")
             )
