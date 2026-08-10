@@ -243,9 +243,11 @@ def test_burndown_points_sorted_and_deduplicated_by_day():
         _session("2026-01-01", 10, 15, hour="20"),  # later same-day session wins
     ]
     points = stat_tiles.burndown_points(sessions)
-    assert [d.isoformat() for d, _ in points] == ["2026-01-01", "2026-01-02"]
-    assert points[0][1] == 85  # 100 - 15 = 85% remaining
-    assert points[1][1] == 80  # 100 - 20 = 80% remaining
+    # A synthetic 100%-remaining point is prepended the day before the first real session — see
+    # test_burndown_points_prepends_100_percent_day_before_first_session for that behavior itself.
+    assert [d.isoformat() for d, _ in points] == ["2025-12-31", "2026-01-01", "2026-01-02"]
+    assert points[1][1] == 85  # 100 - 15 = 85% remaining
+    assert points[2][1] == 80  # 100 - 20 = 80% remaining
 
 
 def test_burndown_points_excludes_zero_delta_sessions():
@@ -255,7 +257,18 @@ def test_burndown_points_excludes_zero_delta_sessions():
         _session("2026-01-03", 10, 20),
     ]
     points = stat_tiles.burndown_points(sessions)
-    assert [d.isoformat() for d, _ in points] == ["2026-01-01", "2026-01-03"]
+    assert [d.isoformat() for d, _ in points] == ["2025-12-31", "2026-01-01", "2026-01-03"]
+
+
+def test_burndown_points_prepends_100_percent_day_before_first_session():
+    # The chart should always burn down from 0% read (100% remaining) rather than starting at
+    # whatever was already left after the first day's own session — otherwise progress reads as
+    # having appeared out of nowhere instead of being visibly made on day one.
+    sessions = [_session("2026-01-05", 0, 15)]
+    points = stat_tiles.burndown_points(sessions)
+    assert [d.isoformat() for d, _ in points] == ["2026-01-04", "2026-01-05"]
+    assert points[0][1] == 100
+    assert points[1][1] == 85  # 100 - 15 = 85% remaining after the first session
 
 
 # --- burndown_svg_points ---

@@ -9,6 +9,6 @@
 	<title>{data.shelf.label} — Book Knook</title>
 </svelte:head>
 
-<ShelfList label={data.shelf.label} entries={data.shelf.entries} />
+<ShelfList status={data.shelf.status} label={data.shelf.label} entries={data.shelf.entries} />
 
 <AddSheet />

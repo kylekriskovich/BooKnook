@@ -54,6 +54,7 @@ from app.models import (
     set_tbr_entry_finished_at,
     set_tbr_entry_started_at,
     set_view_preference,
+    set_wanted_order,
     upsert_goal,
 )
 
@@ -272,11 +273,15 @@ def _entries_for_shelf(entries, status: str, year: int):
     """Entries for one shelf — for "finished", also restricted to finished_at falling within
     the given year, matching the "Finished in {year}" label (status alone isn't enough; a
     'finished' entry from a prior year shouldn't show up here), and sorted most-recently-finished
-    first rather than the default added_at-DESC ordering."""
+    first rather than the default added_at-DESC ordering. "wanted" sorts by the user's own manual
+    order instead (see models.py:set_wanted_order) — sort_order is never None for a live wanted
+    entry once init_db's backfill has run, so this doesn't need a None-safe fallback."""
     matching = [e for e in entries if e.status == status]
     if status == "finished":
         matching = [e for e in matching if e.finished_at and e.finished_at.startswith(str(year))]
         matching.sort(key=_finished_at_sort_key, reverse=True)
+    elif status == "wanted":
+        matching.sort(key=lambda e: e.sort_order)
     return matching
 
 
@@ -572,6 +577,13 @@ def api_home(user: User = Depends(require_user), db_connection: sqlite3.Connecti
     )
 
 
+def _shelf_out(db_connection, user_id: int, status: str, year: int) -> schemas.ShelfOut:
+    entries = _entries_for_shelf(_tbr_entries_for_user(db_connection, user_id), status, year)
+    return schemas.ShelfOut(
+        status=status, label=_shelf_label(status, year), entries=[_to_entry_out(e) for e in entries]
+    )
+
+
 @app.get("/api/shelf/{status}", response_model=schemas.ShelfOut)
 def api_shelf(
     status: str,
@@ -580,11 +592,17 @@ def api_shelf(
 ):
     if status not in SHELF_STATUSES:
         raise HTTPException(status_code=404, detail="Unknown shelf")
-    year = datetime.now(timezone.utc).year
-    entries = _entries_for_shelf(_tbr_entries_for_user(db_connection, user.id), status, year)
-    return schemas.ShelfOut(
-        status=status, label=_shelf_label(status, year), entries=[_to_entry_out(e) for e in entries]
-    )
+    return _shelf_out(db_connection, user.id, status, datetime.now(timezone.utc).year)
+
+
+@app.post("/api/shelf/wanted/reorder", response_model=schemas.ShelfOut)
+def api_reorder_wanted_shelf(
+    payload: schemas.ReorderIn,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    set_wanted_order(db_connection, user.id, payload.entry_ids)
+    return _shelf_out(db_connection, user.id, "wanted", datetime.now(timezone.utc).year)
 
 
 @app.post("/api/onboarding", response_model=schemas.MeOut)

@@ -278,10 +278,19 @@ def burndown_points(sessions: list[dict]) -> list[tuple[date, int]]:
     for _, day, end_progress in dated:
         by_date[day] = end_progress  # later entries for the same day overwrite earlier ones
 
-    return [
+    points = [
         (day, round(100.0 - progress))
         for day, progress in sorted(by_date.items())
     ]
+    if points:
+        # Synthetic "Day 0" point at 100% remaining, the day before the first logged session.
+        # Without it the first plotted point already reflects whatever was left after *that*
+        # day's own session (e.g. 85% remaining after an evening spent reading), which reads as
+        # progress appearing out of nowhere rather than the line burning down from the actual
+        # start of the book.
+        first_day = points[0][0]
+        points.insert(0, (first_day - timedelta(days=1), 100))
+    return points
 
 
 def burndown_svg_points(points: list[tuple[date, int]], width: int = 300, height: int = 100) -> str:

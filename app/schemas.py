@@ -254,6 +254,13 @@ class TBRDatesIn(BaseModel):
     finished_at: str = ""
 
 
+class ReorderIn(BaseModel):
+    """Entry ids for the "wanted" shelf in the desired order (first = top of the shelf) — see
+    models.py:set_wanted_order, which scopes the update to the caller's own wanted entries only."""
+
+    entry_ids: list[int]
+
+
 class ViewPreferenceIn(BaseModel):
     view: str
 

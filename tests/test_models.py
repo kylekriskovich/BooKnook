@@ -94,6 +94,98 @@ def test_remove_tbr_entry(conn):
     assert models.list_tbr_entries_for_user(conn, user.id) == []
 
 
+# --- wanted-shelf manual ordering ---
+
+
+def test_add_tbr_entry_first_wanted_entry_gets_sort_order_zero(conn):
+    user = models.create_user(conn, "Alice")
+    book = models.create_book(conn, "Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id)
+    assert entry.sort_order == 0
+
+
+def test_add_tbr_entry_new_wanted_entries_go_to_the_top(conn):
+    user = models.create_user(conn, "Alice")
+    dune = models.create_book(conn, "Dune")
+    hobbit = models.create_book(conn, "The Hobbit")
+    first = models.add_tbr_entry(conn, user.id, dune.id)
+    second = models.add_tbr_entry(conn, user.id, hobbit.id)
+    assert second.sort_order < first.sort_order
+
+
+def test_add_tbr_entry_leaves_sort_order_none_for_non_wanted_status(conn):
+    user = models.create_user(conn, "Alice")
+    book = models.create_book(conn, "Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="reading")
+    assert entry.sort_order is None
+
+
+def test_init_db_backfills_sort_order_for_legacy_wanted_entries(conn):
+    # Simulates rows written before sort_order existed (NULL), inserted directly to bypass
+    # add_tbr_entry's own sort_order handling — same scenario a pre-upgrade database is in.
+    user = models.create_user(conn, "Alice")
+    older = models.create_book(conn, "Older Book")
+    newer = models.create_book(conn, "Newer Book")
+    conn.execute(
+        "INSERT INTO tbr_entries (user_id, book_id, status, added_at, sort_order) "
+        "VALUES (?, ?, 'wanted', '2026-01-01T00:00:00', NULL)",
+        (user.id, older.id),
+    )
+    conn.execute(
+        "INSERT INTO tbr_entries (user_id, book_id, status, added_at, sort_order) "
+        "VALUES (?, ?, 'wanted', '2026-01-02T00:00:00', NULL)",
+        (user.id, newer.id),
+    )
+    conn.commit()
+
+    models.init_db(conn)  # re-run the (idempotent) backfill
+
+    entries = {e.book_id: e for e in models.list_tbr_entries_for_user(conn, user.id)}
+    assert entries[newer.id].sort_order < entries[older.id].sort_order  # newest-added sorts first
+
+    # Idempotent: running it again doesn't change already-backfilled values.
+    before = {e.book_id: e.sort_order for e in models.list_tbr_entries_for_user(conn, user.id)}
+    models.init_db(conn)
+    after = {e.book_id: e.sort_order for e in models.list_tbr_entries_for_user(conn, user.id)}
+    assert before == after
+
+
+def test_set_wanted_order_reorders_by_index(conn):
+    user = models.create_user(conn, "Alice")
+    a = models.add_tbr_entry(conn, user.id, models.create_book(conn, "A").id)
+    b = models.add_tbr_entry(conn, user.id, models.create_book(conn, "B").id)
+    c = models.add_tbr_entry(conn, user.id, models.create_book(conn, "C").id)
+
+    models.set_wanted_order(conn, user.id, [b.id, c.id, a.id])
+
+    entries = {e.id: e.sort_order for e in models.list_tbr_entries_for_user(conn, user.id)}
+    assert entries[b.id] < entries[c.id] < entries[a.id]
+
+
+def test_set_wanted_order_does_not_touch_another_users_entries(conn):
+    alice = models.create_user(conn, "Alice")
+    bob = models.create_user(conn, "Bob")
+    book = models.create_book(conn, "Dune", isbn="9780441172719")
+    bobs_entry = models.add_tbr_entry(conn, bob.id, book.id)
+    original_sort_order = bobs_entry.sort_order
+
+    # Alice tries to reorder using Bob's entry id — scoped update must silently no-op it.
+    models.set_wanted_order(conn, alice.id, [bobs_entry.id])
+
+    refreshed = models.get_tbr_entry(conn, bobs_entry.id)
+    assert refreshed.sort_order == original_sort_order
+
+
+def test_set_wanted_order_does_not_touch_non_wanted_entries(conn):
+    user = models.create_user(conn, "Alice")
+    book = models.create_book(conn, "Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="reading")
+
+    models.set_wanted_order(conn, user.id, [entry.id])
+
+    assert models.get_tbr_entry(conn, entry.id).sort_order is None
+
+
 def test_list_all_tbr_entries_across_users(conn):
     alice = models.create_user(conn, "Alice")
     bob = models.create_user(conn, "Bob")

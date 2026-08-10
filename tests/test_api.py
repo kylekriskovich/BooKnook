@@ -267,6 +267,64 @@ def test_api_set_tbr_dates_marks_started_at_manual(client):
     assert body["started_at_manual"] is True
 
 
+def test_api_reorder_wanted_shelf(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    a = models.add_tbr_entry(conn, user.id, models.create_book(conn, title="A").id)
+    b = models.add_tbr_entry(conn, user.id, models.create_book(conn, title="B").id)
+    c = models.add_tbr_entry(conn, user.id, models.create_book(conn, title="C").id)
+    conn.close()
+
+    response = client.post("/api/shelf/wanted/reorder", json={"entry_ids": [b.id, c.id, a.id]})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [e["book"]["title"] for e in body["entries"]] == ["B", "C", "A"]
+
+    # Persisted, not just reflected in the immediate response.
+    refreshed = client.get("/api/shelf/wanted")
+    assert [e["book"]["title"] for e in refreshed.json()["entries"]] == ["B", "C", "A"]
+
+    # Home page's wanted shelf reflects the same order.
+    home = client.get("/api/home")
+    home_wanted = next(s for s in home.json()["shelves"] if s["status"] == "wanted")
+    assert [e["book"]["title"] for e in home_wanted["entries"]] == ["B", "C", "A"]
+
+
+def test_api_reorder_wanted_shelf_cannot_touch_another_users_entry(client):
+    owner = _make_user("Owner")
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    owners_entry = models.add_tbr_entry(conn, owner.id, book.id)
+    conn.close()
+
+    _logged_in_client(client)  # a different user ("Alice")
+    response = client.post("/api/shelf/wanted/reorder", json={"entry_ids": [owners_entry.id]})
+
+    assert response.status_code == 200  # silently no-ops the id it doesn't own, not an error
+    conn = models.get_connection()
+    untouched = models.get_tbr_entry(conn, owners_entry.id)
+    conn.close()
+    assert untouched.sort_order == owners_entry.sort_order
+
+
+def test_api_reorder_wanted_shelf_ignores_non_wanted_entry_ids(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    reading_entry = models.add_tbr_entry(
+        conn, user.id, models.create_book(conn, title="Reading Book").id, status="reading"
+    )
+    conn.close()
+
+    response = client.post("/api/shelf/wanted/reorder", json={"entry_ids": [reading_entry.id]})
+
+    assert response.status_code == 200
+    conn = models.get_connection()
+    untouched = models.get_tbr_entry(conn, reading_entry.id)
+    conn.close()
+    assert untouched.sort_order is None
+
+
 # --- book detail ---
 
 
@@ -305,7 +363,10 @@ def test_api_book_detail_includes_tiles_and_burndown(client, monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["progress_percent"] == 10.0
-    assert body["burndown"] == [{"date": "2026-01-01", "remaining_percent": 90}]
+    assert body["burndown"] == [
+        {"date": "2025-12-31", "remaining_percent": 100},
+        {"date": "2026-01-01", "remaining_percent": 90},
+    ]
     assert any(t["label"] == "Reading Days" for t in body["tiles"])
 
 

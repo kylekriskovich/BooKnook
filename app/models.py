@@ -80,6 +80,10 @@ CREATE TABLE IF NOT EXISTS books (
 -- leave a plain non-null value indistinguishable from a manual one. rating mirrors Grimmory's own
 -- personalRating (1-5, nullable) — like page_count, this is plain metadata already present in the
 -- reading-status sync response, always overwritten from Grimmory, not user-editable in this app.
+-- sort_order is a user-chosen manual ordering, meaningful only for status='wanted' (see
+-- set_wanted_order) — lower sorts earlier. NULL until backfilled/set (see init_db's backfill and
+-- add_tbr_entry), never NULL for a live wanted entry afterward. reading/finished ignore this
+-- entirely (they order by added_at/finished_at instead — see app/main.py:_entries_for_shelf).
 CREATE TABLE IF NOT EXISTS tbr_entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id),
@@ -90,6 +94,7 @@ CREATE TABLE IF NOT EXISTS tbr_entries (
     started_at TEXT,
     started_at_manual INTEGER NOT NULL DEFAULT 0,
     rating INTEGER,
+    sort_order INTEGER,
     UNIQUE(user_id, book_id)
 );
 
@@ -240,6 +245,27 @@ def init_db(db_connection: sqlite3.Connection) -> None:
             db_connection.execute(f"ALTER TABLE users DROP COLUMN {column}")
         except sqlite3.OperationalError:
             pass  # already dropped, or never existed on a fresh database
+    try:
+        db_connection.execute("ALTER TABLE tbr_entries ADD COLUMN sort_order INTEGER")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    # One-time backfill for wanted entries that predate sort_order — numbers each user's own
+    # wanted shelf by their current added_at DESC order (preserving today's effective order across
+    # the upgrade instead of scrambling it), 0 = first. Only touches sort_order IS NULL rows, so
+    # this is a no-op on every init_db() call after the first — new entries always get a
+    # non-null sort_order from add_tbr_entry itself, never relying on this running again.
+    db_connection.execute(
+        """
+        UPDATE tbr_entries
+        SET sort_order = ranked.rn
+        FROM (
+            SELECT id, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY added_at DESC) - 1 AS rn
+            FROM tbr_entries
+            WHERE status = 'wanted' AND sort_order IS NULL
+        ) AS ranked
+        WHERE tbr_entries.id = ranked.id
+        """
+    )
     db_connection.commit()
 
 
@@ -278,6 +304,7 @@ class TBREntry:
     started_at: Optional[str] = None
     started_at_manual: bool = False
     rating: Optional[int] = None
+    sort_order: Optional[int] = None
 
 
 @dataclass
@@ -291,6 +318,7 @@ class TBREntryDetail:
     started_at: Optional[str] = None
     started_at_manual: bool = False
     rating: Optional[int] = None
+    sort_order: Optional[int] = None
 
 
 @dataclass
@@ -381,6 +409,7 @@ def _row_to_tbr_entry(row: sqlite3.Row) -> TBREntry:
         started_at=row["started_at"],
         started_at_manual=bool(row["started_at_manual"]),
         rating=row["rating"],
+        sort_order=row["sort_order"],
     )
 
 
@@ -511,7 +540,7 @@ def list_tbr_entries_with_books(db_connection: sqlite3.Connection, user_id: int)
         """
         SELECT tbr_entries.id AS entry_id, tbr_entries.status, tbr_entries.added_at,
                tbr_entries.finished_at, tbr_entries.started_at, tbr_entries.started_at_manual,
-               tbr_entries.rating,
+               tbr_entries.rating, tbr_entries.sort_order,
                books.id AS book_id, books.title, books.author, books.isbn, books.cover_url,
                books.published_date, books.page_count, books.grimmory_book_id, books.cover_color
         FROM tbr_entries
@@ -530,6 +559,7 @@ def list_tbr_entries_with_books(db_connection: sqlite3.Connection, user_id: int)
             started_at=row["started_at"],
             started_at_manual=bool(row["started_at_manual"]),
             rating=row["rating"],
+            sort_order=row["sort_order"],
             book=Book(
                 id=row["book_id"],
                 title=row["title"],
@@ -578,9 +608,20 @@ def list_aggregate_tbr(db_connection: sqlite3.Connection) -> list[AggregateTBREn
 
 
 def add_tbr_entry(db_connection: sqlite3.Connection, user_id: int, book_id: int, status: str = "wanted") -> TBREntry:
+    # New wanted entries go to the *top* of the manually-ordered shelf (lowest sort_order sorts
+    # first — see set_wanted_order), matching the pre-ordering default of newest-added-first until
+    # the user drags it elsewhere. Left NULL for reading/finished, which never read sort_order.
+    sort_order = None
+    if status == "wanted":
+        row = db_connection.execute(
+            "SELECT MIN(sort_order) AS min_order FROM tbr_entries WHERE user_id = ? AND status = 'wanted'",
+            (user_id,),
+        ).fetchone()
+        sort_order = (row["min_order"] - 1) if row["min_order"] is not None else 0
+
     cur = db_connection.execute(
-        "INSERT OR IGNORE INTO tbr_entries (user_id, book_id, status) VALUES (?, ?, ?)",
-        (user_id, book_id, status),
+        "INSERT OR IGNORE INTO tbr_entries (user_id, book_id, status, sort_order) VALUES (?, ?, ?, ?)",
+        (user_id, book_id, status, sort_order),
     )
     db_connection.commit()
     if cur.lastrowid and cur.rowcount:
@@ -621,6 +662,18 @@ def set_tbr_entry_finished_at(
 ) -> None:
     db_connection.execute(
         "UPDATE tbr_entries SET finished_at = ? WHERE id = ?", (finished_at, entry_id)
+    )
+    db_connection.commit()
+
+
+def set_wanted_order(db_connection: sqlite3.Connection, user_id: int, entry_ids: list[int]) -> None:
+    """Sets sort_order for each id in entry_ids to its index in that list (0 = first). Scoped to
+    `WHERE user_id = ? AND status = 'wanted'` so a request can't reorder another user's entries or
+    silently repurpose this to reorder a reading/finished entry, which ignores sort_order entirely
+    (see SCHEMA_SQL's comment on the column)."""
+    db_connection.executemany(
+        "UPDATE tbr_entries SET sort_order = ? WHERE id = ? AND user_id = ? AND status = 'wanted'",
+        [(index, entry_id, user_id) for index, entry_id in enumerate(entry_ids)],
     )
     db_connection.commit()
 
