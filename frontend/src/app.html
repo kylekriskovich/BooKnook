@@ -7,6 +7,15 @@
 		<meta name="theme-color" content="#12181c" />
 		<link rel="icon" href="/icons/favicon-32.png" sizes="32x32" type="image/png" />
 		<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+		<!-- iOS Safari ignores the web manifest's display:"standalone" for "Add to Home Screen" —
+		     it needs these Apple-specific tags instead to actually launch without browser chrome.
+		     status-bar-style is "black" (opaque), not "black-translucent", because the CSS here has
+		     no safe-area-inset-top handling yet — translucent would draw the status bar over the
+		     site header instead of above it. -->
+		<meta name="apple-mobile-web-app-capable" content="yes" />
+		<meta name="mobile-web-app-capable" content="yes" />
+		<meta name="apple-mobile-web-app-status-bar-style" content="black" />
+		<meta name="apple-mobile-web-app-title" content="Book Knook" />
 		%sveltekit.head%
 	</head>
 	<body data-sveltekit-preload-data="hover">
