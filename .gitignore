@@ -1,0 +1,22 @@
+# Env / secrets — see .env.example for the template committed instead
+.env
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
+
+# App data — SQLite db + downloaded covers, generated at runtime (local dev only; in Docker these
+# live in the booknook-data volume, never in the repo)
+tbr.db
+covers/
+
+# Frontend build output (frontend/ has its own .gitignore for node_modules/.svelte-kit/build;
+# this covers the Dockerfile's COPY destination if ever built to the repo root by hand)
+frontend-dist/
+
+# OS
+.DS_Store

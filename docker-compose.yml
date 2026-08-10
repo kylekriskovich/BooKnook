@@ -1,0 +1,23 @@
+services:
+  booknook:
+    build: .
+    container_name: booknook
+    restart: unless-stopped
+    # Host-side port comes from TBR_PORT (see .env.example), defaulting to 8011 if unset.
+    # No shared Docker network with NPM/KriskoLib yet, so this is reached via the host's
+    # LAN IP + published port from the NPM proxy host config (see DEPLOYMENT.md).
+    ports:
+      - "${TBR_PORT:-8011}:8000"
+    environment:
+      # Where TBR sends login attempts (see .env.example) and the key used to sign session
+      # cookies — both required for real Grimmory-backed login to work.
+      - GRIMMORY_BASE_URL=${GRIMMORY_BASE_URL}
+      - TBR_SECRET_KEY=${TBR_SECRET_KEY}
+      # Grimmory username whose nav settings icon shortcuts to /admin (UI convenience only —
+      # /admin itself is still gated externally, not by this).
+      - TBR_ADMIN_USERNAME=${TBR_ADMIN_USERNAME}
+    volumes:
+      - booknook-data:/data
+
+volumes:
+  booknook-data:
