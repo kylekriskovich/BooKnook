@@ -9,12 +9,18 @@
 
 ## Docker (recommended)
 
-1. Clone the repo:
+`docker-compose.yml`'s `build` points straight at this repo's `latest` tag on GitHub, not a local
+checkout — you only need `docker-compose.yml` and your own `.env` on disk, not a full clone (though
+cloning is the easiest way to grab both).
+
+1. Get `docker-compose.yml` and `.env.example` — either clone the repo:
 
    ```bash
    git clone https://github.com/kylekriskovich/BooKnook.git
    cd BooKnook
    ```
+
+   or just download those two files directly if you don't want a local checkout at all.
 
 2. Copy the env template and fill it in:
 
@@ -36,6 +42,29 @@
    ```
 
 4. Visit `http://localhost:<TBR_PORT>` and log in with your Grimmory username/password.
+
+To update later, just rebuild — no need to re-clone or `git pull` first:
+
+```bash
+docker compose up -d --build
+```
+
+### Releasing a new version (maintainers)
+
+Releases are plain semver git tags (e.g. `v0.1.0-alpha`), plus a `latest` tag that's deliberately
+moved to point at whichever release is current — that's what `docker-compose.yml`'s build context
+tracks (`...git#latest`), rather than `main` directly, so pushing to `main` alone never changes
+what a deployed instance builds.
+
+```bash
+git tag v0.1.0-alpha
+git push origin v0.1.0-alpha
+
+git tag -f latest v0.1.0-alpha   # -f: moves the tag if it already points elsewhere
+git push origin latest --force
+```
+
+Anyone who then runs `docker compose up -d --build` picks up that release.
 
 ### Securing `/admin`
 
