@@ -92,7 +92,7 @@
 		<div id="library-results">
 			<div class="settings-section-title">In your library</div>
 			<ul class="search-results-list">
-				{#each libraryResults as result (result.isbn ?? result.title)}
+				{#each libraryResults as result, index (index)}
 					<ResultCard {result} />
 				{/each}
 			</ul>
@@ -104,7 +104,7 @@
 			<p class="error">{searchErrorMessage ?? 'Search failed — try again.'}</p>
 		{:else if results.length}
 			<ul class="search-results-list">
-				{#each results as result (result.isbn ?? result.title)}
+				{#each results as result, index (index)}
 					<ResultCard {result} />
 				{/each}
 			</ul>
@@ -119,7 +119,7 @@
 				<p class="error">Open Library search failed — try again.</p>
 			{:else if moreResults.length}
 				<ul class="search-results-list">
-					{#each moreResults as result (result.isbn ?? result.title)}
+					{#each moreResults as result, index (index)}
 						<ResultCard {result} />
 					{/each}
 				</ul>

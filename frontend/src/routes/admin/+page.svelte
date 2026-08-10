@@ -62,7 +62,7 @@
 	<div class="admin-view-needed-section">
 		{#if data.admin.needed_entries.length}
 			<ul class="admin-entries">
-				{#each data.admin.needed_entries as row (row.title)}
+				{#each data.admin.needed_entries as row, index (index)}
 					<AdminEntry {row} />
 				{/each}
 			</ul>
@@ -74,7 +74,7 @@
 	<div class="admin-view-owned-section">
 		{#if data.admin.owned_entries.length}
 			<ul class="admin-entries">
-				{#each data.admin.owned_entries as row (row.title)}
+				{#each data.admin.owned_entries as row, index (index)}
 					<AdminEntry {row} hideWantedBy />
 				{/each}
 			</ul>
@@ -84,7 +84,7 @@
 	</div>
 {:else}
 	<ul class="admin-entries">
-		{#each data.admin.needed_entries as row (row.title)}
+		{#each data.admin.needed_entries as row, index (index)}
 			<AdminEntry {row} />
 		{/each}
 	</ul>
