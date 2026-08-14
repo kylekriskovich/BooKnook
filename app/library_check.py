@@ -10,6 +10,7 @@ import httpx
 from rapidfuzz import fuzz
 
 from app.models import (
+    Book,
     LibraryCatalogEntry,
     add_tbr_entry,
     covers_dir,
@@ -195,7 +196,7 @@ def _apply_catalog_matches_to_local_books(
     db_connection, base_url: str, access_token: str, catalog: list[LibraryCatalogEntry]
 ) -> None:
     for book in list_books(db_connection):
-        match = find_catalog_match(book.title, book.isbn, book.author, catalog)
+        match = resolve_catalog_match(book, catalog)
         if match is None or match.grimmory_id is None:
             continue
         set_book_grimmory_id(db_connection, book.id, match.grimmory_id)
@@ -241,6 +242,54 @@ def find_catalog_match(
         if author_score >= AUTHOR_MATCH_THRESHOLD:
             return entry
 
+    return None
+
+# Function Name: resolve_catalog_match
+# Description: Finds the catalog entry a book should be considered to own — an admin-asserted
+#   manual pin (see POST /api/admin/books/{id}/match) always wins over the fuzzy matcher.
+# Parameters:
+# - book (Book): The local book to resolve a match for.
+# - catalog (list[LibraryCatalogEntry]): Catalog entries to search.
+# Returns: Matching catalog entry, or None if no match is found.
+def resolve_catalog_match(book: Book, catalog: list[LibraryCatalogEntry]) -> Optional[LibraryCatalogEntry]:
+    if book.manual_match_grimmory_id is not None:
+        # Looked up by grimmory_id in the given catalog, never by book.grimmory_book_id - that
+        # column may be stale relative to `catalog` (this is only ever computed against a
+        # freshly-fetched/cached catalog list). If the pin points at a book Grimmory no longer has
+        # (or the local catalog cache just hasn't caught up yet), this returns None rather than
+        # silently falling back to a guess - an admin can always rematch.
+        for entry in catalog:
+            if entry.grimmory_id == book.manual_match_grimmory_id:
+                return entry
+        return None
+    return find_catalog_match(book.title, book.isbn, book.author, catalog)
+
+# Function Name: find_owning_book_id
+# Description: Finds which local book (if any) currently owns a given Grimmory catalog id, via
+#   either a manual match or an auto-match - used to block matching the same catalog book to two
+#   different needed entries.
+# Parameters:
+# - db_connection: Database connection.
+# - grimmory_id (int): The Grimmory book id being claimed.
+# - exclude_book_id (Optional[int]): A book id to skip - lets a book be re-confirmed against its
+#   own already-matched entry without tripping the conflict check.
+# Returns: The owning book's local id, or None if unowned.
+def find_owning_book_id(
+    db_connection, grimmory_id: int, exclude_book_id: Optional[int] = None
+) -> Optional[int]:
+    # Compares against each book's own persisted claim (manual pin, else grimmory_book_id) rather
+    # than routing through resolve_catalog_match/a freshly-loaded catalog list - that would only
+    # detect a conflict when the target id happens to still be present in whatever catalog was
+    # passed in, which is unnecessarily fragile against a stale/just-resynced cache. The persisted
+    # columns are the actual source of truth for "what does this book currently claim to be."
+    for book in list_books(db_connection):
+        if book.id == exclude_book_id:
+            continue
+        claimed_id = book.manual_match_grimmory_id
+        if claimed_id is None:
+            claimed_id = book.grimmory_book_id
+        if claimed_id == grimmory_id:
+            return book.id
     return None
 
 # Function Name: fetch_user_books

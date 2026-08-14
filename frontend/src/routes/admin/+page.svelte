@@ -2,6 +2,7 @@
 	import { invalidateAll } from '$app/navigation';
 	import { api } from '$lib/api/client';
 	import AdminEntry from '$lib/components/AdminEntry.svelte';
+	import AdminMatchSheet from '$lib/components/AdminMatchSheet.svelte';
 
 	let { data } = $props();
 
@@ -62,8 +63,8 @@
 	<div class="admin-view-needed-section">
 		{#if data.admin.needed_entries.length}
 			<ul class="admin-entries">
-				{#each data.admin.needed_entries as row, index (index)}
-					<AdminEntry {row} />
+				{#each data.admin.needed_entries as row (row.id)}
+					<AdminEntry {row} mode="needed" />
 				{/each}
 			</ul>
 		{:else}
@@ -74,18 +75,19 @@
 	<div class="admin-view-owned-section">
 		{#if data.admin.owned_entries.length}
 			<ul class="admin-entries">
-				{#each data.admin.owned_entries as row, index (index)}
-					<AdminEntry {row} hideWantedBy />
+				{#each data.admin.owned_entries as row (row.grimmory_id ?? row.id)}
+					<AdminEntry {row} mode="owned" />
 				{/each}
 			</ul>
 		{:else}
 			<p class="empty-state">Library catalog is empty — try syncing.</p>
 		{/if}
 	</div>
+	<AdminMatchSheet />
 {:else}
 	<ul class="admin-entries">
-		{#each data.admin.needed_entries as row, index (index)}
-			<AdminEntry {row} />
+		{#each data.admin.needed_entries as row (row.id)}
+			<AdminEntry {row} mode="needed" matchable={false} />
 		{/each}
 	</ul>
 {/if}

@@ -766,6 +766,158 @@ def test_api_admin_shows_aggregate_entries_without_login(client):
     assert body["needed_entries"][0]["wanted_by"] == ["Bob"]
 
 
+def test_api_admin_needed_entry_exposes_book_id(client):
+    user = _make_user("Bob")
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    models.add_tbr_entry(conn, user.id, book.id)
+    conn.close()
+
+    response = client.get("/api/admin")
+
+    assert response.json()["needed_entries"][0]["id"] == book.id
+
+
+def _configure_library_check():
+    conn = models.get_connection()
+    models.set_library_settings(
+        conn, base_url="https://grimmory.example.com", username="tbr-sync", password="hunter2",
+        sync_interval_minutes=60,
+    )
+    conn.close()
+
+
+def test_api_admin_manual_match_moves_entry_to_owned_using_book_fields(client):
+    _configure_library_check()
+    user = _make_user("Bob")
+    conn = models.get_connection()
+    # Deliberately mismatched fuzzy fields — the fuzzy matcher would never auto-match these.
+    book = models.create_book(conn, title="My Local Title", author="Some Author")
+    models.add_tbr_entry(conn, user.id, book.id)
+    models.replace_library_catalog(
+        conn,
+        [models.LibraryCatalogEntry(
+            title="Completely Different Catalog Title", isbn13=None, isbn10=None,
+            authors=["Someone Else"], grimmory_id=42,
+        )],
+    )
+    conn.close()
+
+    response = client.post(f"/api/admin/books/{book.id}/match", json={"grimmory_id": 42})
+    assert response.status_code == 204
+
+    body = client.get("/api/admin").json()
+    assert body["needed_entries"] == []
+    owned = body["owned_entries"][0]
+    assert owned["id"] == book.id
+    assert owned["title"] == "My Local Title"  # the book's own title, not the catalog row's
+    assert owned["author"] == "Some Author"
+    assert owned["manually_matched"] is True
+    assert owned["grimmory_id"] == 42
+
+
+def test_api_admin_match_rejects_duplicate_manual_match_target(client):
+    conn = models.get_connection()
+    book_a = models.create_book(conn, title="Book A")
+    book_b = models.create_book(conn, title="Book B")
+    conn.close()
+
+    first = client.post(f"/api/admin/books/{book_a.id}/match", json={"grimmory_id": 42})
+    assert first.status_code == 204
+
+    second = client.post(f"/api/admin/books/{book_b.id}/match", json={"grimmory_id": 42})
+
+    assert second.status_code == 409
+    assert "Book A" in second.json()["detail"]
+    conn = models.get_connection()
+    assert models.get_book(conn, book_b.id).manual_match_grimmory_id is None
+    conn.close()
+
+
+def test_api_admin_match_rejects_duplicate_auto_match_target(client):
+    conn = models.get_connection()
+    auto_matched = models.create_book(conn, title="Dune", author="Frank Herbert")
+    models.set_book_grimmory_id(conn, auto_matched.id, 42)
+    other_book = models.create_book(conn, title="Some Other Book")
+    conn.close()
+
+    response = client.post(f"/api/admin/books/{other_book.id}/match", json={"grimmory_id": 42})
+
+    assert response.status_code == 409
+    assert "Dune" in response.json()["detail"]
+    conn = models.get_connection()
+    assert models.get_book(conn, other_book.id).manual_match_grimmory_id is None
+    conn.close()
+
+
+def test_api_admin_unmatch_clears_pin_and_falls_back_to_auto_match(client):
+    _configure_library_check()
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune", author="Frank Herbert")
+    models.replace_library_catalog(
+        conn,
+        [models.LibraryCatalogEntry(
+            title="Dune", isbn13=None, isbn10=None, authors=["Frank Herbert"], grimmory_id=42,
+        )],
+    )
+    conn.close()
+    assert client.post(f"/api/admin/books/{book.id}/match", json={"grimmory_id": 42}).status_code == 204
+
+    response = client.post(f"/api/admin/books/{book.id}/match", json={"grimmory_id": None})
+
+    assert response.status_code == 204
+    conn = models.get_connection()
+    updated = models.get_book(conn, book.id)
+    conn.close()
+    assert updated.manual_match_grimmory_id is None
+    assert updated.grimmory_book_id == 42  # still owned via the fuzzy auto-match
+
+
+def test_api_admin_unmatch_clears_grimmory_id_when_no_auto_match_either(client):
+    _configure_library_check()
+    conn = models.get_connection()
+    book = models.create_book(conn, title="My Local Title", author="Some Author")
+    models.replace_library_catalog(
+        conn,
+        [models.LibraryCatalogEntry(
+            title="Completely Different Catalog Title", isbn13=None, isbn10=None,
+            authors=["Someone Else"], grimmory_id=42,
+        )],
+    )
+    conn.close()
+    assert client.post(f"/api/admin/books/{book.id}/match", json={"grimmory_id": 42}).status_code == 204
+
+    response = client.post(f"/api/admin/books/{book.id}/match", json={"grimmory_id": None})
+
+    assert response.status_code == 204
+    conn = models.get_connection()
+    updated = models.get_book(conn, book.id)
+    conn.close()
+    assert updated.manual_match_grimmory_id is None
+    assert updated.grimmory_book_id is None
+
+
+def test_api_admin_match_unknown_book_404s(client):
+    response = client.post("/api/admin/books/999999/match", json={"grimmory_id": 42})
+    assert response.status_code == 404
+
+
+def test_api_admin_library_search_works_without_login(client):
+    conn = models.get_connection()
+    models.replace_library_catalog(
+        conn,
+        [models.LibraryCatalogEntry(
+            title="Dune", isbn13="9780441172719", isbn10=None, authors=["Frank Herbert"],
+        )],
+    )
+    conn.close()
+
+    response = client.get("/api/admin/library-search", params={"q": "dune"})
+
+    assert response.status_code == 200
+    assert response.json()["results"][0]["title"] == "Dune"
+
+
 def test_api_admin_settings_never_leaks_stored_passwords(client):
     conn = models.get_connection()
     models.set_library_settings(
