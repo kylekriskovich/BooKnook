@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Iterable, Optional
 
 import httpx
 from rapidfuzz import fuzz
@@ -16,6 +16,7 @@ from app.models import (
     create_book,
     get_connection,
     get_library_settings,
+    get_user,
     list_books,
     list_tbr_entries_with_books,
     list_users,
@@ -25,9 +26,11 @@ from app.models import (
     set_book_grimmory_id,
     set_book_page_count,
     set_library_sync_state,
+    set_sync_to_device_shelf_id,
     set_tbr_entry_rating,
     set_tbr_entry_started_at,
     set_tbr_entry_status,
+    set_want_to_read_shelf_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,6 +44,17 @@ BOOKS_PATH = "/api/v1/books"
 COVER_PATH = "/api/v1/media/book/{book_id}/cover"
 READING_SESSIONS_PATH = "/api/v1/reading-sessions/book/{book_id}"
 READING_SESSIONS_PAGE_SIZE = 100
+SHELVES_PATH = "/api/v1/shelves"
+SHELF_BOOKS_PATH = "/api/v1/shelves/{shelf_id}/books"
+BOOKS_SHELVES_PATH = "/api/v1/books/shelves"
+
+# Default names for the two Grimmory shelves this app keeps in sync (see sync_user_reading_status's
+# shelf-sync passes) - only used the first time a user's shelf id is resolved (see
+# _ensure_want_to_read_shelf/_ensure_sync_to_device_shelf); after that the resolved id is persisted
+# on users.want_to_read_shelf_id/sync_to_device_shelf_id and these names are never consulted again,
+# even if the user later renames the shelf directly in Grimmory.
+DEFAULT_WANT_TO_READ_SHELF_NAME = "Want to Read"
+DEFAULT_SYNC_TO_DEVICE_SHELF_NAME = "Booknook: Sync to Device"
 
 # Prefix set_book_cover_url always writes (see _maybe_download_cover) - distinguishes an already
 #-downloaded Grimmory cover from a book/isbn-search placeholder (e.g. an Open Library thumbnail
@@ -283,6 +297,128 @@ def fetch_reading_sessions_for_book(
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
     return sessions
 
+# Function Name: list_own_shelves
+# Description: Fetches the calling user's own Grimmory shelves (never someone else's public ones).
+# Parameters:
+# - base_url (str): Grimmory base URL.
+# - access_token (str): The calling user's own access token.
+# - own_grimmory_user_id (int): The calling user's own Grimmory numeric id (see
+#   app/grimmory_auth.py:get_own_grimmory_user_id).
+# Returns: Raw shelf payloads owned by this user (list[dict])
+def list_own_shelves(base_url: str, access_token: str, own_grimmory_user_id: int) -> list[dict]:
+    # GET /api/v1/shelves returns own + public shelves mixed with no server-side owner filter, so
+    # filtering to "shelves I own" has to happen client-side here.
+    try:
+        with httpx.Client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
+            response = client.get(SHELVES_PATH, headers={"Authorization": f"Bearer {access_token}"})
+            response.raise_for_status()
+            shelves = response.json()
+    except httpx.HTTPError as exc:
+        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+    return [shelf for shelf in shelves if shelf.get("userId") == own_grimmory_user_id]
+
+# Function Name: get_or_create_shelf_by_name
+# Description: Idempotent get-or-create for a Grimmory shelf, keyed by name.
+# Parameters:
+# - base_url (str): Grimmory base URL.
+# - access_token (str): The calling user's own access token.
+# - own_grimmory_user_id (int): The calling user's own Grimmory numeric id.
+# - name (str): Shelf name to find or create.
+# Returns: The shelf's Grimmory id (int)
+def get_or_create_shelf_by_name(
+    base_url: str, access_token: str, own_grimmory_user_id: int, name: str
+) -> int:
+    # GET-then-POST rather than relying on Grimmory's SHELF_ALREADY_EXISTS (409) on a duplicate
+    # POST - that's an error path, not a natural upsert - and this also means a shelf the user
+    # already made themselves under this name is silently adopted (Grimmory enforces unique shelf
+    # names per user, so a name match here is unambiguous).
+    for shelf in list_own_shelves(base_url, access_token, own_grimmory_user_id):
+        if shelf.get("name") == name and shelf.get("id") is not None:
+            return shelf["id"]
+    try:
+        with httpx.Client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
+            response = client.post(
+                SHELVES_PATH,
+                json={"name": name, "publicShelf": False},
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            if response.status_code == 409:
+                # Lost a create race against another sync for the same user (the manual
+                # POST /api/settings/sync trigger and the periodic background loop can both
+                # reach here concurrently, e.g. while the library catalog cross-check isn't
+                # configured the periodic loop runs every 60s) - someone else already created
+                # this shelf between our GET above and this POST. Not an error: adopt it.
+                for shelf in list_own_shelves(base_url, access_token, own_grimmory_user_id):
+                    if shelf.get("name") == name and shelf.get("id") is not None:
+                        return shelf["id"]
+                raise LibraryCheckUnavailable(
+                    f"Grimmory reported shelf {name!r} already exists but it isn't visible yet"
+                )
+            response.raise_for_status()
+            body = response.json()
+            if body.get("id") is None:
+                raise LibraryCheckUnavailable(
+                    f"Grimmory created shelf {name!r} but returned no id"
+                )
+            return body["id"]
+    except httpx.HTTPError as exc:
+        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+
+# Function Name: fetch_shelf_books
+# Description: Fetches every book currently on a Grimmory shelf.
+# Parameters:
+# - base_url (str): Grimmory base URL.
+# - access_token (str): The calling user's own access token.
+# - shelf_id (int): Grimmory's own id for the shelf.
+# Returns: Raw book payloads (list[dict]), same shape as fetch_user_books' response.
+def fetch_shelf_books(base_url: str, access_token: str, shelf_id: int) -> list[dict]:
+    try:
+        with httpx.Client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
+            response = client.get(
+                SHELF_BOOKS_PATH.format(shelf_id=shelf_id),
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPError as exc:
+        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+
+# Function Name: assign_book_shelves
+# Description: Batched shelf-membership assign/unassign for one or more books.
+# Parameters:
+# - base_url (str): Grimmory base URL.
+# - access_token (str): The calling user's own access token.
+# - book_ids (set[int]): Grimmory book ids to apply the assign/unassign sets to.
+# - shelves_to_assign (set[int]): Shelf ids to add every book in book_ids to.
+# - shelves_to_unassign (set[int]): Shelf ids to remove every book in book_ids from.
+# Returns: None
+def assign_book_shelves(
+    base_url: str,
+    access_token: str,
+    book_ids: Iterable[int],
+    shelves_to_assign: Iterable[int] = frozenset(),
+    shelves_to_unassign: Iterable[int] = frozenset(),
+) -> None:
+    # shelves_to_assign/unassign apply uniformly to every id in book_ids (confirmed against
+    # Grimmory's BookUpdateService) - this is not a per-book instruction list, so callers must
+    # issue one call per distinct (assign-set, unassign-set) combination they need.
+    if not book_ids:
+        return
+    try:
+        with httpx.Client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
+            response = client.post(
+                BOOKS_SHELVES_PATH,
+                json={
+                    "bookIds": list(book_ids),
+                    "shelvesToAssign": list(shelves_to_assign),
+                    "shelvesToUnassign": list(shelves_to_unassign),
+                },
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+
 # Function Name: _target_status
 # Description: Determines the shelf a Grimmory book belongs on, based on its readStatus.
 # Parameters:
@@ -451,6 +587,50 @@ def download_cover_for_book_now(book_id: int, grimmory_book_id: int) -> None:
     finally:
         db_connection.close()
 
+# Function Name: _ensure_want_to_read_shelf
+# Description: Resolves this user's Want to Read shelf id, lazily get-or-creating it in Grimmory
+#   by name the first time (see DEFAULT_WANT_TO_READ_SHELF_NAME) and persisting it thereafter.
+# Parameters:
+# - db_connection: Database connection.
+# - user (User): The user whose shelf id to resolve (mutated in place on first resolution).
+# - base_url (str): Grimmory base URL.
+# - access_token (str): The user's own access token.
+# Returns: Grimmory shelf id (int)
+def _ensure_want_to_read_shelf(db_connection, user, base_url: str, access_token: str) -> int:
+    if user.want_to_read_shelf_id is not None:
+        return user.want_to_read_shelf_id
+    from app import grimmory_auth  # local import: grimmory_auth imports LOGIN_PATH from this
+
+    own_id = grimmory_auth.get_own_grimmory_user_id(base_url, access_token)
+    shelf_id = get_or_create_shelf_by_name(
+        base_url, access_token, own_id, DEFAULT_WANT_TO_READ_SHELF_NAME
+    )
+    set_want_to_read_shelf_id(db_connection, user.id, shelf_id)
+    user.want_to_read_shelf_id = shelf_id
+    return shelf_id
+
+# Function Name: _ensure_sync_to_device_shelf
+# Description: Resolves this user's Sync to Device shelf id, lazily get-or-creating it in Grimmory
+#   by name the first time (see DEFAULT_SYNC_TO_DEVICE_SHELF_NAME) and persisting it thereafter.
+# Parameters:
+# - db_connection: Database connection.
+# - user (User): The user whose shelf id to resolve (mutated in place on first resolution).
+# - base_url (str): Grimmory base URL.
+# - access_token (str): The user's own access token.
+# Returns: Grimmory shelf id (int)
+def _ensure_sync_to_device_shelf(db_connection, user, base_url: str, access_token: str) -> int:
+    if user.sync_to_device_shelf_id is not None:
+        return user.sync_to_device_shelf_id
+    from app import grimmory_auth  # local import: grimmory_auth imports LOGIN_PATH from this
+
+    own_id = grimmory_auth.get_own_grimmory_user_id(base_url, access_token)
+    shelf_id = get_or_create_shelf_by_name(
+        base_url, access_token, own_id, DEFAULT_SYNC_TO_DEVICE_SHELF_NAME
+    )
+    set_sync_to_device_shelf_id(db_connection, user.id, shelf_id)
+    user.sync_to_device_shelf_id = shelf_id
+    return shelf_id
+
 # Function Name: sync_user_reading_status
 # Description: Reflects a user's own Grimmory reading status onto their TBR shelves.
 # Parameters:
@@ -464,6 +644,12 @@ def sync_user_reading_status(
 ) -> None:
     # Callers are expected to treat this as best-effort - a failed Grimmory call must not block
     # login (see /login) or the on-demand sync (see /settings/sync).
+    user = get_user(db_connection, user_id)
+    if user is None:
+        # Deleted mid-sync (e.g. by an admin) between the caller resolving user_id and this
+        # running - surface the same exception type callers already expect, not an AttributeError
+        # from the shelf-sync passes' later `user.*` reads below.
+        raise LibraryCheckUnavailable(f"No such user_id={user_id}")
     books = fetch_user_books(base_url, access_token)
     catalog = [_book_to_catalog_entry(book) for book in books]
 
@@ -522,6 +708,69 @@ def sync_user_reading_status(
         )
         _sync_book_metadata(db_connection, new_book.id, new_entry.id, book)
         _maybe_download_cover(db_connection, base_url, access_token, new_book.id, book.get("id"))
+
+    # Pass 3: Want to Read shelf (always on) - pulls in any Grimmory-shelf book BooKnook doesn't
+    # know about yet (additive only - a manual removal on the Grimmory shelf is never mirrored
+    # back as a local delete), then re-diffs desired vs. current membership every sync so the
+    # shelf keeps reflecting "wanted + in library" as a standing invariant - including re-adding a
+    # book a user manually unassigned from the shelf directly in Grimmory, and correcting any
+    # shelf write left over from a prior sync that failed partway.
+    want_shelf_id = _ensure_want_to_read_shelf(db_connection, user, base_url, access_token)
+    shelf_books = fetch_shelf_books(base_url, access_token, want_shelf_id)
+    entries = list_tbr_entries_with_books(db_connection, user_id)
+    known_grimmory_ids = {
+        entry.book.grimmory_book_id for entry in entries if entry.book.grimmory_book_id is not None
+    }
+    for book in shelf_books:
+        grimmory_id = book.get("id")
+        if grimmory_id is None or grimmory_id in known_grimmory_ids:
+            continue
+        catalog_entry = _book_to_catalog_entry(book)
+        if not catalog_entry.title:
+            continue
+        new_book = create_book(
+            db_connection,
+            title=catalog_entry.title,
+            author=", ".join(catalog_entry.authors) or None,
+            isbn=catalog_entry.isbn13 or catalog_entry.isbn10,
+            published_date=catalog_entry.published_date,
+        )
+        new_entry = add_tbr_entry(db_connection, user_id, new_book.id, status="wanted")
+        _sync_book_metadata(db_connection, new_book.id, new_entry.id, book)
+        _maybe_download_cover(db_connection, base_url, access_token, new_book.id, grimmory_id)
+        known_grimmory_ids.add(grimmory_id)
+
+    # Re-fetch to pick up this pass's own inserts above before computing the diff.
+    entries = list_tbr_entries_with_books(db_connection, user_id)
+    desired_want = {
+        entry.book.grimmory_book_id
+        for entry in entries
+        if entry.status == "wanted" and entry.book.grimmory_book_id is not None
+    }
+    current_want = {book["id"] for book in shelf_books if book.get("id") is not None}
+    to_assign = desired_want - current_want
+    to_unassign = current_want - desired_want
+    if to_assign:
+        assign_book_shelves(base_url, access_token, to_assign, shelves_to_assign={want_shelf_id})
+    if to_unassign:
+        assign_book_shelves(
+            base_url, access_token, to_unassign, shelves_to_unassign={want_shelf_id}
+        )
+
+    # Pass 4: Sync to Device shelf (opt-in) - strictly additive, feeds the external
+    # grimmory.koplugin KOReader plugin. Never unassigned, even across a status change or a full
+    # local delete - see users.sync_to_device_enabled's schema comment.
+    if user.sync_to_device_enabled:
+        device_shelf_id = _ensure_sync_to_device_shelf(db_connection, user, base_url, access_token)
+        device_ids = {
+            entry.book.grimmory_book_id
+            for entry in entries
+            if entry.book.grimmory_book_id is not None
+        }
+        if device_ids:
+            assign_book_shelves(
+                base_url, access_token, device_ids, shelves_to_assign={device_shelf_id}
+            )
 
 # Function Name: check_ownership
 # Description: Checks whether a given TBR book appears to already be in the library catalog.

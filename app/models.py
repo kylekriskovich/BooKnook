@@ -26,6 +26,18 @@ SCHEMA_SQL = """
 -- calendar_view_preference ('grid' | 'list') is which layout the Reading Calendar section on
 -- /stats last showed — same shape/purpose as view_preference above, just a second, independent
 -- view toggle for a different part of the app.
+-- want_to_read_shelf_id is the Grimmory shelf id (Grimmory's own numeric id, not a local foreign
+-- key — same relationship as books.grimmory_book_id) backing this user's always-on "Want to Read"
+-- shelf mirror (see app/library_check.py's shelf-sync passes in sync_user_reading_status). NULL
+-- until resolved — either the user's own choice from the Settings dropdown, or lazily
+-- get-or-created by name on this user's first sync after the feature shipped.
+-- sync_to_device_enabled is the user's opt-in for the "Sync to Device" shelf, which feeds the
+-- external grimmory.koplugin KOReader plugin — default off, and unlike want_to_read_shelf_id
+-- nothing ever flows from this shelf back into BooKnook.
+-- sync_to_device_shelf_id mirrors want_to_read_shelf_id's shape/lifecycle but for the opt-in
+-- shelf; meaningless while sync_to_device_enabled is 0, but deliberately left in place (not
+-- cleared) if the user disables and later re-enables, so re-enabling doesn't need to re-resolve
+-- or re-create the shelf.
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
@@ -33,7 +45,10 @@ CREATE TABLE IF NOT EXISTS users (
     onboarded INTEGER NOT NULL DEFAULT 0,
     grimmory_refresh_token TEXT,
     spice_level INTEGER NOT NULL DEFAULT 0,
-    calendar_view_preference TEXT NOT NULL DEFAULT 'grid'
+    calendar_view_preference TEXT NOT NULL DEFAULT 'grid',
+    want_to_read_shelf_id INTEGER,
+    sync_to_device_enabled INTEGER NOT NULL DEFAULT 0,
+    sync_to_device_shelf_id INTEGER
 );
 
 -- page_count is Grimmory's own catalog metadata (BookMetadata.pageCount) — plain book metadata,
@@ -235,6 +250,20 @@ def init_db(db_connection: sqlite3.Connection) -> None:
         db_connection.execute("ALTER TABLE library_catalog ADD COLUMN grimmory_id INTEGER")
     except sqlite3.OperationalError:
         pass  # column already exists
+    try:
+        db_connection.execute("ALTER TABLE users ADD COLUMN want_to_read_shelf_id INTEGER")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    try:
+        db_connection.execute(
+            "ALTER TABLE users ADD COLUMN sync_to_device_enabled INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    try:
+        db_connection.execute("ALTER TABLE users ADD COLUMN sync_to_device_shelf_id INTEGER")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     # KOReader self-service sync removed 2026-07-29 — dropped in favor of already-hiding
     # null/zero stats everywhere else, rather than needing a second signal to gate them on.
     # DROP COLUMN needs SQLite 3.35+ (bundled with Python 3.12's sqlite3 module, well past that);
@@ -278,6 +307,9 @@ class User:
     grimmory_refresh_token: Optional[str] = None
     spice_level: int = 0
     calendar_view_preference: str = "grid"
+    want_to_read_shelf_id: Optional[int] = None
+    sync_to_device_enabled: bool = False
+    sync_to_device_shelf_id: Optional[int] = None
 
 
 @dataclass
@@ -381,6 +413,9 @@ def _row_to_user(row: sqlite3.Row) -> User:
         grimmory_refresh_token=row["grimmory_refresh_token"],
         spice_level=row["spice_level"],
         calendar_view_preference=row["calendar_view_preference"],
+        want_to_read_shelf_id=row["want_to_read_shelf_id"],
+        sync_to_device_enabled=bool(row["sync_to_device_enabled"]),
+        sync_to_device_shelf_id=row["sync_to_device_shelf_id"],
     )
 
 
@@ -475,6 +510,31 @@ def set_grimmory_refresh_token(
 
 def set_spice_level(db_connection: sqlite3.Connection, user_id: int, spice_level: int) -> None:
     db_connection.execute("UPDATE users SET spice_level = ? WHERE id = ?", (spice_level, user_id))
+    db_connection.commit()
+
+
+def set_want_to_read_shelf_id(
+    db_connection: sqlite3.Connection, user_id: int, shelf_id: Optional[int]
+) -> None:
+    db_connection.execute(
+        "UPDATE users SET want_to_read_shelf_id = ? WHERE id = ?", (shelf_id, user_id)
+    )
+    db_connection.commit()
+
+
+def set_sync_to_device_enabled(db_connection: sqlite3.Connection, user_id: int, enabled: bool) -> None:
+    db_connection.execute(
+        "UPDATE users SET sync_to_device_enabled = ? WHERE id = ?", (int(enabled), user_id)
+    )
+    db_connection.commit()
+
+
+def set_sync_to_device_shelf_id(
+    db_connection: sqlite3.Connection, user_id: int, shelf_id: Optional[int]
+) -> None:
+    db_connection.execute(
+        "UPDATE users SET sync_to_device_shelf_id = ? WHERE id = ?", (shelf_id, user_id)
+    )
     db_connection.commit()
 
 

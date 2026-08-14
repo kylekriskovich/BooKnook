@@ -41,6 +41,37 @@ def test_set_view_preference(conn):
     assert models.get_user(conn, user.id).view_preference == "cover"
 
 
+def test_new_user_defaults_shelf_sync_fields(conn):
+    user = models.create_user(conn, "Alice")
+    assert user.want_to_read_shelf_id is None
+    assert user.sync_to_device_enabled is False
+    assert user.sync_to_device_shelf_id is None
+
+
+def test_set_want_to_read_shelf_id(conn):
+    user = models.create_user(conn, "Alice")
+    models.set_want_to_read_shelf_id(conn, user.id, 42)
+    assert models.get_user(conn, user.id).want_to_read_shelf_id == 42
+    models.set_want_to_read_shelf_id(conn, user.id, None)
+    assert models.get_user(conn, user.id).want_to_read_shelf_id is None
+
+
+def test_set_sync_to_device_enabled(conn):
+    user = models.create_user(conn, "Alice")
+    models.set_sync_to_device_enabled(conn, user.id, True)
+    assert models.get_user(conn, user.id).sync_to_device_enabled is True
+    models.set_sync_to_device_enabled(conn, user.id, False)
+    assert models.get_user(conn, user.id).sync_to_device_enabled is False
+
+
+def test_set_sync_to_device_shelf_id(conn):
+    user = models.create_user(conn, "Alice")
+    models.set_sync_to_device_shelf_id(conn, user.id, 99)
+    assert models.get_user(conn, user.id).sync_to_device_shelf_id == 99
+    models.set_sync_to_device_shelf_id(conn, user.id, None)
+    assert models.get_user(conn, user.id).sync_to_device_shelf_id is None
+
+
 def test_create_book_reuses_existing_isbn(conn):
     book1 = models.create_book(conn, "Dune", author="Frank Herbert", isbn="9780441172719")
     book2 = models.create_book(conn, "Dune", author="Frank Herbert", isbn="9780441172719")

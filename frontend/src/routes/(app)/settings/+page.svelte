@@ -2,6 +2,7 @@
 	import { api, unwrap } from '$lib/api/client';
 	import { auth } from '$lib/stores/auth.svelte';
 	import SpiceSection from '$lib/components/SpiceSection.svelte';
+	import ShelfSyncSection from '$lib/components/ShelfSyncSection.svelte';
 
 	let { data } = $props();
 
@@ -86,6 +87,14 @@
 		{/if}
 	</div>
 </div>
+
+{#if data.settings.has_grimmory_session}
+	<ShelfSyncSection
+		wantToReadShelfId={data.settings.want_to_read_shelf_id ?? null}
+		syncToDeviceEnabled={data.settings.sync_to_device_enabled}
+		syncToDeviceShelfId={data.settings.sync_to_device_shelf_id ?? null}
+	/>
+{/if}
 
 <SpiceSection grimmoryAdminConfigured={data.settings.grimmory_admin_configured} spiceLabels={data.settings.spice_labels} />
 

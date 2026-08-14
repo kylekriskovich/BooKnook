@@ -251,6 +251,43 @@ def test_update_book_finished_date_raises_on_http_failure(monkeypatch):
         )
 
 
+# --- get_own_grimmory_user_id ---
+
+
+class FakeMeResponse:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError("error", request=None, response=self)
+
+    def json(self):
+        return self._payload
+
+
+def test_get_own_grimmory_user_id_returns_id(monkeypatch):
+    calls = []
+
+    def fake_get(url, headers=None, timeout=None):
+        calls.append({"url": url, "headers": headers})
+        return FakeMeResponse({"id": 42, "username": "kyle"})
+
+    monkeypatch.setattr(grimmory_auth.httpx, "get", fake_get)
+
+    assert grimmory_auth.get_own_grimmory_user_id("https://grimmory.example.com", "token") == 42
+    assert calls[0]["url"] == "https://grimmory.example.com/api/v1/users/me"
+    assert calls[0]["headers"] == {"Authorization": "Bearer token"}
+
+
+def test_get_own_grimmory_user_id_raises_on_http_failure(monkeypatch):
+    monkeypatch.setattr(grimmory_auth.httpx, "get", lambda *a, **k: FakeMeResponse({}, 500))
+
+    with pytest.raises(grimmory_auth.LibraryCheckUnavailable):
+        grimmory_auth.get_own_grimmory_user_id("https://grimmory.example.com", "token")
+
+
 # --- admin-privileged actions (content restrictions / the spice scale) ---
 
 

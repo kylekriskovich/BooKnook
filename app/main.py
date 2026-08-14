@@ -51,10 +51,13 @@ from app.models import (
     set_onboarded,
     set_search_settings,
     set_spice_level,
+    set_sync_to_device_enabled,
+    set_sync_to_device_shelf_id,
     set_tbr_entry_finished_at,
     set_tbr_entry_started_at,
     set_view_preference,
     set_wanted_order,
+    set_want_to_read_shelf_id,
     upsert_goal,
 )
 
@@ -710,6 +713,9 @@ def api_settings(user: User = Depends(require_user), db_connection: sqlite3.Conn
         spice_labels=_spice_labels(),
         spice_level=user.spice_level,
         has_grimmory_session=bool(user.grimmory_refresh_token),
+        want_to_read_shelf_id=user.want_to_read_shelf_id,
+        sync_to_device_enabled=user.sync_to_device_enabled,
+        sync_to_device_shelf_id=user.sync_to_device_shelf_id,
     )
 
 
@@ -752,6 +758,58 @@ def api_settings_sync(
             error = str(exc)
 
     return schemas.SyncResultOut(error=error)
+
+
+@app.get("/api/settings/shelves", response_model=schemas.ShelfOptionsOut)
+def api_settings_shelves(
+    user: User = Depends(require_user), db_connection: sqlite3.Connection = Depends(get_db)
+):
+    # Live Grimmory shelf list for the Settings-page dropdowns — deliberately its own route rather
+    # than folded into GET /api/settings, so a slow/unreachable Grimmory only affects this section
+    # instead of the whole settings page load.
+    base_url = os.environ.get(grimmory_auth.GRIMMORY_BASE_URL_ENV)
+    if not base_url:
+        return schemas.ShelfOptionsOut(shelves=[], error="Grimmory login is not configured")
+
+    access_token = grimmory_auth.get_valid_access_token(db_connection, user)
+    if access_token is None:
+        return schemas.ShelfOptionsOut(shelves=[], error="reconnect_needed")
+
+    try:
+        own_id = grimmory_auth.get_own_grimmory_user_id(base_url, access_token)
+        shelves = library_check.list_own_shelves(base_url, access_token, own_id)
+    except LibraryCheckUnavailable as exc:
+        return schemas.ShelfOptionsOut(shelves=[], error=str(exc))
+
+    return schemas.ShelfOptionsOut(
+        shelves=[
+            schemas.ShelfOptionOut(id=shelf["id"], name=shelf["name"])
+            for shelf in shelves
+            if shelf.get("id") is not None and shelf.get("name") is not None
+        ]
+    )
+
+
+@app.post("/api/settings/shelves", response_model=schemas.ShelfSyncSettingsOut)
+def api_settings_shelves_update(
+    payload: schemas.ShelfSyncSettingsIn,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    # Pure local write, no live Grimmory validation call here — if a stale/foreign shelf id ever
+    # got persisted, Grimmory's own POST /api/v1/books/shelves already rejects assigning to a
+    # shelf the user doesn't own, so the next sync fails loud (self-correcting once fixed) rather
+    # than needing a second live round trip on every save.
+    set_want_to_read_shelf_id(db_connection, user.id, payload.want_to_read_shelf_id)
+    set_sync_to_device_enabled(db_connection, user.id, payload.sync_to_device_enabled)
+    set_sync_to_device_shelf_id(db_connection, user.id, payload.sync_to_device_shelf_id)
+
+    current = get_user(db_connection, user.id)
+    return schemas.ShelfSyncSettingsOut(
+        want_to_read_shelf_id=current.want_to_read_shelf_id,
+        sync_to_device_enabled=current.sync_to_device_enabled,
+        sync_to_device_shelf_id=current.sync_to_device_shelf_id,
+    )
 
 
 @app.post("/api/settings/spice", response_model=schemas.SpiceResultOut)

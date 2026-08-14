@@ -168,10 +168,33 @@ class SettingsOut(BaseModel):
     # directly to decide whether /settings/sync needs a password field; this is that same check
     # exposed as a plain boolean instead of the secret.
     has_grimmory_session: bool
+    # Persisted Grimmory shelf ids only — no live Grimmory call happens for this route (see
+    # GET /api/settings/shelves for the live shelf-list fetch that powers the settings dropdowns).
+    want_to_read_shelf_id: Optional[int] = None
+    sync_to_device_enabled: bool = False
+    sync_to_device_shelf_id: Optional[int] = None
 
 
 class SyncResultOut(BaseModel):
     error: Optional[str] = None
+
+
+class ShelfOptionOut(BaseModel):
+    id: int
+    name: str
+
+
+class ShelfOptionsOut(BaseModel):
+    shelves: list[ShelfOptionOut]
+    # "reconnect_needed" | a not-configured message | a LibraryCheckUnavailable message — same
+    # soft-error convention as SyncResultOut/SpiceResultOut (always 200, never raised).
+    error: Optional[str] = None
+
+
+class ShelfSyncSettingsOut(BaseModel):
+    want_to_read_shelf_id: Optional[int] = None
+    sync_to_device_enabled: bool = False
+    sync_to_device_shelf_id: Optional[int] = None
 
 
 class SpiceResultOut(BaseModel):
@@ -238,6 +261,12 @@ class SyncIn(BaseModel):
 
 class SpiceIn(BaseModel):
     level: int
+
+
+class ShelfSyncSettingsIn(BaseModel):
+    want_to_read_shelf_id: Optional[int] = None
+    sync_to_device_enabled: bool = False
+    sync_to_device_shelf_id: Optional[int] = None
 
 
 class TBRCreateIn(BaseModel):

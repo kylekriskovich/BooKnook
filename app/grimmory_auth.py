@@ -23,6 +23,7 @@ GRIMMORY_BASE_URL_ENV = "GRIMMORY_BASE_URL"
 REFRESH_PATH = "/api/v1/auth/refresh"
 BOOK_PROGRESS_PATH = "/api/v1/books/progress"
 USERS_PATH = "/api/v1/users"
+USERS_ME_PATH = "/api/v1/users/me"
 CONTENT_RESTRICTIONS_PATH = "/api/v1/users/{user_id}/content-restrictions"
 
 # Grimmory returns 400 (ApiError.INVALID_CREDENTIALS) for a bad username/password, not 401.
@@ -156,6 +157,27 @@ def update_book_finished_date(
         response.raise_for_status()
     except httpx.HTTPError as exc:
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+
+# Function Name: get_own_grimmory_user_id
+# Description: Returns the calling user's own Grimmory numeric user id.
+# Parameters:
+# - base_url (str): Grimmory base URL.
+# - access_token (str): Calling user's own Grimmory access token.
+# Returns: Grimmory user id (int)
+def get_own_grimmory_user_id(base_url: str, access_token: str) -> int:
+    # Needed because GET /api/v1/shelves returns own + public shelves mixed with no server-side
+    # owner filter - filtering a shelf list down to "shelves I own" requires knowing this first
+    # (see app/library_check.py:list_own_shelves).
+    try:
+        response = httpx.get(
+            f"{base_url.rstrip('/')}{USERS_ME_PATH}",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10.0,
+        )
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+    return response.json()["id"]
 
 
 # --- admin-privileged actions (content restrictions / the spice scale) ---
