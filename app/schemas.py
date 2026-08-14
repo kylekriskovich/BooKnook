@@ -203,10 +203,18 @@ class SpiceResultOut(BaseModel):
 
 
 class AdminEntryOut(BaseModel):
+    # Book id — always set for needed_entries; set for owned_entries only when the row came from a
+    # manual match (drives the Unmatch action). None for a pure catalog row / auto-match.
+    id: Optional[int] = None
     title: str
     author: Optional[str] = None
     cover_url: Optional[str] = None
     wanted_by: list[str]
+    # Grimmory's own catalog id — always set for owned_entries, never set for needed_entries (a
+    # needed entry has no match yet).
+    grimmory_id: Optional[int] = None
+    # True only for an owned_entries row sourced from an admin manual match, not an auto-match.
+    manually_matched: bool = False
 
 
 class AdminOut(BaseModel):
@@ -261,6 +269,11 @@ class SyncIn(BaseModel):
 
 class SpiceIn(BaseModel):
     level: int
+
+
+class AdminMatchIn(BaseModel):
+    # A Grimmory catalog id to pin this book to, or None to clear an existing manual match.
+    grimmory_id: Optional[int] = None
 
 
 class ShelfSyncSettingsIn(BaseModel):

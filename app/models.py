@@ -65,6 +65,17 @@ CREATE TABLE IF NOT EXISTS users (
 -- color that book's calendar bars/swatch so they match its actual cover instead of an id-cycled
 -- palette. NULL until first computed, and forever afterward if the book has no cover_url or the
 -- image can't be decoded (callers fall back to the palette in that case).
+-- manual_match_grimmory_id is an admin-asserted override, distinct from grimmory_book_id's
+-- fuzzy-match provenance above — set via POST /api/admin/books/{id}/match when an admin manually
+-- links a Need-to-Acquire book to a library_catalog row that library_check.find_catalog_match
+-- failed to associate on its own. Stores Grimmory's own numeric book id (library_catalog.grimmory_id),
+-- never library_catalog.id — that table is fully ephemeral, rebuilt from scratch on every catalog
+-- sync (see replace_library_catalog), so its row ids don't survive across syncs. NULL means no
+-- manual override; when set, library_check.resolve_catalog_match treats it as this book's catalog
+-- match, taking priority over the fuzzy matcher. This is a second, higher-priority source for
+-- grimmory_book_id above, not a loosening of that column's "not user-editable" contract —
+-- grimmory_book_id itself remains only ever machine-derived, just from two candidate sources now.
+-- Cleared back to NULL by the unmatch action.
 CREATE TABLE IF NOT EXISTS books (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
@@ -74,7 +85,8 @@ CREATE TABLE IF NOT EXISTS books (
     published_date TEXT,
     page_count INTEGER,
     grimmory_book_id INTEGER,
-    cover_color TEXT
+    cover_color TEXT,
+    manual_match_grimmory_id INTEGER
 );
 
 -- status is 'wanted' | 'reading' | 'finished' — driven automatically by the Grimmory reading-
@@ -278,6 +290,10 @@ def init_db(db_connection: sqlite3.Connection) -> None:
         db_connection.execute("ALTER TABLE tbr_entries ADD COLUMN sort_order INTEGER")
     except sqlite3.OperationalError:
         pass  # column already exists
+    try:
+        db_connection.execute("ALTER TABLE books ADD COLUMN manual_match_grimmory_id INTEGER")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     # One-time backfill for wanted entries that predate sort_order — numbers each user's own
     # wanted shelf by their current added_at DESC order (preserving today's effective order across
     # the upgrade instead of scrambling it), 0 = first. Only touches sort_order IS NULL rows, so
@@ -323,6 +339,7 @@ class Book:
     page_count: Optional[int] = None
     grimmory_book_id: Optional[int] = None
     cover_color: Optional[str] = None
+    manual_match_grimmory_id: Optional[int] = None
 
 
 @dataclass
@@ -430,6 +447,7 @@ def _row_to_book(row: sqlite3.Row) -> Book:
         page_count=row["page_count"],
         grimmory_book_id=row["grimmory_book_id"],
         cover_color=row["cover_color"],
+        manual_match_grimmory_id=row["manual_match_grimmory_id"],
     )
 
 
@@ -641,7 +659,7 @@ def list_aggregate_tbr(db_connection: sqlite3.Connection) -> list[AggregateTBREn
     rows = db_connection.execute(
         """
         SELECT books.id AS book_id, books.title, books.author, books.isbn, books.cover_url,
-               users.name AS user_name
+               books.grimmory_book_id, books.manual_match_grimmory_id, users.name AS user_name
         FROM tbr_entries
         JOIN books ON books.id = tbr_entries.book_id
         JOIN users ON users.id = tbr_entries.user_id
@@ -660,6 +678,8 @@ def list_aggregate_tbr(db_connection: sqlite3.Connection) -> list[AggregateTBREn
                     author=row["author"],
                     isbn=row["isbn"],
                     cover_url=row["cover_url"],
+                    grimmory_book_id=row["grimmory_book_id"],
+                    manual_match_grimmory_id=row["manual_match_grimmory_id"],
                 ),
                 wanted_by=[],
             )
@@ -765,6 +785,31 @@ def set_book_grimmory_id(
 ) -> None:
     db_connection.execute(
         "UPDATE books SET grimmory_book_id = ? WHERE id = ?", (grimmory_book_id, book_id)
+    )
+    db_connection.commit()
+
+
+def set_book_manual_match_grimmory_id(
+    db_connection: sqlite3.Connection, book_id: int, grimmory_book_id: Optional[int]
+) -> None:
+    db_connection.execute(
+        "UPDATE books SET manual_match_grimmory_id = ? WHERE id = ?", (grimmory_book_id, book_id)
+    )
+    db_connection.commit()
+
+
+def set_book_manual_match_and_grimmory_id(
+    db_connection: sqlite3.Connection,
+    book_id: int,
+    manual_match_grimmory_id: Optional[int],
+    grimmory_book_id: Optional[int],
+) -> None:
+    """Sets both columns in a single UPDATE + commit — used by POST /api/admin/books/{id}/match
+    (match and unmatch) so the pin and its immediate effect on grimmory_book_id can never be left
+    inconsistent by a crash between two separate writes."""
+    db_connection.execute(
+        "UPDATE books SET manual_match_grimmory_id = ?, grimmory_book_id = ? WHERE id = ?",
+        (manual_match_grimmory_id, grimmory_book_id, book_id),
     )
     db_connection.commit()
 

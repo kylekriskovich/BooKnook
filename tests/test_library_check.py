@@ -291,13 +291,109 @@ def test_fetch_catalog_skips_cover_download_when_local_cover_already_downloaded(
     assert updated.grimmory_book_id == 42  # still set even though the cover download was skipped
 
 
+def test_fetch_catalog_manual_pin_wins_over_conflicting_fuzzy_match(
+    conn, configured_settings, covers_tmp_dir, monkeypatch
+):
+    # This book's title/author would fuzzy-match Grimmory book 42 below (exact title match, first
+    # in the catalog), but it's pinned to book 99 instead - the pin must win.
+    book = models.create_book(conn, title="Dune", author="Frank Herbert")
+    models.set_book_manual_match_grimmory_id(conn, book.id, 99)
+    books_payload = [
+        {"id": 42, "metadata": {"title": "Dune", "authors": ["Frank Herbert"]}},
+        {"id": 99, "metadata": {"title": "Dune: Deluxe Edition", "authors": ["Frank Herbert"]}},
+    ]
+    books_client = FakeClient(books_payload=books_payload)
+    routing_client = RoutingFakeClient(books_client, FakeCoverResponse())
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: routing_client)
+
+    library_check.fetch_catalog(conn)
+
+    assert models.get_book(conn, book.id).grimmory_book_id == 99
+
+
 # --- check_ownership ---
 
 
-def _catalog_entry(title="Dune", isbn13="9780441172719", isbn10="0441172717", authors=None):
+def _catalog_entry(title="Dune", isbn13="9780441172719", isbn10="0441172717", authors=None, grimmory_id=None):
     return models.LibraryCatalogEntry(
-        title=title, isbn13=isbn13, isbn10=isbn10, authors=authors or ["Frank Herbert"]
+        title=title, isbn13=isbn13, isbn10=isbn10, authors=authors or ["Frank Herbert"],
+        grimmory_id=grimmory_id,
     )
+
+
+# --- resolve_catalog_match / find_owning_book_id ---
+
+
+def test_resolve_catalog_match_prefers_manual_pin_over_fuzzy_match():
+    catalog = [_catalog_entry(title="Dune", grimmory_id=42)]
+    # Title/author don't fuzzy-match anything in the catalog at all.
+    book = models.Book(
+        id=1, title="Some Totally Different Title", author="Nobody", isbn=None, cover_url=None,
+        manual_match_grimmory_id=42,
+    )
+
+    match = library_check.resolve_catalog_match(book, catalog)
+
+    assert match is not None and match.grimmory_id == 42
+
+
+def test_resolve_catalog_match_falls_back_to_fuzzy_when_no_pin():
+    catalog = [_catalog_entry(title="Dune", grimmory_id=42)]
+    book = models.Book(id=1, title="Dune", author="Frank Herbert", isbn=None, cover_url=None)
+
+    match = library_check.resolve_catalog_match(book, catalog)
+
+    assert match is not None and match.grimmory_id == 42
+
+
+def test_resolve_catalog_match_pin_missing_from_catalog_returns_none():
+    catalog = [_catalog_entry(title="Dune", grimmory_id=42)]
+    book = models.Book(
+        id=1, title="Dune", author="Frank Herbert", isbn=None, cover_url=None,
+        manual_match_grimmory_id=99,
+    )
+
+    assert library_check.resolve_catalog_match(book, catalog) is None
+
+
+def test_find_owning_book_id_detects_manual_pin_conflict(conn):
+    # Compares against each book's own persisted claim, not a freshly-loaded catalog list, so no
+    # library_catalog seeding is needed here (see find_owning_book_id's docstring).
+    owner = models.create_book(conn, title="Some Other Title")
+    models.set_book_manual_match_grimmory_id(conn, owner.id, 42)
+
+    assert library_check.find_owning_book_id(conn, 42) == owner.id
+
+
+def test_find_owning_book_id_detects_auto_match_conflict(conn):
+    owner = models.create_book(conn, title="Dune", author="Frank Herbert")
+    models.set_book_grimmory_id(conn, owner.id, 42)
+
+    assert library_check.find_owning_book_id(conn, 42) == owner.id
+
+
+def test_find_owning_book_id_manual_pin_takes_precedence_over_grimmory_book_id(conn):
+    # A book could in principle have a stale grimmory_book_id from a prior auto-match alongside a
+    # newer manual pin to a different target - the manual pin is the one that should count.
+    owner = models.create_book(conn, title="Some Book")
+    models.set_book_grimmory_id(conn, owner.id, 7)
+    models.set_book_manual_match_grimmory_id(conn, owner.id, 42)
+
+    assert library_check.find_owning_book_id(conn, 42) == owner.id
+    assert library_check.find_owning_book_id(conn, 7) is None
+
+
+def test_find_owning_book_id_excludes_given_book(conn):
+    owner = models.create_book(conn, title="Some Other Title")
+    models.set_book_manual_match_grimmory_id(conn, owner.id, 42)
+
+    assert library_check.find_owning_book_id(conn, 42, exclude_book_id=owner.id) is None
+
+
+def test_find_owning_book_id_returns_none_when_unowned(conn):
+    models.create_book(conn, title="Something Else")
+
+    assert library_check.find_owning_book_id(conn, 42) is None
 
 
 def test_check_ownership_isbn_match_ignores_hyphens():
