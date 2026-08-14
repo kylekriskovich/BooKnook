@@ -537,6 +537,109 @@ def test_api_settings_spice_clamps_out_of_range_level(client, monkeypatch):
     assert sync_calls == [5]
 
 
+def test_api_settings_shelf_fields_default_for_fresh_user(client):
+    _logged_in_client(client)
+
+    response = client.get("/api/settings")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["want_to_read_shelf_id"] is None
+    assert body["sync_to_device_enabled"] is False
+    assert body["sync_to_device_shelf_id"] is None
+
+
+def test_api_settings_shelves_not_configured(client, monkeypatch):
+    _logged_in_client(client)
+    monkeypatch.delenv(grimmory_auth.GRIMMORY_BASE_URL_ENV, raising=False)
+
+    response = client.get("/api/settings/shelves")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["shelves"] == []
+    assert body["error"] == "Grimmory login is not configured"
+
+
+def test_api_settings_shelves_prompts_reconnect_when_no_valid_session(client, monkeypatch):
+    _logged_in_client(client)
+    monkeypatch.setattr(grimmory_auth, "get_valid_access_token", lambda conn, u: None)
+
+    response = client.get("/api/settings/shelves")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["shelves"] == []
+    assert body["error"] == "reconnect_needed"
+
+
+def test_api_settings_shelves_returns_own_shelves(client, monkeypatch):
+    _logged_in_client(client)
+    monkeypatch.setattr(grimmory_auth, "get_valid_access_token", lambda conn, u: "access-token")
+    monkeypatch.setattr(grimmory_auth, "get_own_grimmory_user_id", lambda base_url, token: 7)
+    monkeypatch.setattr(
+        library_check,
+        "list_own_shelves",
+        lambda base_url, token, own_id: [
+            {"id": 1, "name": "Want to Read", "userId": own_id},
+            {"id": 2, "name": "Booknook: Sync to Device", "userId": own_id},
+        ],
+    )
+
+    response = client.get("/api/settings/shelves")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["error"] is None
+    assert body["shelves"] == [
+        {"id": 1, "name": "Want to Read"},
+        {"id": 2, "name": "Booknook: Sync to Device"},
+    ]
+
+
+def test_api_settings_shelves_surfaces_library_check_unavailable(client, monkeypatch):
+    _logged_in_client(client)
+    monkeypatch.setattr(grimmory_auth, "get_valid_access_token", lambda conn, u: "access-token")
+    monkeypatch.setattr(grimmory_auth, "get_own_grimmory_user_id", lambda base_url, token: 7)
+
+    def raise_unavailable(*a, **k):
+        raise library_check.LibraryCheckUnavailable("shelf api down")
+
+    monkeypatch.setattr(library_check, "list_own_shelves", raise_unavailable)
+
+    response = client.get("/api/settings/shelves")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["shelves"] == []
+    assert body["error"] == "shelf api down"
+
+
+def test_api_settings_shelves_update_persists_and_round_trips(client):
+    _logged_in_client(client)
+
+    response = client.post(
+        "/api/settings/shelves",
+        json={
+            "want_to_read_shelf_id": 1,
+            "sync_to_device_enabled": True,
+            "sync_to_device_shelf_id": 2,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "want_to_read_shelf_id": 1,
+        "sync_to_device_enabled": True,
+        "sync_to_device_shelf_id": 2,
+    }
+
+    settings = client.get("/api/settings").json()
+    assert settings["want_to_read_shelf_id"] == 1
+    assert settings["sync_to_device_enabled"] is True
+    assert settings["sync_to_device_shelf_id"] == 2
+
+
 # --- search ---
 
 

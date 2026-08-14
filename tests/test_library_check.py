@@ -3,6 +3,13 @@ import pytest
 
 from app import library_check, models
 
+# Captured before any test's autouse fixture (see stub_shelf_sync below) replaces these module
+# attributes — the few places a test needs the *real* function instead of the default stub used
+# everywhere else so unrelated tests don't need their own Grimmory shelf fakes.
+_REAL_ENSURE_WANT_TO_READ_SHELF = library_check._ensure_want_to_read_shelf
+_REAL_FETCH_SHELF_BOOKS = library_check.fetch_shelf_books
+_REAL_ASSIGN_BOOK_SHELVES = library_check.assign_book_shelves
+
 
 class FakeResponse:
     def __init__(self, payload, status_code=200):
@@ -92,6 +99,31 @@ class RoutingFakeClient:
         return self._books_client.post(path, json=json)
 
 
+class ShelfFakeClient:
+    """Generic path-routed fake for the shelf endpoints (list/create shelves, shelf books,
+    assign/unassign) — responses keyed by path, recording every call for assertions."""
+
+    def __init__(self, get_responses=None, post_responses=None):
+        self._get_responses = get_responses or {}
+        self._post_responses = post_responses or {}
+        self.get_calls = []
+        self.post_calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def get(self, path, headers=None):
+        self.get_calls.append({"path": path, "headers": headers})
+        return FakeResponse(self._get_responses.get(path, []))
+
+    def post(self, path, json=None, headers=None):
+        self.post_calls.append({"path": path, "json": json, "headers": headers})
+        return FakeResponse(self._post_responses.get(path, {}))
+
+
 @pytest.fixture
 def covers_tmp_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(library_check, "covers_dir", lambda: str(tmp_path))
@@ -104,6 +136,17 @@ def conn():
     models.init_db(connection)
     yield connection
     connection.close()
+
+
+@pytest.fixture(autouse=True)
+def stub_shelf_sync(monkeypatch):
+    """sync_user_reading_status's Pass 3 (Want to Read) always runs, so every test that calls it
+    directly would otherwise need its own Grimmory shelf fakes even when shelf sync isn't what
+    it's testing. Stub the shelf functions to no-ops by default; the "shelf sync" tests below
+    override these with their own fakes via their own monkeypatch calls (last write wins)."""
+    monkeypatch.setattr(library_check, "_ensure_want_to_read_shelf", lambda *a, **k: 1)
+    monkeypatch.setattr(library_check, "fetch_shelf_books", lambda *a, **k: [])
+    monkeypatch.setattr(library_check, "assign_book_shelves", lambda *a, **k: None)
 
 
 @pytest.fixture
@@ -836,3 +879,297 @@ def test_fetch_reading_sessions_for_book_raises_on_http_failure(monkeypatch):
 
     with pytest.raises(library_check.LibraryCheckUnavailable):
         library_check.fetch_reading_sessions_for_book("https://grimmory.example.com", "token", 42)
+
+
+# --- list_own_shelves / get_or_create_shelf_by_name / fetch_shelf_books / assign_book_shelves ---
+
+SHELF_BASE_URL = "https://grimmory.example.com"
+
+
+def test_list_own_shelves_filters_to_own_user(monkeypatch):
+    shelves = [
+        {"id": 1, "name": "Want to Read", "userId": 7},
+        {"id": 2, "name": "Public Faves", "userId": 99},
+    ]
+    fake_client = ShelfFakeClient(get_responses={library_check.SHELVES_PATH: shelves})
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+
+    result = library_check.list_own_shelves(SHELF_BASE_URL, "token", own_grimmory_user_id=7)
+
+    assert result == [{"id": 1, "name": "Want to Read", "userId": 7}]
+
+
+def test_list_own_shelves_raises_on_http_failure(monkeypatch):
+    class FailingClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, path, headers=None):
+            return FakeResponse({}, status_code=500)
+
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: FailingClient())
+
+    with pytest.raises(library_check.LibraryCheckUnavailable):
+        library_check.list_own_shelves(SHELF_BASE_URL, "token", 7)
+
+
+def test_get_or_create_shelf_by_name_returns_existing_match_without_posting(monkeypatch):
+    shelves = [{"id": 1, "name": "Want to Read", "userId": 7}]
+    fake_client = ShelfFakeClient(get_responses={library_check.SHELVES_PATH: shelves})
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+
+    shelf_id = library_check.get_or_create_shelf_by_name(SHELF_BASE_URL, "token", 7, "Want to Read")
+
+    assert shelf_id == 1
+    assert fake_client.post_calls == []
+
+
+def test_get_or_create_shelf_by_name_creates_when_missing(monkeypatch):
+    fake_client = ShelfFakeClient(
+        get_responses={library_check.SHELVES_PATH: []},
+        post_responses={library_check.SHELVES_PATH: {"id": 55, "name": "Want to Read"}},
+    )
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+
+    shelf_id = library_check.get_or_create_shelf_by_name(SHELF_BASE_URL, "token", 7, "Want to Read")
+
+    assert shelf_id == 55
+    assert fake_client.post_calls[0]["json"] == {"name": "Want to Read", "publicShelf": False}
+
+
+def test_fetch_shelf_books_returns_payload(monkeypatch):
+    books = [{"id": 42, "metadata": {"title": "Dune"}}]
+    fake_client = ShelfFakeClient(
+        get_responses={library_check.SHELF_BOOKS_PATH.format(shelf_id=9): books}
+    )
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+
+    # fetch_shelf_books itself is what's under test here — the autouse stub_shelf_sync fixture
+    # only stubs it for sync_user_reading_status's own callers, not tests exercising it directly.
+    assert _REAL_FETCH_SHELF_BOOKS(SHELF_BASE_URL, "token", 9) == books
+
+
+def test_assign_book_shelves_noop_when_no_book_ids(monkeypatch):
+    fake_client = ShelfFakeClient()
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+
+    _REAL_ASSIGN_BOOK_SHELVES(SHELF_BASE_URL, "token", set())
+
+    assert fake_client.post_calls == []
+
+
+def test_assign_book_shelves_posts_expected_body(monkeypatch):
+    fake_client = ShelfFakeClient()
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+
+    _REAL_ASSIGN_BOOK_SHELVES(
+        SHELF_BASE_URL, "token", {1, 2}, shelves_to_assign={10}, shelves_to_unassign={20}
+    )
+
+    call = fake_client.post_calls[0]
+    assert call["path"] == library_check.BOOKS_SHELVES_PATH
+    assert set(call["json"]["bookIds"]) == {1, 2}
+    assert call["json"]["shelvesToAssign"] == [10]
+    assert call["json"]["shelvesToUnassign"] == [20]
+
+
+def test_assign_book_shelves_raises_on_http_failure(monkeypatch):
+    class FailingClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, path, json=None, headers=None):
+            return FakeResponse({}, status_code=500)
+
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: FailingClient())
+
+    with pytest.raises(library_check.LibraryCheckUnavailable):
+        _REAL_ASSIGN_BOOK_SHELVES(SHELF_BASE_URL, "token", {1})
+
+
+# --- sync_user_reading_status: shelf sync (Pass 3 Want to Read / Pass 4 Sync to Device) ---
+
+
+def _record_assign_calls(monkeypatch, calls):
+    def fake_assign(base_url, access_token, book_ids, shelves_to_assign=frozenset(), shelves_to_unassign=frozenset()):
+        calls.append(
+            {
+                "book_ids": set(book_ids),
+                "assign": set(shelves_to_assign),
+                "unassign": set(shelves_to_unassign),
+            }
+        )
+
+    monkeypatch.setattr(library_check, "assign_book_shelves", fake_assign)
+
+
+def test_shelf_sync_lazy_creation_skipped_when_shelf_id_already_set(conn, monkeypatch):
+    user = models.get_or_create_user(conn, "alice")
+    models.set_want_to_read_shelf_id(conn, user.id, 555)
+    monkeypatch.setattr(
+        library_check, "_ensure_want_to_read_shelf", _REAL_ENSURE_WANT_TO_READ_SHELF
+    )
+    _fake_books_client([], monkeypatch)
+    monkeypatch.setattr(library_check, "fetch_shelf_books", lambda *a, **k: [])
+    monkeypatch.setattr(library_check, "assign_book_shelves", lambda *a, **k: None)
+
+    def fail_get_or_create(*a, **k):
+        raise AssertionError("shelf id already resolved, must not be re-created")
+
+    monkeypatch.setattr(library_check, "get_or_create_shelf_by_name", fail_get_or_create)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+
+def test_shelf_sync_assigns_wanted_in_library_book_not_yet_on_shelf(conn, monkeypatch):
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
+    models.set_book_grimmory_id(conn, book.id, 42)
+    models.add_tbr_entry(conn, user.id, book.id)  # status "wanted"
+    _fake_books_client([], monkeypatch)
+    monkeypatch.setattr(library_check, "fetch_shelf_books", lambda *a, **k: [])
+    assign_calls = []
+    _record_assign_calls(monkeypatch, assign_calls)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    call = next(c for c in assign_calls if c["assign"] == {1})
+    assert call["book_ids"] == {42}
+    assert call["unassign"] == set()
+
+
+def test_shelf_sync_unassigns_book_that_transitions_off_wanted_this_sync(conn, monkeypatch):
+    user = models.get_or_create_user(conn, "alice")
+    # Local cover already set so Pass 1 doesn't attempt a cover download for this entry — that's
+    # covered separately by the existing cover-download tests, not the point of this test.
+    book = models.create_book(
+        conn, title="Dune", author="Frank Herbert", isbn="9780441172719", cover_url="/covers/existing.jpg"
+    )
+    models.set_book_grimmory_id(conn, book.id, 42)
+    models.add_tbr_entry(conn, user.id, book.id)  # status "wanted"
+    # Real Grimmory book payloads always include "id" - matters here since Pass 1's
+    # _sync_book_metadata always overwrites books.grimmory_book_id from this payload.
+    _fake_books_client(
+        [
+            {
+                "id": 42,
+                "metadata": {"title": "Dune", "isbn13": "9780441172719", "authors": ["Frank Herbert"]},
+                "readStatus": "READING",
+            }
+        ],
+        monkeypatch,
+    )
+    # Simulate the book already sitting on the Want to Read shelf from a prior sync.
+    monkeypatch.setattr(
+        library_check, "fetch_shelf_books", lambda *a, **k: [{"id": 42, "metadata": {"title": "Dune"}}]
+    )
+    assign_calls = []
+    _record_assign_calls(monkeypatch, assign_calls)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entry = models.list_tbr_entries_with_books(conn, user.id)[0]
+    assert entry.status == "reading"
+    call = next(c for c in assign_calls if c["unassign"] == {1})
+    assert call["book_ids"] == {42}
+
+
+def test_shelf_sync_pulls_in_unknown_shelf_book_without_duplicating_known_match(
+    conn, covers_tmp_dir, monkeypatch
+):
+    user = models.get_or_create_user(conn, "alice")
+    # Already-known entry, currently "reading" and present on the shelf too — pull-in must not
+    # duplicate or downgrade it.
+    known_book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
+    models.set_book_grimmory_id(conn, known_book.id, 42)
+    known_entry = models.add_tbr_entry(conn, user.id, known_book.id)
+    models.set_tbr_entry_status(conn, known_entry.id, "reading")
+
+    # The pulled-in book (id 99) has no local cover yet, so Pass 3's pull-in triggers a real cover
+    # download — route it through a proper fake cover response rather than the plain books-list
+    # fake, matching the existing test_sync_downloads_cover_for_imported_book pattern.
+    books_client = FakeClient(books_payload=[])
+    routing_client = RoutingFakeClient(books_client, FakeCoverResponse())
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: routing_client)
+    shelf_books = [
+        {"id": 42, "metadata": {"title": "Dune", "isbn13": "9780441172719", "authors": ["Frank Herbert"]}},
+        {
+            "id": 99,
+            "metadata": {
+                "title": "Project Hail Mary",
+                "isbn13": "9780593135204",
+                "authors": ["Andy Weir"],
+            },
+        },
+    ]
+    monkeypatch.setattr(library_check, "fetch_shelf_books", lambda *a, **k: shelf_books)
+    monkeypatch.setattr(library_check, "assign_book_shelves", lambda *a, **k: None)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entries = models.list_tbr_entries_with_books(conn, user.id)
+    assert len(entries) == 2
+    known = next(e for e in entries if e.book.grimmory_book_id == 42)
+    assert known.status == "reading"  # not downgraded/duplicated
+    pulled_in = next(e for e in entries if e.book.grimmory_book_id == 99)
+    assert pulled_in.status == "wanted"
+    assert pulled_in.book.title == "Project Hail Mary"
+
+
+def test_shelf_sync_device_shelf_skipped_when_disabled(conn, monkeypatch):
+    user = models.get_or_create_user(conn, "alice")  # sync_to_device_enabled defaults to False
+    _fake_books_client([], monkeypatch)
+    monkeypatch.setattr(library_check, "fetch_shelf_books", lambda *a, **k: [])
+    monkeypatch.setattr(library_check, "assign_book_shelves", lambda *a, **k: None)
+
+    def fail_ensure_device_shelf(*a, **k):
+        raise AssertionError("sync_to_device shelf should not be resolved when disabled")
+
+    monkeypatch.setattr(library_check, "_ensure_sync_to_device_shelf", fail_ensure_device_shelf)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+
+def test_shelf_sync_device_shelf_assigns_all_in_library_statuses_never_unassigns(conn, monkeypatch):
+    user = models.get_or_create_user(conn, "alice")
+    models.set_sync_to_device_enabled(conn, user.id, True)
+
+    wanted_book = models.create_book(conn, title="Dune", isbn="9780441172719")
+    models.set_book_grimmory_id(conn, wanted_book.id, 1)
+    models.add_tbr_entry(conn, user.id, wanted_book.id)  # wanted
+
+    finished_book = models.create_book(conn, title="Hyperion", isbn="9780553283686")
+    models.set_book_grimmory_id(conn, finished_book.id, 2)
+    finished_entry = models.add_tbr_entry(conn, user.id, finished_book.id)
+    models.set_tbr_entry_status(conn, finished_entry.id, "finished")
+
+    _fake_books_client([], monkeypatch)
+    monkeypatch.setattr(library_check, "fetch_shelf_books", lambda *a, **k: [])
+    monkeypatch.setattr(library_check, "_ensure_sync_to_device_shelf", lambda *a, **k: 2)
+    assign_calls = []
+    _record_assign_calls(monkeypatch, assign_calls)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    device_call = next(c for c in assign_calls if c["assign"] == {2})
+    assert device_call["book_ids"] == {1, 2}
+    assert device_call["unassign"] == set()
+
+
+def test_shelf_sync_failure_propagates_uncaught(conn, monkeypatch):
+    user = models.get_or_create_user(conn, "alice")
+    _fake_books_client([], monkeypatch)
+
+    def raise_unavailable(*a, **k):
+        raise library_check.LibraryCheckUnavailable("shelf api down")
+
+    monkeypatch.setattr(library_check, "fetch_shelf_books", raise_unavailable)
+
+    with pytest.raises(library_check.LibraryCheckUnavailable):
+        library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
