@@ -940,6 +940,33 @@ def test_get_or_create_shelf_by_name_creates_when_missing(monkeypatch):
     assert fake_client.post_calls[0]["json"] == {"name": "Want to Read", "publicShelf": False}
 
 
+def test_get_or_create_shelf_by_name_ignores_name_match_missing_an_id(monkeypatch):
+    # A malformed name-matching entry (no "id") must not be treated as a real match - it should
+    # fall through to creating a fresh shelf instead of raising a bare KeyError.
+    shelves = [{"name": "Want to Read", "userId": 7}]
+    fake_client = ShelfFakeClient(
+        get_responses={library_check.SHELVES_PATH: shelves},
+        post_responses={library_check.SHELVES_PATH: {"id": 55, "name": "Want to Read"}},
+    )
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+
+    shelf_id = library_check.get_or_create_shelf_by_name(SHELF_BASE_URL, "token", 7, "Want to Read")
+
+    assert shelf_id == 55
+    assert len(fake_client.post_calls) == 1
+
+
+def test_get_or_create_shelf_by_name_raises_when_created_shelf_has_no_id(monkeypatch):
+    fake_client = ShelfFakeClient(
+        get_responses={library_check.SHELVES_PATH: []},
+        post_responses={library_check.SHELVES_PATH: {"name": "Want to Read"}},
+    )
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+
+    with pytest.raises(library_check.LibraryCheckUnavailable):
+        library_check.get_or_create_shelf_by_name(SHELF_BASE_URL, "token", 7, "Want to Read")
+
+
 def test_get_or_create_shelf_by_name_adopts_shelf_created_by_a_concurrent_sync(monkeypatch):
     # Regression test: the manual /api/settings/sync trigger and the periodic background loop can
     # both reach this function for the same user around the same time (e.g. while the library
@@ -1211,3 +1238,11 @@ def test_shelf_sync_failure_propagates_uncaught(conn, monkeypatch):
 
     with pytest.raises(library_check.LibraryCheckUnavailable):
         library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+
+def test_sync_user_reading_status_raises_when_user_deleted_mid_sync(conn, monkeypatch):
+    # Regression test: user_id no longer resolving to a row (e.g. deleted between the caller
+    # loading it and this running) must surface as LibraryCheckUnavailable - the exception type
+    # every caller already catches - not an AttributeError from a later `user.*` read.
+    with pytest.raises(library_check.LibraryCheckUnavailable):
+        library_check.sync_user_reading_status(conn, 999999, "https://grimmory.example.com", "token")

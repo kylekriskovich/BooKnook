@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { api, unwrap } from '$lib/api/client';
+	import { api, ApiError, unwrap } from '$lib/api/client';
 
 	let {
 		wantToReadShelfId: initialWantToReadShelfId,
@@ -28,9 +28,14 @@
 
 	let saving = $state(false);
 	let saved = $state(false);
+	let saveError = $state<string | null>(null);
 
 	let reconnectPassword = $state('');
 	let reconnecting = $state(false);
+
+	function describeError(err: unknown): string {
+		return err instanceof ApiError ? err.message : 'Could not reach the server — try again.';
+	}
 
 	async function loadShelves() {
 		loadingShelves = true;
@@ -38,6 +43,8 @@
 			const result = unwrap(await api.GET('/api/settings/shelves'));
 			shelves = result.shelves;
 			shelvesError = result.error ?? null;
+		} catch (err) {
+			shelvesError = describeError(err);
 		} finally {
 			loadingShelves = false;
 		}
@@ -56,6 +63,8 @@
 			} else {
 				await loadShelves();
 			}
+		} catch (err) {
+			shelvesError = describeError(err);
 		} finally {
 			reconnecting = false;
 		}
@@ -65,6 +74,7 @@
 		event.preventDefault();
 		saving = true;
 		saved = false;
+		saveError = null;
 		try {
 			unwrap(
 				await api.POST('/api/settings/shelves', {
@@ -76,6 +86,8 @@
 				})
 			);
 			saved = true;
+		} catch (err) {
+			saveError = describeError(err);
 		} finally {
 			saving = false;
 		}
@@ -102,6 +114,7 @@
 			Keeps a Grimmory shelf in sync with your Want to Read list, and optionally a second shelf
 			for the KOReader plugin.
 		</p>
+		{#if saveError}<p class="error">{saveError}</p>{/if}
 		<form class="settings-form" onsubmit={save}>
 			<label>
 				Want to Read shelf

@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Iterable, Optional
 
 import httpx
 from rapidfuzz import fuzz
@@ -333,7 +333,7 @@ def get_or_create_shelf_by_name(
     # already made themselves under this name is silently adopted (Grimmory enforces unique shelf
     # names per user, so a name match here is unambiguous).
     for shelf in list_own_shelves(base_url, access_token, own_grimmory_user_id):
-        if shelf.get("name") == name:
+        if shelf.get("name") == name and shelf.get("id") is not None:
             return shelf["id"]
     try:
         with httpx.Client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
@@ -349,13 +349,18 @@ def get_or_create_shelf_by_name(
                 # configured the periodic loop runs every 60s) - someone else already created
                 # this shelf between our GET above and this POST. Not an error: adopt it.
                 for shelf in list_own_shelves(base_url, access_token, own_grimmory_user_id):
-                    if shelf.get("name") == name:
+                    if shelf.get("name") == name and shelf.get("id") is not None:
                         return shelf["id"]
                 raise LibraryCheckUnavailable(
                     f"Grimmory reported shelf {name!r} already exists but it isn't visible yet"
                 )
             response.raise_for_status()
-            return response.json()["id"]
+            body = response.json()
+            if body.get("id") is None:
+                raise LibraryCheckUnavailable(
+                    f"Grimmory created shelf {name!r} but returned no id"
+                )
+            return body["id"]
     except httpx.HTTPError as exc:
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
 
@@ -390,9 +395,9 @@ def fetch_shelf_books(base_url: str, access_token: str, shelf_id: int) -> list[d
 def assign_book_shelves(
     base_url: str,
     access_token: str,
-    book_ids: set[int],
-    shelves_to_assign: set[int] = frozenset(),
-    shelves_to_unassign: set[int] = frozenset(),
+    book_ids: Iterable[int],
+    shelves_to_assign: Iterable[int] = frozenset(),
+    shelves_to_unassign: Iterable[int] = frozenset(),
 ) -> None:
     # shelves_to_assign/unassign apply uniformly to every id in book_ids (confirmed against
     # Grimmory's BookUpdateService) - this is not a per-book instruction list, so callers must
@@ -640,6 +645,11 @@ def sync_user_reading_status(
     # Callers are expected to treat this as best-effort - a failed Grimmory call must not block
     # login (see /login) or the on-demand sync (see /settings/sync).
     user = get_user(db_connection, user_id)
+    if user is None:
+        # Deleted mid-sync (e.g. by an admin) between the caller resolving user_id and this
+        # running - surface the same exception type callers already expect, not an AttributeError
+        # from the shelf-sync passes' later `user.*` reads below.
+        raise LibraryCheckUnavailable(f"No such user_id={user_id}")
     books = fetch_user_books(base_url, access_token)
     catalog = [_book_to_catalog_entry(book) for book in books]
 
