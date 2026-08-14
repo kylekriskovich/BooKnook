@@ -342,6 +342,18 @@ def get_or_create_shelf_by_name(
                 json={"name": name, "publicShelf": False},
                 headers={"Authorization": f"Bearer {access_token}"},
             )
+            if response.status_code == 409:
+                # Lost a create race against another sync for the same user (the manual
+                # POST /api/settings/sync trigger and the periodic background loop can both
+                # reach here concurrently, e.g. while the library catalog cross-check isn't
+                # configured the periodic loop runs every 60s) - someone else already created
+                # this shelf between our GET above and this POST. Not an error: adopt it.
+                for shelf in list_own_shelves(base_url, access_token, own_grimmory_user_id):
+                    if shelf.get("name") == name:
+                        return shelf["id"]
+                raise LibraryCheckUnavailable(
+                    f"Grimmory reported shelf {name!r} already exists but it isn't visible yet"
+                )
             response.raise_for_status()
             return response.json()["id"]
     except httpx.HTTPError as exc:

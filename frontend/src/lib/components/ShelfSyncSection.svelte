@@ -105,8 +105,8 @@
 		<form class="settings-form" onsubmit={save}>
 			<label>
 				Want to Read shelf
-				<select bind:value={wantToReadShelfId} required>
-					<option value={null} disabled>Choose a shelf…</option>
+				<select bind:value={wantToReadShelfId}>
+					<option value={null}>Auto-create "Want to Read" on next sync</option>
 					{#each shelves as shelf (shelf.id)}
 						<option value={shelf.id}>{shelf.name}</option>
 					{/each}
@@ -122,8 +122,8 @@
 			{#if syncToDeviceEnabled}
 				<label>
 					Sync to Device shelf
-					<select bind:value={syncToDeviceShelfId} required>
-						<option value={null} disabled>Choose a shelf…</option>
+					<select bind:value={syncToDeviceShelfId}>
+						<option value={null}>Auto-create "Booknook: Sync to Device" on next sync</option>
 						{#each shelves as shelf (shelf.id)}
 							<option value={shelf.id}>{shelf.name}</option>
 						{/each}

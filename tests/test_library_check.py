@@ -940,6 +940,44 @@ def test_get_or_create_shelf_by_name_creates_when_missing(monkeypatch):
     assert fake_client.post_calls[0]["json"] == {"name": "Want to Read", "publicShelf": False}
 
 
+def test_get_or_create_shelf_by_name_adopts_shelf_created_by_a_concurrent_sync(monkeypatch):
+    # Regression test: the manual /api/settings/sync trigger and the periodic background loop can
+    # both reach this function for the same user around the same time (e.g. while the library
+    # catalog cross-check isn't configured, the periodic loop runs every 60s) - whichever POSTs
+    # second gets Grimmory's 409 SHELF_ALREADY_EXISTS. That must be treated as "someone else just
+    # created it" and adopted, not surfaced as a sync failure.
+    class RacyShelfClient:
+        def __init__(self):
+            self.get_call_count = 0
+            self.post_calls = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, path, headers=None):
+            self.get_call_count += 1
+            # First GET (before the POST) sees nothing yet; the second GET (after losing the
+            # create race) sees the shelf the other sync already created.
+            shelves = [] if self.get_call_count == 1 else [{"id": 77, "name": "Want to Read", "userId": 7}]
+            return FakeResponse(shelves)
+
+        def post(self, path, json=None, headers=None):
+            self.post_calls.append({"path": path, "json": json})
+            return FakeResponse({}, status_code=409)
+
+    fake_client = RacyShelfClient()
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+
+    shelf_id = library_check.get_or_create_shelf_by_name(SHELF_BASE_URL, "token", 7, "Want to Read")
+
+    assert shelf_id == 77
+    assert len(fake_client.post_calls) == 1
+    assert fake_client.get_call_count == 2
+
+
 def test_fetch_shelf_books_returns_payload(monkeypatch):
     books = [{"id": 42, "metadata": {"title": "Dune"}}]
     fake_client = ShelfFakeClient(
