@@ -790,7 +790,8 @@ main > h1:first-child {
   color: var(--text-muted2);
 }
 
-.settings-form input {
+.settings-form input:not([type='checkbox']),
+.settings-form select {
   padding: 12px 14px;
   font: 15px system-ui;
   border-radius: 10px;
@@ -803,6 +804,18 @@ main > h1:first-child {
 .settings-form button {
   justify-self: start;
   padding: 0.7rem 1.4rem;
+}
+
+.settings-form label.settings-checkbox-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.settings-checkbox-row input[type='checkbox'] {
+  width: 1.1rem;
+  height: 1.1rem;
 }
 
 /* Settings page (/settings) — account list */

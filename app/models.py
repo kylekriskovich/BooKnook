@@ -26,6 +26,18 @@ SCHEMA_SQL = """
 -- calendar_view_preference ('grid' | 'list') is which layout the Reading Calendar section on
 -- /stats last showed — same shape/purpose as view_preference above, just a second, independent
 -- view toggle for a different part of the app.
+-- want_to_read_shelf_id is the Grimmory shelf id (Grimmory's own numeric id, not a local foreign
+-- key — same relationship as books.grimmory_book_id) backing this user's always-on "Want to Read"
+-- shelf mirror (see app/library_check.py's shelf-sync passes in sync_user_reading_status). NULL
+-- until resolved — either the user's own choice from the Settings dropdown, or lazily
+-- get-or-created by name on this user's first sync after the feature shipped.
+-- sync_to_device_enabled is the user's opt-in for the "Sync to Device" shelf, which feeds the
+-- external grimmory.koplugin KOReader plugin — default off, and unlike want_to_read_shelf_id
+-- nothing ever flows from this shelf back into BooKnook.
+-- sync_to_device_shelf_id mirrors want_to_read_shelf_id's shape/lifecycle but for the opt-in
+-- shelf; meaningless while sync_to_device_enabled is 0, but deliberately left in place (not
+-- cleared) if the user disables and later re-enables, so re-enabling doesn't need to re-resolve
+-- or re-create the shelf.
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
@@ -33,7 +45,10 @@ CREATE TABLE IF NOT EXISTS users (
     onboarded INTEGER NOT NULL DEFAULT 0,
     grimmory_refresh_token TEXT,
     spice_level INTEGER NOT NULL DEFAULT 0,
-    calendar_view_preference TEXT NOT NULL DEFAULT 'grid'
+    calendar_view_preference TEXT NOT NULL DEFAULT 'grid',
+    want_to_read_shelf_id INTEGER,
+    sync_to_device_enabled INTEGER NOT NULL DEFAULT 0,
+    sync_to_device_shelf_id INTEGER
 );
 
 -- page_count is Grimmory's own catalog metadata (BookMetadata.pageCount) — plain book metadata,
@@ -50,6 +65,17 @@ CREATE TABLE IF NOT EXISTS users (
 -- color that book's calendar bars/swatch so they match its actual cover instead of an id-cycled
 -- palette. NULL until first computed, and forever afterward if the book has no cover_url or the
 -- image can't be decoded (callers fall back to the palette in that case).
+-- manual_match_grimmory_id is an admin-asserted override, distinct from grimmory_book_id's
+-- fuzzy-match provenance above — set via POST /api/admin/books/{id}/match when an admin manually
+-- links a Need-to-Acquire book to a library_catalog row that library_check.find_catalog_match
+-- failed to associate on its own. Stores Grimmory's own numeric book id (library_catalog.grimmory_id),
+-- never library_catalog.id — that table is fully ephemeral, rebuilt from scratch on every catalog
+-- sync (see replace_library_catalog), so its row ids don't survive across syncs. NULL means no
+-- manual override; when set, library_check.resolve_catalog_match treats it as this book's catalog
+-- match, taking priority over the fuzzy matcher. This is a second, higher-priority source for
+-- grimmory_book_id above, not a loosening of that column's "not user-editable" contract —
+-- grimmory_book_id itself remains only ever machine-derived, just from two candidate sources now.
+-- Cleared back to NULL by the unmatch action.
 CREATE TABLE IF NOT EXISTS books (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
@@ -59,7 +85,8 @@ CREATE TABLE IF NOT EXISTS books (
     published_date TEXT,
     page_count INTEGER,
     grimmory_book_id INTEGER,
-    cover_color TEXT
+    cover_color TEXT,
+    manual_match_grimmory_id INTEGER
 );
 
 -- status is 'wanted' | 'reading' | 'finished' — driven automatically by the Grimmory reading-
@@ -235,6 +262,20 @@ def init_db(db_connection: sqlite3.Connection) -> None:
         db_connection.execute("ALTER TABLE library_catalog ADD COLUMN grimmory_id INTEGER")
     except sqlite3.OperationalError:
         pass  # column already exists
+    try:
+        db_connection.execute("ALTER TABLE users ADD COLUMN want_to_read_shelf_id INTEGER")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    try:
+        db_connection.execute(
+            "ALTER TABLE users ADD COLUMN sync_to_device_enabled INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    try:
+        db_connection.execute("ALTER TABLE users ADD COLUMN sync_to_device_shelf_id INTEGER")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     # KOReader self-service sync removed 2026-07-29 — dropped in favor of already-hiding
     # null/zero stats everywhere else, rather than needing a second signal to gate them on.
     # DROP COLUMN needs SQLite 3.35+ (bundled with Python 3.12's sqlite3 module, well past that);
@@ -247,6 +288,10 @@ def init_db(db_connection: sqlite3.Connection) -> None:
             pass  # already dropped, or never existed on a fresh database
     try:
         db_connection.execute("ALTER TABLE tbr_entries ADD COLUMN sort_order INTEGER")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    try:
+        db_connection.execute("ALTER TABLE books ADD COLUMN manual_match_grimmory_id INTEGER")
     except sqlite3.OperationalError:
         pass  # column already exists
     # One-time backfill for wanted entries that predate sort_order — numbers each user's own
@@ -278,6 +323,9 @@ class User:
     grimmory_refresh_token: Optional[str] = None
     spice_level: int = 0
     calendar_view_preference: str = "grid"
+    want_to_read_shelf_id: Optional[int] = None
+    sync_to_device_enabled: bool = False
+    sync_to_device_shelf_id: Optional[int] = None
 
 
 @dataclass
@@ -291,6 +339,7 @@ class Book:
     page_count: Optional[int] = None
     grimmory_book_id: Optional[int] = None
     cover_color: Optional[str] = None
+    manual_match_grimmory_id: Optional[int] = None
 
 
 @dataclass
@@ -381,6 +430,9 @@ def _row_to_user(row: sqlite3.Row) -> User:
         grimmory_refresh_token=row["grimmory_refresh_token"],
         spice_level=row["spice_level"],
         calendar_view_preference=row["calendar_view_preference"],
+        want_to_read_shelf_id=row["want_to_read_shelf_id"],
+        sync_to_device_enabled=bool(row["sync_to_device_enabled"]),
+        sync_to_device_shelf_id=row["sync_to_device_shelf_id"],
     )
 
 
@@ -395,6 +447,7 @@ def _row_to_book(row: sqlite3.Row) -> Book:
         page_count=row["page_count"],
         grimmory_book_id=row["grimmory_book_id"],
         cover_color=row["cover_color"],
+        manual_match_grimmory_id=row["manual_match_grimmory_id"],
     )
 
 
@@ -475,6 +528,31 @@ def set_grimmory_refresh_token(
 
 def set_spice_level(db_connection: sqlite3.Connection, user_id: int, spice_level: int) -> None:
     db_connection.execute("UPDATE users SET spice_level = ? WHERE id = ?", (spice_level, user_id))
+    db_connection.commit()
+
+
+def set_want_to_read_shelf_id(
+    db_connection: sqlite3.Connection, user_id: int, shelf_id: Optional[int]
+) -> None:
+    db_connection.execute(
+        "UPDATE users SET want_to_read_shelf_id = ? WHERE id = ?", (shelf_id, user_id)
+    )
+    db_connection.commit()
+
+
+def set_sync_to_device_enabled(db_connection: sqlite3.Connection, user_id: int, enabled: bool) -> None:
+    db_connection.execute(
+        "UPDATE users SET sync_to_device_enabled = ? WHERE id = ?", (int(enabled), user_id)
+    )
+    db_connection.commit()
+
+
+def set_sync_to_device_shelf_id(
+    db_connection: sqlite3.Connection, user_id: int, shelf_id: Optional[int]
+) -> None:
+    db_connection.execute(
+        "UPDATE users SET sync_to_device_shelf_id = ? WHERE id = ?", (shelf_id, user_id)
+    )
     db_connection.commit()
 
 
@@ -581,7 +659,7 @@ def list_aggregate_tbr(db_connection: sqlite3.Connection) -> list[AggregateTBREn
     rows = db_connection.execute(
         """
         SELECT books.id AS book_id, books.title, books.author, books.isbn, books.cover_url,
-               users.name AS user_name
+               books.grimmory_book_id, books.manual_match_grimmory_id, users.name AS user_name
         FROM tbr_entries
         JOIN books ON books.id = tbr_entries.book_id
         JOIN users ON users.id = tbr_entries.user_id
@@ -600,6 +678,8 @@ def list_aggregate_tbr(db_connection: sqlite3.Connection) -> list[AggregateTBREn
                     author=row["author"],
                     isbn=row["isbn"],
                     cover_url=row["cover_url"],
+                    grimmory_book_id=row["grimmory_book_id"],
+                    manual_match_grimmory_id=row["manual_match_grimmory_id"],
                 ),
                 wanted_by=[],
             )
@@ -705,6 +785,31 @@ def set_book_grimmory_id(
 ) -> None:
     db_connection.execute(
         "UPDATE books SET grimmory_book_id = ? WHERE id = ?", (grimmory_book_id, book_id)
+    )
+    db_connection.commit()
+
+
+def set_book_manual_match_grimmory_id(
+    db_connection: sqlite3.Connection, book_id: int, grimmory_book_id: Optional[int]
+) -> None:
+    db_connection.execute(
+        "UPDATE books SET manual_match_grimmory_id = ? WHERE id = ?", (grimmory_book_id, book_id)
+    )
+    db_connection.commit()
+
+
+def set_book_manual_match_and_grimmory_id(
+    db_connection: sqlite3.Connection,
+    book_id: int,
+    manual_match_grimmory_id: Optional[int],
+    grimmory_book_id: Optional[int],
+) -> None:
+    """Sets both columns in a single UPDATE + commit — used by POST /api/admin/books/{id}/match
+    (match and unmatch) so the pin and its immediate effect on grimmory_book_id can never be left
+    inconsistent by a crash between two separate writes."""
+    db_connection.execute(
+        "UPDATE books SET manual_match_grimmory_id = ?, grimmory_book_id = ? WHERE id = ?",
+        (manual_match_grimmory_id, grimmory_book_id, book_id),
     )
     db_connection.commit()
 

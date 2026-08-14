@@ -44,6 +44,7 @@ from app.models import (
     list_tbr_entries_with_books,
     remove_tbr_entry,
     search_library_catalog,
+    set_book_manual_match_and_grimmory_id,
     set_calendar_view_preference,
     set_grimmory_admin_settings,
     set_grimmory_refresh_token,
@@ -51,10 +52,13 @@ from app.models import (
     set_onboarded,
     set_search_settings,
     set_spice_level,
+    set_sync_to_device_enabled,
+    set_sync_to_device_shelf_id,
     set_tbr_entry_finished_at,
     set_tbr_entry_started_at,
     set_view_preference,
     set_wanted_order,
+    set_want_to_read_shelf_id,
     upsert_goal,
 )
 
@@ -380,6 +384,7 @@ def _requested_row(entry) -> dict:
     see _catalog_row for the other source (a full catalog entry has no book id/cover, no
     wanted_by unless it happens to also be requested)."""
     return {
+        "id": entry.book.id,
         "title": entry.book.title,
         "author": entry.book.author,
         "cover_url": entry.book.cover_url,
@@ -393,6 +398,7 @@ def _catalog_row(catalog_entry, wanted_by: list[str]) -> dict:
         "author": ", ".join(catalog_entry.authors) if catalog_entry.authors else None,
         "cover_url": None,
         "wanted_by": wanted_by,
+        "grimmory_id": catalog_entry.grimmory_id,
     }
 
 
@@ -710,6 +716,9 @@ def api_settings(user: User = Depends(require_user), db_connection: sqlite3.Conn
         spice_labels=_spice_labels(),
         spice_level=user.spice_level,
         has_grimmory_session=bool(user.grimmory_refresh_token),
+        want_to_read_shelf_id=user.want_to_read_shelf_id,
+        sync_to_device_enabled=user.sync_to_device_enabled,
+        sync_to_device_shelf_id=user.sync_to_device_shelf_id,
     )
 
 
@@ -752,6 +761,58 @@ def api_settings_sync(
             error = str(exc)
 
     return schemas.SyncResultOut(error=error)
+
+
+@app.get("/api/settings/shelves", response_model=schemas.ShelfOptionsOut)
+def api_settings_shelves(
+    user: User = Depends(require_user), db_connection: sqlite3.Connection = Depends(get_db)
+):
+    # Live Grimmory shelf list for the Settings-page dropdowns — deliberately its own route rather
+    # than folded into GET /api/settings, so a slow/unreachable Grimmory only affects this section
+    # instead of the whole settings page load.
+    base_url = os.environ.get(grimmory_auth.GRIMMORY_BASE_URL_ENV)
+    if not base_url:
+        return schemas.ShelfOptionsOut(shelves=[], error="Grimmory login is not configured")
+
+    access_token = grimmory_auth.get_valid_access_token(db_connection, user)
+    if access_token is None:
+        return schemas.ShelfOptionsOut(shelves=[], error="reconnect_needed")
+
+    try:
+        own_id = grimmory_auth.get_own_grimmory_user_id(base_url, access_token)
+        shelves = library_check.list_own_shelves(base_url, access_token, own_id)
+    except LibraryCheckUnavailable as exc:
+        return schemas.ShelfOptionsOut(shelves=[], error=str(exc))
+
+    return schemas.ShelfOptionsOut(
+        shelves=[
+            schemas.ShelfOptionOut(id=shelf["id"], name=shelf["name"])
+            for shelf in shelves
+            if shelf.get("id") is not None and shelf.get("name") is not None
+        ]
+    )
+
+
+@app.post("/api/settings/shelves", response_model=schemas.ShelfSyncSettingsOut)
+def api_settings_shelves_update(
+    payload: schemas.ShelfSyncSettingsIn,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    # Pure local write, no live Grimmory validation call here — if a stale/foreign shelf id ever
+    # got persisted, Grimmory's own POST /api/v1/books/shelves already rejects assigning to a
+    # shelf the user doesn't own, so the next sync fails loud (self-correcting once fixed) rather
+    # than needing a second live round trip on every save.
+    set_want_to_read_shelf_id(db_connection, user.id, payload.want_to_read_shelf_id)
+    set_sync_to_device_enabled(db_connection, user.id, payload.sync_to_device_enabled)
+    set_sync_to_device_shelf_id(db_connection, user.id, payload.sync_to_device_shelf_id)
+
+    current = get_user(db_connection, user.id)
+    return schemas.ShelfSyncSettingsOut(
+        want_to_read_shelf_id=current.want_to_read_shelf_id,
+        sync_to_device_enabled=current.sync_to_device_enabled,
+        sync_to_device_shelf_id=current.sync_to_device_shelf_id,
+    )
 
 
 @app.post("/api/settings/spice", response_model=schemas.SpiceResultOut)
@@ -996,18 +1057,34 @@ def api_admin(db_connection: sqlite3.Connection = Depends(get_db)):
         # carrying over wanted_by wherever a catalog entry does happen to also be requested.
         wanted_by_for_catalog: dict[int, list[str]] = {}
         needed_entries = []
+        manual_owned_rows = []
+        # id(match) of catalog entries already represented via a manual-match row below, so the
+        # plain catalog pass doesn't also show them (each catalog entry appears exactly once).
+        represented_catalog_ids: set[int] = set()
         for entry in aggregate_entries:
-            match = library_check.find_catalog_match(
-                entry.book.title, entry.book.isbn, entry.book.author, catalog
-            )
+            match = library_check.resolve_catalog_match(entry.book, catalog)
             if match is None:
                 needed_entries.append(_requested_row(entry))
+            elif entry.book.manual_match_grimmory_id is not None:
+                # Manually matched: render using the book's own stored title/author/cover — this
+                # is admin-asserted certainty, not re-derived from a possibly differently-titled
+                # catalog row (see _catalog_row for the auto-match path, which does use the
+                # catalog row's own fields).
+                row = _requested_row(entry)
+                row["grimmory_id"] = match.grimmory_id
+                row["manually_matched"] = True
+                manual_owned_rows.append(row)
+                represented_catalog_ids.add(id(match))
             else:
                 wanted_by_for_catalog[id(match)] = entry.wanted_by
 
+        catalog_rows = [
+            _catalog_row(c, wanted_by_for_catalog.get(id(c), []))
+            for c in catalog
+            if id(c) not in represented_catalog_ids
+        ]
         owned_entries = sorted(
-            (_catalog_row(c, wanted_by_for_catalog.get(id(c), [])) for c in catalog),
-            key=lambda row: (row["title"] or "").casefold(),
+            manual_owned_rows + catalog_rows, key=lambda row: (row["title"] or "").casefold()
         )
     return schemas.AdminOut(
         needed_entries=[schemas.AdminEntryOut(**row) for row in needed_entries],
@@ -1022,6 +1099,61 @@ def api_admin(db_connection: sqlite3.Connection = Depends(get_db)):
 async def api_admin_library_sync():
     with contextlib.suppress(LibraryCheckUnavailable):
         await asyncio.to_thread(library_check.sync_catalog_now)
+    return Response(status_code=204)
+
+
+@app.get("/api/admin/library-search", response_model=schemas.SearchOut)
+def api_admin_library_search(q: str = "", db_connection: sqlite3.Connection = Depends(get_db)):
+    # Ungated sibling of GET /api/search/library (which requires a household-user login) — the
+    # match picker needs to work for an admin who isn't also logged into the app itself, matching
+    # every other /api/admin/* route's reverse-proxy-gated-not-in-app-gated posture.
+    query = q.strip()
+    catalog_matches = search_library_catalog(db_connection, query)
+    results = [
+        schemas.SearchResultOut(
+            title=entry.title,
+            author=", ".join(entry.authors) if entry.authors else None,
+            isbn=entry.isbn13 or entry.isbn10,
+            cover_url=None,
+            published_date=entry.published_date,
+            grimmory_id=entry.grimmory_id,
+        )
+        for entry in catalog_matches
+    ]
+    return schemas.SearchOut(query=query, results=results)
+
+
+@app.post("/api/admin/books/{book_id}/match", status_code=204)
+def api_admin_match_book(
+    book_id: int,
+    payload: schemas.AdminMatchIn,
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    book = get_book(db_connection, book_id)
+    if book is None:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    if payload.grimmory_id is None:
+        # Unmatch: clear the pin, then recompute grimmory_book_id from whatever the fuzzy matcher
+        # says right now (or None) — never leaves a stale manually-forced id behind. Both columns
+        # are written in one UPDATE (see set_book_manual_match_and_grimmory_id) so a crash between
+        # them can't leave the pin cleared but the old forced id still in place, or vice versa.
+        catalog = get_library_catalog(db_connection)
+        fallback = library_check.find_catalog_match(book.title, book.isbn, book.author, catalog)
+        set_book_manual_match_and_grimmory_id(
+            db_connection, book_id, None, fallback.grimmory_id if fallback else None
+        )
+        return Response(status_code=204)
+
+    owner_id = library_check.find_owning_book_id(
+        db_connection, payload.grimmory_id, exclude_book_id=book_id
+    )
+    if owner_id is not None:
+        owner = get_book(db_connection, owner_id)
+        detail = f'Already matched to "{owner.title}"' if owner else "Already matched to another book"
+        raise HTTPException(status_code=409, detail=detail)
+
+    set_book_manual_match_and_grimmory_id(db_connection, book_id, payload.grimmory_id, payload.grimmory_id)
     return Response(status_code=204)
 
 

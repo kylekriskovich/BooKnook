@@ -242,6 +242,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/settings/shelves": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Api Settings Shelves */
+        get: operations["api_settings_shelves_api_settings_shelves_get"];
+        put?: never;
+        /** Api Settings Shelves Update */
+        post: operations["api_settings_shelves_update_api_settings_shelves_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/settings/spice": {
         parameters: {
             query?: never;
@@ -429,6 +447,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/admin/library-search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Api Admin Library Search */
+        get: operations["api_admin_library_search_api_admin_library_search_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/books/{book_id}/match": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Api Admin Match Book */
+        post: operations["api_admin_match_book_api_admin_books__book_id__match_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/admin/settings": {
         parameters: {
             query?: never;
@@ -487,6 +539,8 @@ export interface components {
     schemas: {
         /** AdminEntryOut */
         AdminEntryOut: {
+            /** Id */
+            id?: number | null;
             /** Title */
             title: string;
             /** Author */
@@ -495,6 +549,18 @@ export interface components {
             cover_url?: string | null;
             /** Wanted By */
             wanted_by: string[];
+            /** Grimmory Id */
+            grimmory_id?: number | null;
+            /**
+             * Manually Matched
+             * @default false
+             */
+            manually_matched: boolean;
+        };
+        /** AdminMatchIn */
+        AdminMatchIn: {
+            /** Grimmory Id */
+            grimmory_id?: number | null;
         };
         /** AdminOut */
         AdminOut: {
@@ -822,6 +888,29 @@ export interface components {
             spice_level: number;
             /** Has Grimmory Session */
             has_grimmory_session: boolean;
+            /** Want To Read Shelf Id */
+            want_to_read_shelf_id?: number | null;
+            /**
+             * Sync To Device Enabled
+             * @default false
+             */
+            sync_to_device_enabled: boolean;
+            /** Sync To Device Shelf Id */
+            sync_to_device_shelf_id?: number | null;
+        };
+        /** ShelfOptionOut */
+        ShelfOptionOut: {
+            /** Id */
+            id: number;
+            /** Name */
+            name: string;
+        };
+        /** ShelfOptionsOut */
+        ShelfOptionsOut: {
+            /** Shelves */
+            shelves: components["schemas"]["ShelfOptionOut"][];
+            /** Error */
+            error?: string | null;
         };
         /** ShelfOut */
         ShelfOut: {
@@ -831,6 +920,30 @@ export interface components {
             label: string;
             /** Entries */
             entries: components["schemas"]["TBREntryOut"][];
+        };
+        /** ShelfSyncSettingsIn */
+        ShelfSyncSettingsIn: {
+            /** Want To Read Shelf Id */
+            want_to_read_shelf_id?: number | null;
+            /**
+             * Sync To Device Enabled
+             * @default false
+             */
+            sync_to_device_enabled: boolean;
+            /** Sync To Device Shelf Id */
+            sync_to_device_shelf_id?: number | null;
+        };
+        /** ShelfSyncSettingsOut */
+        ShelfSyncSettingsOut: {
+            /** Want To Read Shelf Id */
+            want_to_read_shelf_id?: number | null;
+            /**
+             * Sync To Device Enabled
+             * @default false
+             */
+            sync_to_device_enabled: boolean;
+            /** Sync To Device Shelf Id */
+            sync_to_device_shelf_id?: number | null;
         };
         /** SpiceIn */
         SpiceIn: {
@@ -1345,6 +1458,59 @@ export interface operations {
             };
         };
     };
+    api_settings_shelves_api_settings_shelves_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ShelfOptionsOut"];
+                };
+            };
+        };
+    };
+    api_settings_shelves_update_api_settings_shelves_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ShelfSyncSettingsIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ShelfSyncSettingsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     api_settings_spice_api_settings_spice_post: {
         parameters: {
             query?: never;
@@ -1665,6 +1831,70 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    api_admin_library_search_api_admin_library_search_get: {
+        parameters: {
+            query?: {
+                q?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SearchOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    api_admin_match_book_api_admin_books__book_id__match_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                book_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdminMatchIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
             };
         };
     };
