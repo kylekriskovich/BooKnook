@@ -11,8 +11,9 @@
 	let hasSearched = $state(false);
 	let matchingGrimmoryId = $state<number | null>(null);
 	let matchError = $state<string | null>(null);
+	let searchError = $state<string | null>(null);
 
-	let searchTimer: ReturnType<typeof setTimeout>;
+	let searchTimer: ReturnType<typeof setTimeout> | undefined = undefined;
 
 	// Reset search state each time a different book is targeted, so stale results from a previous
 	// match attempt never show for the newly-opened row.
@@ -22,6 +23,7 @@
 		results = [];
 		hasSearched = false;
 		matchError = null;
+		searchError = null;
 	});
 
 	function onInput() {
@@ -34,11 +36,19 @@
 		if (!q) {
 			results = [];
 			hasSearched = false;
+			searchError = null;
 			return;
 		}
-		const { data } = await api.GET('/api/admin/library-search', { params: { query: { q } } });
-		results = data?.results ?? [];
-		hasSearched = true;
+		try {
+			const data = unwrap(await api.GET('/api/admin/library-search', { params: { query: { q } } }));
+			results = data.results;
+			searchError = null;
+		} catch (err) {
+			results = [];
+			searchError = err instanceof ApiError ? err.message : 'Could not reach the server — try again.';
+		} finally {
+			hasSearched = true;
+		}
 	}
 
 	function onSubmit(event: SubmitEvent) {
@@ -84,6 +94,7 @@
 	</form>
 
 	{#if matchError}<p class="error">{matchError}</p>{/if}
+	{#if searchError}<p class="error">{searchError}</p>{/if}
 
 	{#if results.length}
 		<ul class="search-results-list">
@@ -107,7 +118,7 @@
 				</li>
 			{/each}
 		</ul>
-	{:else if hasSearched && query.trim()}
+	{:else if hasSearched && query.trim() && !searchError}
 		<p class="empty-state">No results for "{query.trim()}".</p>
 	{/if}
 </div>

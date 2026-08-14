@@ -288,6 +288,33 @@ def test_get_own_grimmory_user_id_raises_on_http_failure(monkeypatch):
         grimmory_auth.get_own_grimmory_user_id("https://grimmory.example.com", "token")
 
 
+def test_get_own_grimmory_user_id_raises_when_id_missing(monkeypatch):
+    # A well-formed but unexpected payload (missing "id") must raise LibraryCheckUnavailable, not
+    # a bare KeyError.
+    monkeypatch.setattr(
+        grimmory_auth.httpx, "get", lambda *a, **k: FakeMeResponse({"username": "kyle"})
+    )
+
+    with pytest.raises(grimmory_auth.LibraryCheckUnavailable):
+        grimmory_auth.get_own_grimmory_user_id("https://grimmory.example.com", "token")
+
+
+def test_get_own_grimmory_user_id_raises_on_invalid_json(monkeypatch):
+    class NonJsonResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            raise ValueError("not JSON")
+
+    monkeypatch.setattr(grimmory_auth.httpx, "get", lambda *a, **k: NonJsonResponse())
+
+    with pytest.raises(grimmory_auth.LibraryCheckUnavailable):
+        grimmory_auth.get_own_grimmory_user_id("https://grimmory.example.com", "token")
+
+
 # --- admin-privileged actions (content restrictions / the spice scale) ---
 
 

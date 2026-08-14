@@ -175,9 +175,17 @@ def get_own_grimmory_user_id(base_url: str, access_token: str) -> int:
             timeout=10.0,
         )
         response.raise_for_status()
+        body = response.json()
     except httpx.HTTPError as exc:
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
-    return response.json()["id"]
+    except ValueError as exc:
+        # response.json() raises json.JSONDecodeError (a ValueError subclass) on a non-JSON body
+        # (e.g. an HTML error page from a proxy in front of Grimmory).
+        raise LibraryCheckUnavailable(f"Grimmory API returned an invalid response: {exc}") from exc
+    user_id = body.get("id") if isinstance(body, dict) else None
+    if user_id is None:
+        raise LibraryCheckUnavailable("Grimmory API response for /users/me is missing 'id'")
+    return user_id
 
 
 # --- admin-privileged actions (content restrictions / the spice scale) ---
