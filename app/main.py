@@ -44,8 +44,7 @@ from app.models import (
     list_tbr_entries_with_books,
     remove_tbr_entry,
     search_library_catalog,
-    set_book_grimmory_id,
-    set_book_manual_match_grimmory_id,
+    set_book_manual_match_and_grimmory_id,
     set_calendar_view_preference,
     set_grimmory_admin_settings,
     set_grimmory_refresh_token,
@@ -1136,11 +1135,14 @@ def api_admin_match_book(
 
     if payload.grimmory_id is None:
         # Unmatch: clear the pin, then recompute grimmory_book_id from whatever the fuzzy matcher
-        # says right now (or None) — never leaves a stale manually-forced id behind.
-        set_book_manual_match_grimmory_id(db_connection, book_id, None)
+        # says right now (or None) — never leaves a stale manually-forced id behind. Both columns
+        # are written in one UPDATE (see set_book_manual_match_and_grimmory_id) so a crash between
+        # them can't leave the pin cleared but the old forced id still in place, or vice versa.
         catalog = get_library_catalog(db_connection)
         fallback = library_check.find_catalog_match(book.title, book.isbn, book.author, catalog)
-        set_book_grimmory_id(db_connection, book_id, fallback.grimmory_id if fallback else None)
+        set_book_manual_match_and_grimmory_id(
+            db_connection, book_id, None, fallback.grimmory_id if fallback else None
+        )
         return Response(status_code=204)
 
     owner_id = library_check.find_owning_book_id(
@@ -1151,8 +1153,7 @@ def api_admin_match_book(
         detail = f'Already matched to "{owner.title}"' if owner else "Already matched to another book"
         raise HTTPException(status_code=409, detail=detail)
 
-    set_book_manual_match_grimmory_id(db_connection, book_id, payload.grimmory_id)
-    set_book_grimmory_id(db_connection, book_id, payload.grimmory_id)
+    set_book_manual_match_and_grimmory_id(db_connection, book_id, payload.grimmory_id, payload.grimmory_id)
     return Response(status_code=204)
 
 

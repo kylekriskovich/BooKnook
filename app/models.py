@@ -798,6 +798,22 @@ def set_book_manual_match_grimmory_id(
     db_connection.commit()
 
 
+def set_book_manual_match_and_grimmory_id(
+    db_connection: sqlite3.Connection,
+    book_id: int,
+    manual_match_grimmory_id: Optional[int],
+    grimmory_book_id: Optional[int],
+) -> None:
+    """Sets both columns in a single UPDATE + commit — used by POST /api/admin/books/{id}/match
+    (match and unmatch) so the pin and its immediate effect on grimmory_book_id can never be left
+    inconsistent by a crash between two separate writes."""
+    db_connection.execute(
+        "UPDATE books SET manual_match_grimmory_id = ?, grimmory_book_id = ? WHERE id = ?",
+        (manual_match_grimmory_id, grimmory_book_id, book_id),
+    )
+    db_connection.commit()
+
+
 def set_tbr_entry_rating(db_connection: sqlite3.Connection, entry_id: int, rating: Optional[int]) -> None:
     db_connection.execute("UPDATE tbr_entries SET rating = ? WHERE id = ?", (rating, entry_id))
     db_connection.commit()

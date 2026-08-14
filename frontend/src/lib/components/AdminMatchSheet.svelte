@@ -87,7 +87,7 @@
 
 	{#if results.length}
 		<ul class="search-results-list">
-			{#each results as result (result.grimmory_id ?? result.title)}
+			{#each results as result, index (result.grimmory_id ?? result.isbn ?? index)}
 				<li class="result-card">
 					{#if result.cover_url}
 						<img src={result.cover_url} alt="" class="result-cover" />
