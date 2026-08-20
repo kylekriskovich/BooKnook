@@ -366,6 +366,21 @@ def list_own_shelves(base_url: str, access_token: str, own_grimmory_user_id: int
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
     return [shelf for shelf in shelves if shelf.get("userId") == own_grimmory_user_id]
 
+# Function Name: _shelf_name_key
+# Description: Normalizes a shelf name for matching - Grimmory's own duplicate-name check
+#   (existsByUserIdAndName) inherits MariaDB's default case-insensitive column collation, so a
+#   shelf named e.g. "Want To Read" already 409s a create of "Want to Read" even though a naive
+#   Python `==` wouldn't consider them equal. Matching case-insensitively (and trimmed) here keeps
+#   the two checks - "does Grimmory think this already exists" and "can we find it in the list" -
+#   in agreement, instead of get_or_create_shelf_by_name looping forever on a 409 it can never
+#   resolve (confirmed in production: a shelf named "Want To Read" left want_to_read_shelf_id
+#   permanently unresolved).
+# Parameters:
+# - name (str): Raw shelf name.
+# Returns: Normalized name (str)
+def _shelf_name_key(name: str) -> str:
+    return name.strip().casefold()
+
 # Function Name: get_or_create_shelf_by_name
 # Description: Idempotent get-or-create for a Grimmory shelf, keyed by name.
 # Parameters:
@@ -381,8 +396,9 @@ def get_or_create_shelf_by_name(
     # POST - that's an error path, not a natural upsert - and this also means a shelf the user
     # already made themselves under this name is silently adopted (Grimmory enforces unique shelf
     # names per user, so a name match here is unambiguous).
+    target_key = _shelf_name_key(name)
     for shelf in list_own_shelves(base_url, access_token, own_grimmory_user_id):
-        if shelf.get("name") == name and shelf.get("id") is not None:
+        if shelf.get("id") is not None and _shelf_name_key(shelf.get("name") or "") == target_key:
             return shelf["id"]
     try:
         with httpx.Client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
@@ -398,7 +414,7 @@ def get_or_create_shelf_by_name(
                 # configured the periodic loop runs every 60s) - someone else already created
                 # this shelf between our GET above and this POST. Not an error: adopt it.
                 for shelf in list_own_shelves(base_url, access_token, own_grimmory_user_id):
-                    if shelf.get("name") == name and shelf.get("id") is not None:
+                    if shelf.get("id") is not None and _shelf_name_key(shelf.get("name") or "") == target_key:
                         return shelf["id"]
                 raise LibraryCheckUnavailable(
                     f"Grimmory reported shelf {name!r} already exists but it isn't visible yet"

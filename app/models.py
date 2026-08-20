@@ -188,7 +188,8 @@ CREATE TABLE IF NOT EXISTS goals (
 def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     if db_path is None:
         db_path = os.environ.get("TBR_DB_PATH", DEFAULT_DB_PATH)
-    db_connection = sqlite3.connect(db_path)
+    # check_same_thread=False: FastAPI resolves each sync dependency
+    db_connection = sqlite3.connect(db_path, check_same_thread=False)
     db_connection.row_factory = sqlite3.Row
     db_connection.execute("PRAGMA foreign_keys = ON")
     return db_connection

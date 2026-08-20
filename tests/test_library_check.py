@@ -1023,6 +1023,57 @@ def test_get_or_create_shelf_by_name_returns_existing_match_without_posting(monk
     assert fake_client.post_calls == []
 
 
+def test_get_or_create_shelf_by_name_matches_existing_shelf_case_insensitively(monkeypatch):
+    # Regression test: a shelf named "Want To Read" (differing only in case from
+    # DEFAULT_WANT_TO_READ_SHELF_NAME's "Want to Read") must still be found by the initial GET, so
+    # a differently-cased shelf a user already has doesn't get skipped and re-created. Reproduces a
+    # production case where a Python `==` name comparison and Grimmory's own case-insensitive
+    # (MariaDB collation) duplicate-name check disagreed, permanently blocking the sync.
+    shelves = [{"id": 1, "name": "Want To Read", "userId": 7}]
+    fake_client = ShelfFakeClient(get_responses={library_check.SHELVES_PATH: shelves})
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+
+    shelf_id = library_check.get_or_create_shelf_by_name(SHELF_BASE_URL, "token", 7, "Want to Read")
+
+    assert shelf_id == 1
+    assert fake_client.post_calls == []
+
+
+def test_get_or_create_shelf_by_name_adopts_differently_cased_shelf_after_409(monkeypatch):
+    # Regression test: the initial GET sees nothing yet (e.g. a stale/incomplete list), the POST
+    # 409s because Grimmory's own case-insensitive collation considers "Want To Read" a duplicate
+    # of "Want to Read", and only the 409-retry GET actually returns the differently-cased shelf -
+    # that retry must still recognize it rather than looping forever (production bug: this left
+    # want_to_read_shelf_id permanently unresolved for a user whose shelf was "Want To Read").
+    class RacyCasedShelfClient:
+        def __init__(self):
+            self.get_call_count = 0
+            self.post_calls = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, path, headers=None):
+            self.get_call_count += 1
+            shelves = [] if self.get_call_count == 1 else [{"id": 1, "name": "Want To Read", "userId": 7}]
+            return FakeResponse(shelves)
+
+        def post(self, path, json=None, headers=None):
+            self.post_calls.append({"path": path, "json": json})
+            return FakeResponse({}, status_code=409)
+
+    fake_client = RacyCasedShelfClient()
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+
+    shelf_id = library_check.get_or_create_shelf_by_name(SHELF_BASE_URL, "token", 7, "Want to Read")
+
+    assert shelf_id == 1
+    assert fake_client.get_call_count == 2
+
+
 def test_get_or_create_shelf_by_name_creates_when_missing(monkeypatch):
     fake_client = ShelfFakeClient(
         get_responses={library_check.SHELVES_PATH: []},
