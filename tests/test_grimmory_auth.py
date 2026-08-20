@@ -58,8 +58,9 @@ def test_login_succeeds(base_url, monkeypatch):
     assert calls[0]["json"] == {"username": "kyle", "password": "hunter2"}
 
 
-def test_login_raises_on_invalid_credentials(base_url, monkeypatch):
-    monkeypatch.setattr(grimmory_auth.httpx, "post", lambda *a, **k: FakeResponse(400))
+@pytest.mark.parametrize("status_code", [400, 401])
+def test_login_raises_on_invalid_credentials(base_url, monkeypatch, status_code):
+    monkeypatch.setattr(grimmory_auth.httpx, "post", lambda *a, **k: FakeResponse(status_code))
 
     with pytest.raises(grimmory_auth.GrimmoryLoginError, match="Invalid username or password"):
         grimmory_auth.login("kyle", "wrong-password")
