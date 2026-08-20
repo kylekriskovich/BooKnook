@@ -26,8 +26,8 @@ USERS_PATH = "/api/v1/users"
 USERS_ME_PATH = "/api/v1/users/me"
 CONTENT_RESTRICTIONS_PATH = "/api/v1/users/{user_id}/content-restrictions"
 
-# Grimmory returns 400 (ApiError.INVALID_CREDENTIALS) for a bad username/password, not 401.
-INVALID_CREDENTIALS_STATUS = 400
+# Grimmory returns 400,401 (ApiError) for a bad username/password.
+INVALID_CREDENTIALS_STATUSES = {400, 401}
 
 # Index = chili count (0-5); RESTRICTION_TIERS[level + 1] is the ageRating threshold to exclude
 # for levels 0-4. Level 5 removes the restriction entirely rather than using a threshold.
@@ -67,7 +67,7 @@ def login(username: str, password: str) -> tuple[str, str]:
     except httpx.HTTPError as exc:
         raise GrimmoryLoginError("Couldn't reach Grimmory — try again shortly") from exc
 
-    if response.status_code == INVALID_CREDENTIALS_STATUS:
+    if response.status_code in INVALID_CREDENTIALS_STATUSES:
         raise GrimmoryLoginError("Invalid username or password")
     if response.status_code >= 400:
         raise GrimmoryLoginError("Couldn't reach Grimmory — try again shortly")
