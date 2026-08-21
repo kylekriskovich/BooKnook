@@ -71,7 +71,7 @@ def test_api_home_requires_login_returns_401_not_a_redirect(client):
 
 def test_api_login_success_sets_cookie_and_returns_me(client, monkeypatch):
     monkeypatch.setattr(
-        grimmory_auth, "login", lambda username, password: ("fake-token", "fake-refresh")
+        grimmory_auth, "login", lambda username, password: ("fake-token", "fake-refresh", 7200)
     )
 
     response = client.post("/api/login", json={"username": "Alice", "password": "hunter2"})
@@ -84,6 +84,37 @@ def test_api_login_success_sets_cookie_and_returns_me(client, monkeypatch):
 
     me = client.get("/api/me").json()
     assert me == body
+
+
+def test_api_login_caches_access_token_so_book_detail_skips_refresh(client, monkeypatch):
+    # Regression test: get_valid_access_token used to call Grimmory's refresh endpoint
+    # unconditionally on every call, including the very first page a user opens right after
+    # logging in - even though login() had just handed back a perfectly good, unused access
+    # token. api_login now caches it (see grimmory_auth.cache_access_token) so this doesn't happen.
+    monkeypatch.setattr(
+        grimmory_auth, "login", lambda username, password: ("fresh-access", "fake-refresh", 7200)
+    )
+    refresh_calls = []
+    monkeypatch.setattr(
+        grimmory_auth,
+        "refresh",
+        lambda base_url, refresh_token: refresh_calls.append(1) or ("x", "y", 7200),
+    )
+
+    login_body = client.post("/api/login", json={"username": "Alice", "password": "hunter2"}).json()
+
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    models.set_book_grimmory_id(conn, book.id, 42)
+    entry = models.add_tbr_entry(conn, login_body["id"], book.id, status="reading")
+    conn.close()
+
+    monkeypatch.setattr(library_check, "fetch_reading_sessions_for_book", lambda *a, **k: [])
+
+    response = client.get(f"/api/book/{entry.id}")
+
+    assert response.status_code == 200
+    assert refresh_calls == []
 
 
 def test_api_login_invalid_credentials_returns_401(client, monkeypatch):
@@ -505,6 +536,59 @@ def test_api_book_detail_pages_per_day_uses_client_today_not_server_utc(client, 
     # 10 elapsed days (Jan 1 - Jan 10 inclusive) -> 300 / 10 = 30 pages/day, computed from the
     # client-supplied today, not the mocked-UTC 2020 date.
     assert any(t["label"] == "Pages per day" and t["value"] == "30" for t in body["tiles"])
+
+
+def test_api_book_detail_evicts_rejected_access_token_on_fetch_failure(client, monkeypatch):
+    # Regression test: a cached access token that Grimmory has actually rejected (revoked early,
+    # a signing-key rotation, anything our own cached deadline can't know about) must not keep
+    # getting handed back for up to ~2 hours - see grimmory_auth.evict_access_token.
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    models.set_book_grimmory_id(conn, book.id, 42)
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="reading")
+    models.set_grimmory_refresh_token(conn, user.id, "stored-refresh")
+    conn.close()
+
+    grimmory_auth.cache_access_token(user.id, "stale-rejected-token", 7200)
+
+    def fail(*a, **k):
+        raise library_check.LibraryCheckUnavailable(
+            "Grimmory API request failed: 401", status_code=401
+        )
+
+    monkeypatch.setattr(library_check, "fetch_reading_sessions_for_book", fail)
+
+    response = client.get(f"/api/book/{entry.id}")
+
+    assert response.status_code == 200
+    assert grimmory_auth._access_token_cache.get(user.id) is None
+
+
+def test_api_book_detail_keeps_cached_access_token_on_transient_fetch_failure(client, monkeypatch):
+    # A transient failure (5xx, timeout, connection error) doesn't mean the token itself is bad -
+    # evicting it here would just force an unnecessary refresh-token rotation on the next request.
+    # See LibraryCheckUnavailable.is_auth_rejection.
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    models.set_book_grimmory_id(conn, book.id, 42)
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="reading")
+    models.set_grimmory_refresh_token(conn, user.id, "stored-refresh")
+    conn.close()
+
+    grimmory_auth.cache_access_token(user.id, "still-good-token", 7200)
+
+    def fail(*a, **k):
+        raise library_check.LibraryCheckUnavailable("Grimmory API request failed: 503")
+
+    monkeypatch.setattr(library_check, "fetch_reading_sessions_for_book", fail)
+
+    response = client.get(f"/api/book/{entry.id}")
+
+    assert response.status_code == 200
+    cached = grimmory_auth._access_token_cache.get(user.id)
+    assert cached is not None and cached[0] == "still-good-token"
 
 
 # --- stats / calendar ---

@@ -569,17 +569,28 @@ def api_login(payload: schemas.LoginIn, db_connection: sqlite3.Connection = Depe
     # FastAPI's automatic response_model serialization/filtering, but the documented schema still
     # comes from this declaration regardless of what the handler actually returns at runtime.
     try:
-        access_token, refresh_token = grimmory_auth.login(payload.username, payload.password)
+        access_token, refresh_token, expires_in = grimmory_auth.login(payload.username, payload.password)
     except GrimmoryLoginError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
     user = get_or_create_user(db_connection, payload.username)
-    set_grimmory_refresh_token(db_connection, user.id, refresh_token)
+    # Locked so a concurrent get_valid_access_token/refresh() call for this same user can't read
+    # the pre-login refresh token and rotate it against Grimmory just as this write lands,
+    # clobbering this fresh login's token pair with a stale one - see grimmory_auth.refresh_lock.
+    with grimmory_auth.refresh_lock(user.id):
+        set_grimmory_refresh_token(db_connection, user.id, refresh_token)
+        grimmory_auth.log_token_write(user.id, refresh_token, "api_login")  # TEMPORARY diagnostic
+        # This access token is perfectly good, unused - caching it here means the *next* call to
+        # get_valid_access_token for this user (e.g. the first book detail page they open) reuses
+        # it instead of immediately making another refresh() call.
+        grimmory_auth.cache_access_token(user.id, access_token, expires_in)
     base_url = os.environ.get(grimmory_auth.GRIMMORY_BASE_URL_ENV)
     if base_url:
         try:
             library_check.sync_user_reading_status(db_connection, user.id, base_url, access_token)
-        except LibraryCheckUnavailable:
+        except LibraryCheckUnavailable as exc:
+            if exc.is_auth_rejection:
+                grimmory_auth.evict_access_token(access_token)
             logger.exception("Grimmory reading-status sync failed")
 
     response = JSONResponse(_to_me_out(user).model_dump(mode="json"))
@@ -690,10 +701,13 @@ def api_book_detail(
     if base_url and entry.book.grimmory_book_id:
         access_token = grimmory_auth.get_valid_access_token(db_connection, user)
         if access_token is not None:
-            with contextlib.suppress(LibraryCheckUnavailable):
+            try:
                 sessions = library_check.fetch_reading_sessions_for_book(
                     base_url, access_token, entry.book.grimmory_book_id
                 )
+            except LibraryCheckUnavailable as exc:
+                if exc.is_auth_rejection:
+                    grimmory_auth.evict_access_token(access_token)
 
     if sessions and not entry.started_at_manual:
         derived = stat_tiles.first_meaningful_session_date(sessions)
@@ -810,11 +824,15 @@ def api_settings_sync(
         error = "Grimmory login is not configured"
     elif payload.password:
         try:
-            access_token, refresh_token = grimmory_auth.login(user.name, payload.password)
+            access_token, refresh_token, expires_in = grimmory_auth.login(user.name, payload.password)
         except GrimmoryLoginError as exc:
             error = str(exc)
         else:
-            set_grimmory_refresh_token(db_connection, user.id, refresh_token)
+            # Locked for the same reason as /api/login - see grimmory_auth.refresh_lock.
+            with grimmory_auth.refresh_lock(user.id):
+                set_grimmory_refresh_token(db_connection, user.id, refresh_token)
+                grimmory_auth.log_token_write(user.id, refresh_token, "api_settings_sync")  # TEMPORARY
+                grimmory_auth.cache_access_token(user.id, access_token, expires_in)
     else:
         access_token = grimmory_auth.get_valid_access_token(db_connection, user)
         if access_token is None:
@@ -824,6 +842,8 @@ def api_settings_sync(
         try:
             library_check.sync_user_reading_status(db_connection, user.id, base_url, access_token)
         except LibraryCheckUnavailable as exc:
+            if exc.is_auth_rejection:
+                grimmory_auth.evict_access_token(access_token)
             error = str(exc)
 
     return schemas.SyncResultOut(error=error)
@@ -848,6 +868,8 @@ def api_settings_shelves(
         own_id = grimmory_auth.get_own_grimmory_user_id(base_url, access_token)
         shelves = library_check.list_own_shelves(base_url, access_token, own_id)
     except LibraryCheckUnavailable as exc:
+        if exc.is_auth_rejection:
+            grimmory_auth.evict_access_token(access_token)
         return schemas.ShelfOptionsOut(shelves=[], error=str(exc))
 
     return schemas.ShelfOptionsOut(
@@ -1067,10 +1089,13 @@ def api_set_tbr_dates(
             if base_url and book is not None and book.grimmory_book_id is not None:
                 access_token = grimmory_auth.get_valid_access_token(db_connection, user)
                 if access_token is not None:
-                    with contextlib.suppress(LibraryCheckUnavailable):
+                    try:
                         grimmory_auth.update_book_finished_date(
                             base_url, access_token, book.grimmory_book_id, finished_date
                         )
+                    except LibraryCheckUnavailable as exc:
+                        if exc.is_auth_rejection:
+                            grimmory_auth.evict_access_token(access_token)
     elif entry.status == "finished":
         set_tbr_entry_finished_at(db_connection, entry_id, None)
 
