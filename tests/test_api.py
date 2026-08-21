@@ -15,6 +15,19 @@ from app.main import COOKIE_NAME, app, sign_session_cookie
 from app.metadata import SearchResult
 
 
+# --- _resolve_log_level_name ---
+
+
+def test_resolve_log_level_name_accepts_known_level():
+    assert main._resolve_log_level_name("DEBUG") == "DEBUG"
+
+
+def test_resolve_log_level_name_falls_back_to_info_on_typo():
+    # Regression test: logging.basicConfig(level=...) raises ValueError and crashes the app at
+    # import time on an unrecognized string - a typo'd TBR_LOG_LEVEL must not take the app down.
+    assert main._resolve_log_level_name("WARNNIG") == "INFO"
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     db_path = str(tmp_path / "test.db")

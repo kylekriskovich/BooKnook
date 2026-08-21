@@ -62,13 +62,25 @@ from app.models import (
     upsert_goal,
 )
 
+# Function Name: _resolve_log_level_name
+# Description: Validates a TBR_LOG_LEVEL value against logging's own level names, falling back to
+#   INFO for anything unrecognized - logging.basicConfig(level=...) raises ValueError and crashes
+#   the app at import time on an unrecognized string, so a typo'd env var must fall back rather
+#   than taking the whole app down.
+# Parameters:
+# - raw (str): Raw TBR_LOG_LEVEL env var value, already uppercased.
+# Returns: A valid logging level name (str)
+def _resolve_log_level_name(raw: str) -> str:
+    return raw if raw in logging.getLevelNamesMapping() else "INFO"
+
+
 # Configured here rather than left to whatever default uvicorn/the WSGI/ASGI server happens to
 # set up, so app.* loggers (notably app.grimmory_api - see app/grimmory_http.py) reliably show
 # every Grimmory request/response instead of only warnings/errors via Python's bare last-resort
 # stderr handler. TBR_LOG_LEVEL lets an operator turn this down without a code change if the
 # per-request INFO lines get too noisy in production.
 logging.basicConfig(
-    level=os.environ.get("TBR_LOG_LEVEL", "INFO").upper(),
+    level=_resolve_log_level_name(os.environ.get("TBR_LOG_LEVEL", "INFO").upper()),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)

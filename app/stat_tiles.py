@@ -155,11 +155,25 @@ def build_book_tiles(entry, sessions: list[dict], today: Optional[date] = None) 
                         }
                     )
 
-        if entry.status == "reading" and len(reading_dates) >= 2 and deltas:
+        if entry.status == "reading" and len(reading_dates) >= 2:
             span_days = (reading_dates[-1] - reading_dates[0]).days + 1
-            pace_per_day = sum(deltas) / span_days
-            end_progresses = [s.get("endProgress") for s in sessions if s.get("endProgress") is not None]
-            latest_progress = max(end_progresses) if end_progresses else 0.0
+            if deltas:
+                pace_per_day = sum(deltas) / span_days
+                end_progresses = [
+                    s.get("endProgress") for s in sessions if s.get("endProgress") is not None
+                ]
+                latest_progress = max(end_progresses) if end_progresses else 0.0
+            elif is_audiobook and entry.audiobook_progress_percent is not None:
+                # Grimmory's audiobook player never logs per-session progressDelta/endProgress (see
+                # _has_meaningful_progress above), so there's no session-level pace to sum here -
+                # fall back to the one number Grimmory does keep current for audiobooks (see
+                # tbr_entries.audiobook_progress_percent in app/models.py), averaged over the
+                # listening days actually observed so far.
+                pace_per_day = entry.audiobook_progress_percent / span_days
+                latest_progress = entry.audiobook_progress_percent
+            else:
+                pace_per_day = 0.0
+                latest_progress = 0.0
             remaining = max(0.0, 100.0 - latest_progress)
             if pace_per_day > 0 and remaining > 0:
                 days_remaining = remaining / pace_per_day

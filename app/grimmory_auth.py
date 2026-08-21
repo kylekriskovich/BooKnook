@@ -170,7 +170,8 @@ def update_book_finished_date(
         grimmory_http.log_call("POST", url, response.status_code, time.monotonic() - start)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        logger.warning("Grimmory book-progress update failed for book %s: %s", grimmory_book_id, exc)
+        if not grimmory_http.already_logged(exc):
+            logger.warning("Grimmory book-progress update failed for book %s: %s", grimmory_book_id, exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
 
 # Function Name: get_own_grimmory_user_id
@@ -191,7 +192,8 @@ def get_own_grimmory_user_id(base_url: str, access_token: str) -> int:
         response.raise_for_status()
         body = response.json()
     except httpx.HTTPError as exc:
-        logger.warning("Grimmory /users/me request failed: %s", exc)
+        if not grimmory_http.already_logged(exc):
+            logger.warning("Grimmory /users/me request failed: %s", exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
     except ValueError as exc:
         # response.json() raises json.JSONDecodeError (a ValueError subclass) on a non-JSON body
@@ -254,7 +256,8 @@ def _admin_login(base_url: str, username: str, password: str) -> str:
         grimmory_http.log_call("POST", url, response.status_code, time.monotonic() - start)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        logger.warning("Grimmory admin login request failed: %s", exc)
+        if not grimmory_http.already_logged(exc):
+            logger.warning("Grimmory admin login request failed: %s", exc)
         raise LibraryCheckUnavailable(f"Grimmory admin login failed: {exc}") from exc
     return response.json()["accessToken"]
 
@@ -273,7 +276,8 @@ def find_grimmory_user_id(base_url: str, admin_token: str, username: str) -> Opt
         grimmory_http.log_call("GET", url, response.status_code, time.monotonic() - start)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        logger.warning("Grimmory users list request failed: %s", exc)
+        if not grimmory_http.already_logged(exc):
+            logger.warning("Grimmory users list request failed: %s", exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
 
     for user in response.json():
@@ -296,7 +300,8 @@ def get_content_restrictions(base_url: str, admin_token: str, user_id: int) -> l
         grimmory_http.log_call("GET", url, response.status_code, time.monotonic() - start)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        logger.warning("Grimmory content-restrictions GET failed for user %s: %s", user_id, exc)
+        if not grimmory_http.already_logged(exc):
+            logger.warning("Grimmory content-restrictions GET failed for user %s: %s", user_id, exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
     return response.json()
 
@@ -320,7 +325,8 @@ def put_content_restrictions(
         grimmory_http.log_call("PUT", url, response.status_code, time.monotonic() - start)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        logger.warning("Grimmory content-restrictions PUT failed for user %s: %s", user_id, exc)
+        if not grimmory_http.already_logged(exc):
+            logger.warning("Grimmory content-restrictions PUT failed for user %s: %s", user_id, exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
 
 # Function Name: sync_restriction_level

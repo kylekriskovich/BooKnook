@@ -173,7 +173,8 @@ def fetch_catalog(db_connection) -> list[LibraryCatalogEntry]:
             books_response.raise_for_status()
             books = books_response.json()
     except httpx.HTTPError as exc:
-        logger.warning("Grimmory catalog fetch failed: %s", exc)
+        if not grimmory_http.already_logged(exc):
+            logger.warning("Grimmory catalog fetch failed: %s", exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
 
     entries = [_book_to_catalog_entry(book) for book in books]
@@ -312,7 +313,8 @@ def fetch_user_books(base_url: str, access_token: str) -> list[dict]:
             response.raise_for_status()
             return response.json()
     except httpx.HTTPError as exc:
-        logger.warning("Grimmory user-books fetch failed: %s", exc)
+        if not grimmory_http.already_logged(exc):
+            logger.warning("Grimmory user-books fetch failed: %s", exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
 
 # Function Name: fetch_reading_sessions_for_book
@@ -348,7 +350,10 @@ def fetch_reading_sessions_for_book(
                 if page >= total_pages:
                     break
     except httpx.HTTPError as exc:
-        logger.warning("Grimmory reading-sessions fetch failed for book %s: %s", grimmory_book_id, exc)
+        if not grimmory_http.already_logged(exc):
+            logger.warning(
+                "Grimmory reading-sessions fetch failed for book %s: %s", grimmory_book_id, exc
+            )
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
     return sessions
 
@@ -369,7 +374,8 @@ def list_own_shelves(base_url: str, access_token: str, own_grimmory_user_id: int
             response.raise_for_status()
             shelves = response.json()
     except httpx.HTTPError as exc:
-        logger.warning("Grimmory shelves fetch failed: %s", exc)
+        if not grimmory_http.already_logged(exc):
+            logger.warning("Grimmory shelves fetch failed: %s", exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
     return [shelf for shelf in shelves if shelf.get("userId") == own_grimmory_user_id]
 
@@ -434,7 +440,8 @@ def get_or_create_shelf_by_name(
                 )
             return body["id"]
     except httpx.HTTPError as exc:
-        logger.warning("Grimmory get-or-create shelf %r failed: %s", name, exc)
+        if not grimmory_http.already_logged(exc):
+            logger.warning("Grimmory get-or-create shelf %r failed: %s", name, exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
 
 # Function Name: fetch_shelf_books
@@ -454,7 +461,8 @@ def fetch_shelf_books(base_url: str, access_token: str, shelf_id: int) -> list[d
             response.raise_for_status()
             return response.json()
     except httpx.HTTPError as exc:
-        logger.warning("Grimmory shelf-books fetch failed for shelf %s: %s", shelf_id, exc)
+        if not grimmory_http.already_logged(exc):
+            logger.warning("Grimmory shelf-books fetch failed for shelf %s: %s", shelf_id, exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
 
 # Function Name: assign_book_shelves
@@ -491,7 +499,8 @@ def assign_book_shelves(
             )
             response.raise_for_status()
     except httpx.HTTPError as exc:
-        logger.warning("Grimmory assign-book-shelves failed: %s", exc)
+        if not grimmory_http.already_logged(exc):
+            logger.warning("Grimmory assign-book-shelves failed: %s", exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
 
 # Function Name: _target_status
@@ -597,8 +606,8 @@ def fetch_book_cover(
         return None
     try:
         response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        logger.warning("Grimmory cover fetch returned an error for book %s: %s", grimmory_book_id, exc)
+    except httpx.HTTPStatusError:
+        # Already logged by grimmory_http's Client event hooks when the response came in above.
         return None
     return response.content, response.headers.get("content-type", "image/jpeg")
 
@@ -641,7 +650,8 @@ def _login_service_account(base_url: str, username: str, password: str) -> Optio
             login_response.raise_for_status()
             return login_response.json()["accessToken"]
     except httpx.HTTPError as exc:
-        logger.warning("Grimmory service-account login failed: %s", exc)
+        if not grimmory_http.already_logged(exc):
+            logger.warning("Grimmory service-account login failed: %s", exc)
         return None
 
 # Function Name: download_cover_for_book

@@ -60,3 +60,14 @@ def log_call(method: str, url: str, status_code: int, elapsed_seconds: float) ->
     elapsed = f"{elapsed_seconds * 1000:.0f}ms"
     log = logger.error if status_code >= 500 else logger.warning if status_code >= 400 else logger.info
     log("Grimmory %s %s -> %s (%s)", method, url, status_code, elapsed)
+
+# Function Name: already_logged
+# Description: True if exc is an httpx.HTTPStatusError - a response that already reached client()'s
+#   event hooks or a bare log_call() above, so callers should skip logging it a second time in
+#   their own except block. Only a connection-level failure (timeout, DNS, refused - no response
+#   ever received) still needs its own log line there.
+# Parameters:
+# - exc (Exception): The caught httpx.HTTPError.
+# Returns: bool
+def already_logged(exc: Exception) -> bool:
+    return isinstance(exc, httpx.HTTPStatusError)

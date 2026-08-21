@@ -4,7 +4,14 @@ from app import stat_tiles
 from app.models import Book, TBREntryDetail
 
 
-def _entry(status="reading", started_at=None, finished_at=None, page_count=None, format=None):
+def _entry(
+    status="reading",
+    started_at=None,
+    finished_at=None,
+    page_count=None,
+    format=None,
+    audiobook_progress_percent=None,
+):
     book = Book(
         id=1, title="Dune", author="Frank Herbert", isbn="111", cover_url=None,
         page_count=page_count, format=format,
@@ -12,6 +19,7 @@ def _entry(status="reading", started_at=None, finished_at=None, page_count=None,
     return TBREntryDetail(
         id=1, status=status, added_at="2026-01-01", book=book,
         started_at=started_at, finished_at=finished_at,
+        audiobook_progress_percent=audiobook_progress_percent,
     )
 
 
@@ -197,6 +205,30 @@ def test_burndown_still_empty_for_audiobook_sessions():
     # audiobooks - the duration-based activity fix must not fabricate one.
     sessions = [_audiobook_session("2026-01-01"), _audiobook_session("2026-01-02")]
     assert stat_tiles.burndown_points(sessions) == []
+
+
+def test_estimated_completion_falls_back_to_audiobook_progress_percent():
+    # Session-level progressDelta/endProgress are always null for audiobooks, so the pace/latest-
+    # progress used to have no way to compute Estimated Completion here at all even though the
+    # exact number it needs (tbr_entries.audiobook_progress_percent) already exists on the entry.
+    entry = _entry(status="reading", format="AUDIOBOOK", audiobook_progress_percent=20.0)
+    sessions = [
+        _audiobook_session("2026-01-01"),
+        _audiobook_session("2026-01-02"),
+    ]
+    tiles = stat_tiles.build_book_tiles(entry, sessions, today=dt.date(2026, 1, 2))
+    by_label = {t["label"]: t["value"] for t in tiles}
+    # pace = 20% / 2 listening days = 10%/day, remaining = 80% -> 8 days from today (Jan 2) -> Jan 10.
+    assert by_label["Estimated Completion"] == "Jan 10, 2026"
+
+
+def test_estimated_completion_omitted_without_audiobook_progress_percent():
+    # No fallback value stored yet (not synced, or a non-audiobook with no session deltas either)
+    # - must not fabricate a pace out of nothing.
+    entry = _entry(status="reading", format="AUDIOBOOK", audiobook_progress_percent=None)
+    sessions = [_audiobook_session("2026-01-01"), _audiobook_session("2026-01-02")]
+    tiles = stat_tiles.build_book_tiles(entry, sessions, today=dt.date(2026, 1, 2))
+    assert not any(t["label"] == "Estimated Completion" for t in tiles)
 
 
 def test_pages_per_session_and_best_session_use_page_count():
