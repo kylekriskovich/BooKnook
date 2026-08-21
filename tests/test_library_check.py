@@ -629,6 +629,55 @@ def test_sync_leaves_audiobook_progress_percent_none_for_non_audiobooks(conn, mo
     assert entry.audiobook_progress_percent is None
 
 
+def test_sync_matches_by_grimmory_book_id_despite_drifted_metadata(conn, monkeypatch):
+    # Regression test for GitHub issue #22: production ended up with 11 duplicate local rows for
+    # the same Grimmory book because Pass 1 used to only re-derive a fuzzy title/isbn/author match
+    # every sync, which can silently fail once Grimmory's own metadata for a book drifts even
+    # slightly (an ISBN correction, an author list edit) - Pass 2 then treated the "unmatched"
+    # entry as a brand-new book and created a duplicate. A book that already has a known
+    # grimmory_book_id must be matched by that id directly, immune to metadata drift.
+    user = models.get_or_create_user(conn, "alice")
+    # Local cover already set so Pass 1 doesn't attempt a cover download - not the point of this
+    # test (see test_shelf_sync_unassigns_book_that_transitions_off_wanted_this_sync for that path).
+    book = models.create_book(
+        conn,
+        title="Dungeon Crawler Carl",
+        author="Matt Dinniman",
+        isbn="9780000000001",
+        cover_url="/covers/existing.jpg",
+    )
+    models.set_book_grimmory_id(conn, book.id, 400)
+    models.add_tbr_entry(conn, user.id, book.id)  # starts "wanted"
+    # Not the point of this test — without the grimmory_book_id-first fix, Pass 2 would otherwise
+    # attempt a real cover download for the wrongly-created duplicate book, which isn't mocked here.
+    monkeypatch.setattr(library_check, "_maybe_download_cover", lambda *a, **k: None)
+
+    # Grimmory's response for the same book id now has a different isbn and an added author -
+    # different enough that fuzzy title+author matching alone would miss it (author_score for
+    # "Matt Dinniman" vs "Matt Dinniman, Will Staehle" falls below AUTHOR_MATCH_THRESHOLD).
+    _fake_books_client(
+        [
+            {
+                "id": 400,
+                "metadata": {
+                    "title": "Dungeon Crawler Carl",
+                    "isbn13": "9780000000002",
+                    "authors": ["Matt Dinniman", "Will Staehle"],
+                },
+                "readStatus": "READING",
+            }
+        ],
+        monkeypatch,
+    )
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entries = models.list_tbr_entries_with_books(conn, user.id)
+    assert len(entries) == 1
+    assert entries[0].status == "reading"
+    assert entries[0].book.id == book.id
+
+
 def test_sync_never_downgrades_finished_entry(conn, monkeypatch):
     user = models.get_or_create_user(conn, "alice")
     book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
