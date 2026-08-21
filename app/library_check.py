@@ -776,18 +776,38 @@ def sync_user_reading_status(
     books = fetch_user_books(base_url, access_token)
     catalog = [_book_to_catalog_entry(book) for book in books]
 
+    # Grimmory's own book id, once known, is a fully reliable match key - unlike title/isbn/author,
+    # which can drift slightly between syncs (a metadata refresh correcting an ISBN, adding an
+    # author) and silently fail the fuzzy matcher below. Built once per sync call, first occurrence
+    # wins for a repeated id - see the entry loop below for why a repeated id can happen at all.
+    books_by_grimmory_id: dict[int, int] = {}
+    for i, book in enumerate(books):
+        book_id = book.get("id")
+        if book_id is not None:
+            books_by_grimmory_id.setdefault(book_id, i)
+
     matched_indices: set[int] = set()
 
-    # Pass 1: match Grimmory books against existing tbr_entries (by ISBN, then fuzzy title+author)
-    # and update status/finished_at, or remove a "reading" entry outright if Grimmory now says
-    # WONT_READ/ABANDONED. Also downloads the real Grimmory cover (see
-    # fetch_book_cover/_maybe_download_cover) for any matched book that doesn't have one locally
-    # yet - see _has_local_cover.
+    # Pass 1: match Grimmory books against existing tbr_entries - by grimmory_book_id when already
+    # known (see books_by_grimmory_id above), falling back to fuzzy ISBN/title/author matching only
+    # for a book not yet linked to a Grimmory id. Matching by grimmory_book_id first, rather than
+    # always re-deriving a fuzzy match, is what stops this pass from ever treating an
+    # already-tracked book as "unmatched" just because its title/isbn/author metadata changed
+    # slightly since the last sync - Pass 2 below would otherwise re-add it as a brand-new
+    # duplicate book+entry, which is exactly what happened in production (see GitHub issue #22)
+    # before this grimmory_book_id-first check existed. Also updates status/finished_at, or removes
+    # a "reading" entry outright if Grimmory now says WONT_READ/ABANDONED. Also downloads the real
+    # Grimmory cover (see fetch_book_cover/_maybe_download_cover) for any matched book that doesn't
+    # have one locally yet - see _has_local_cover.
     for entry in list_tbr_entries_with_books(db_connection, user_id):
-        match = find_catalog_match(entry.book.title, entry.book.isbn, entry.book.author, catalog)
-        if match is None:
-            continue
-        idx = next(i for i, catalog_entry in enumerate(catalog) if catalog_entry is match)
+        idx = None
+        if entry.book.grimmory_book_id is not None:
+            idx = books_by_grimmory_id.get(entry.book.grimmory_book_id)
+        if idx is None:
+            match = find_catalog_match(entry.book.title, entry.book.isbn, entry.book.author, catalog)
+            if match is None:
+                continue
+            idx = next(i for i, catalog_entry in enumerate(catalog) if catalog_entry is match)
         matched_indices.add(idx)
         book = books[idx]
         # An explicit abandon/won't-read signal removes a "reading" entry outright, rather than
