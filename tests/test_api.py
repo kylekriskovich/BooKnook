@@ -71,7 +71,7 @@ def test_api_home_requires_login_returns_401_not_a_redirect(client):
 
 def test_api_login_success_sets_cookie_and_returns_me(client, monkeypatch):
     monkeypatch.setattr(
-        grimmory_auth, "login", lambda username, password: ("fake-token", "fake-refresh")
+        grimmory_auth, "login", lambda username, password: ("fake-token", "fake-refresh", 7200)
     )
 
     response = client.post("/api/login", json={"username": "Alice", "password": "hunter2"})
@@ -84,6 +84,37 @@ def test_api_login_success_sets_cookie_and_returns_me(client, monkeypatch):
 
     me = client.get("/api/me").json()
     assert me == body
+
+
+def test_api_login_caches_access_token_so_book_detail_skips_refresh(client, monkeypatch):
+    # Regression test: get_valid_access_token used to call Grimmory's refresh endpoint
+    # unconditionally on every call, including the very first page a user opens right after
+    # logging in - even though login() had just handed back a perfectly good, unused access
+    # token. api_login now caches it (see grimmory_auth.cache_access_token) so this doesn't happen.
+    monkeypatch.setattr(
+        grimmory_auth, "login", lambda username, password: ("fresh-access", "fake-refresh", 7200)
+    )
+    refresh_calls = []
+    monkeypatch.setattr(
+        grimmory_auth,
+        "refresh",
+        lambda base_url, refresh_token: refresh_calls.append(1) or ("x", "y", 7200),
+    )
+
+    login_body = client.post("/api/login", json={"username": "Alice", "password": "hunter2"}).json()
+
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    models.set_book_grimmory_id(conn, book.id, 42)
+    entry = models.add_tbr_entry(conn, login_body["id"], book.id, status="reading")
+    conn.close()
+
+    monkeypatch.setattr(library_check, "fetch_reading_sessions_for_book", lambda *a, **k: [])
+
+    response = client.get(f"/api/book/{entry.id}")
+
+    assert response.status_code == 200
+    assert refresh_calls == []
 
 
 def test_api_login_invalid_credentials_returns_401(client, monkeypatch):

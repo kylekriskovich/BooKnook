@@ -12,13 +12,24 @@ from app.models import (
 
 
 class FakeResponse:
-    def __init__(self, status_code, access_token="fake-token", refresh_token="fake-refresh"):
+    def __init__(
+        self, status_code, access_token="fake-token", refresh_token="fake-refresh", expires=7200
+    ):
         self.status_code = status_code
         self._access_token = access_token
         self._refresh_token = refresh_token
+        self._expires = expires
 
     def json(self):
-        return {"accessToken": self._access_token, "refreshToken": self._refresh_token}
+        return {
+            "accessToken": self._access_token,
+            "refreshToken": self._refresh_token,
+            "expires": self._expires,
+        }
+
+    @property
+    def text(self):
+        return str(self.json())
 
 
 @pytest.fixture
@@ -50,10 +61,11 @@ def test_login_succeeds(base_url, monkeypatch):
 
     monkeypatch.setattr(grimmory_auth.httpx, "post", fake_post)
 
-    access_token, refresh_token = grimmory_auth.login("kyle", "hunter2")
+    access_token, refresh_token, expires_in = grimmory_auth.login("kyle", "hunter2")
 
     assert access_token == "abc123"
     assert refresh_token == "refresh-abc"
+    assert expires_in == 7200
     assert calls[0]["url"] == "https://grimmory.example.com/api/v1/auth/login"
     assert calls[0]["json"] == {"username": "kyle", "password": "hunter2"}
 
@@ -92,12 +104,13 @@ def test_refresh_returns_new_token_pair(monkeypatch):
 
     monkeypatch.setattr(grimmory_auth.httpx, "post", fake_post)
 
-    access_token, refresh_token = grimmory_auth.refresh(
+    access_token, refresh_token, expires_in = grimmory_auth.refresh(
         "https://grimmory.example.com", "old-refresh"
     )
 
     assert access_token == "new-access"
     assert refresh_token == "new-refresh"
+    assert expires_in == 7200
     assert calls[0]["url"] == "https://grimmory.example.com/api/v1/auth/refresh"
     assert calls[0]["json"] == {"refreshToken": "old-refresh"}
 
@@ -113,6 +126,86 @@ def test_get_valid_access_token_returns_none_when_never_connected(base_url, conn
     user = get_or_create_user(conn, "kyle")
 
     assert grimmory_auth.get_valid_access_token(conn, user) is None
+
+
+# --- access-token caching (cache_access_token / get_valid_access_token's cache check) ---
+
+
+def test_cache_access_token_then_get_valid_access_token_skips_refresh(base_url, conn, monkeypatch):
+    created = get_or_create_user(conn, "kyle")
+    set_grimmory_refresh_token(conn, created.id, "some-refresh")
+    user = User(id=created.id, name="kyle", grimmory_refresh_token="some-refresh")
+
+    def fail_if_called(*a, **k):
+        raise AssertionError("refresh() must not be called - a cached token is still fresh")
+
+    monkeypatch.setattr(grimmory_auth, "refresh", fail_if_called)
+    grimmory_auth.cache_access_token(created.id, "cached-access", 7200)
+
+    assert grimmory_auth.get_valid_access_token(conn, user) == "cached-access"
+
+
+def test_get_valid_access_token_refreshes_when_no_cached_token(base_url, conn, monkeypatch):
+    created = get_or_create_user(conn, "kyle")
+    set_grimmory_refresh_token(conn, created.id, "some-refresh")
+    user = User(id=created.id, name="kyle", grimmory_refresh_token="some-refresh")
+
+    monkeypatch.setattr(
+        grimmory_auth, "refresh", lambda base_url, refresh_token: ("fresh-access", "new-refresh", 7200)
+    )
+
+    assert grimmory_auth.get_valid_access_token(conn, user) == "fresh-access"
+
+
+def test_get_valid_access_token_refreshes_when_cached_token_is_stale(base_url, conn, monkeypatch):
+    created = get_or_create_user(conn, "kyle")
+    set_grimmory_refresh_token(conn, created.id, "some-refresh")
+    user = User(id=created.id, name="kyle", grimmory_refresh_token="some-refresh")
+
+    # A cache entry whose deadline is already in the past (simulating one that's expired) - past
+    # calls that populated it with a real elapsed clock aren't reproducible here, so this reaches
+    # into the cache dict directly the same way cache_access_token itself would compute a deadline.
+    grimmory_auth._access_token_cache[created.id] = ("stale-cached-access", 0.0)
+    monkeypatch.setattr(
+        grimmory_auth, "refresh", lambda base_url, refresh_token: ("fresh-access", "new-refresh", 7200)
+    )
+
+    assert grimmory_auth.get_valid_access_token(conn, user) == "fresh-access"
+
+
+def test_cache_access_token_skips_caching_when_expires_in_is_none(base_url, conn, monkeypatch):
+    created = get_or_create_user(conn, "kyle")
+    set_grimmory_refresh_token(conn, created.id, "some-refresh")
+    user = User(id=created.id, name="kyle", grimmory_refresh_token="some-refresh")
+
+    refresh_calls = []
+    grimmory_auth.cache_access_token(created.id, "ignored", None)
+    monkeypatch.setattr(
+        grimmory_auth,
+        "refresh",
+        lambda base_url, refresh_token: refresh_calls.append(1) or ("fresh-access", "new-refresh", None),
+    )
+
+    assert grimmory_auth.get_valid_access_token(conn, user) == "fresh-access"
+    assert refresh_calls == [1]
+
+
+def test_cache_access_token_skips_caching_when_expires_in_within_safety_margin(base_url, conn, monkeypatch):
+    created = get_or_create_user(conn, "kyle")
+    set_grimmory_refresh_token(conn, created.id, "some-refresh")
+    user = User(id=created.id, name="kyle", grimmory_refresh_token="some-refresh")
+
+    refresh_calls = []
+    # Shorter than _ACCESS_TOKEN_SAFETY_MARGIN_SECONDS - not worth caching at all.
+    grimmory_auth.cache_access_token(created.id, "ignored", 60)
+    monkeypatch.setattr(
+        grimmory_auth,
+        "refresh",
+        lambda base_url, refresh_token: refresh_calls.append(1) or ("fresh-access", "new-refresh", None),
+    )
+
+    assert grimmory_auth.get_valid_access_token(conn, user) == "fresh-access"
+    assert refresh_calls == [1]
 
 
 def test_get_valid_access_token_returns_none_when_unconfigured(monkeypatch, conn):
@@ -132,7 +225,7 @@ def test_get_valid_access_token_refreshes_and_persists_rotated_token(base_url, c
     monkeypatch.setattr(
         grimmory_auth,
         "refresh",
-        lambda base_url, refresh_token: ("fresh-access", "rotated-refresh"),
+        lambda base_url, refresh_token: ("fresh-access", "rotated-refresh", None),
     )
 
     access_token = grimmory_auth.get_valid_access_token(conn, user)
@@ -183,9 +276,9 @@ def test_get_valid_access_token_uses_fresh_db_token_not_stale_caller_object(
     def fake_refresh(base_url, refresh_token):
         refresh_calls.append(refresh_token)
         if refresh_token == "token-a":
-            return "access-1", "token-b"
+            return "access-1", "token-b", None
         if refresh_token == "token-b":
-            return "access-2", "token-c"
+            return "access-2", "token-c", None
         raise grimmory_auth.GrimmoryLoginError("stale/rejected token")
 
     monkeypatch.setattr(grimmory_auth, "refresh", fake_refresh)
@@ -213,6 +306,7 @@ def test_get_valid_access_token_uses_fresh_db_token_not_stale_caller_object(
 class FakeHttpResponse:
     def __init__(self, status_code=200):
         self.status_code = status_code
+        self.text = "{}"
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -259,6 +353,7 @@ class FakeMeResponse:
     def __init__(self, payload, status_code=200):
         self._payload = payload
         self.status_code = status_code
+        self.text = str(payload)
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -303,6 +398,7 @@ def test_get_own_grimmory_user_id_raises_when_id_missing(monkeypatch):
 def test_get_own_grimmory_user_id_raises_on_invalid_json(monkeypatch):
     class NonJsonResponse:
         status_code = 200
+        text = "<html>not json</html>"
 
         def raise_for_status(self):
             pass
@@ -323,6 +419,7 @@ class FakeAdminResponse:
     def __init__(self, payload, status_code=200):
         self._payload = payload
         self.status_code = status_code
+        self.text = str(payload)
 
     def raise_for_status(self):
         if self.status_code >= 400:

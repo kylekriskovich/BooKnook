@@ -569,13 +569,17 @@ def api_login(payload: schemas.LoginIn, db_connection: sqlite3.Connection = Depe
     # FastAPI's automatic response_model serialization/filtering, but the documented schema still
     # comes from this declaration regardless of what the handler actually returns at runtime.
     try:
-        access_token, refresh_token = grimmory_auth.login(payload.username, payload.password)
+        access_token, refresh_token, expires_in = grimmory_auth.login(payload.username, payload.password)
     except GrimmoryLoginError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
     user = get_or_create_user(db_connection, payload.username)
     set_grimmory_refresh_token(db_connection, user.id, refresh_token)
     grimmory_auth.log_token_write(user.id, refresh_token, "api_login")  # TEMPORARY diagnostic
+    # This access token is perfectly good, unused - caching it here means the *next* call to
+    # get_valid_access_token for this user (e.g. the first book detail page they open) reuses it
+    # instead of immediately making another refresh() call.
+    grimmory_auth.cache_access_token(user.id, access_token, expires_in)
     base_url = os.environ.get(grimmory_auth.GRIMMORY_BASE_URL_ENV)
     if base_url:
         try:
@@ -811,12 +815,13 @@ def api_settings_sync(
         error = "Grimmory login is not configured"
     elif payload.password:
         try:
-            access_token, refresh_token = grimmory_auth.login(user.name, payload.password)
+            access_token, refresh_token, expires_in = grimmory_auth.login(user.name, payload.password)
         except GrimmoryLoginError as exc:
             error = str(exc)
         else:
             set_grimmory_refresh_token(db_connection, user.id, refresh_token)
             grimmory_auth.log_token_write(user.id, refresh_token, "api_settings_sync")  # TEMPORARY
+            grimmory_auth.cache_access_token(user.id, access_token, expires_in)
     else:
         access_token = grimmory_auth.get_valid_access_token(db_connection, user)
         if access_token is None:
