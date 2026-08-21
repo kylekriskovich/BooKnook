@@ -296,11 +296,8 @@ def init_db(db_connection: sqlite3.Connection) -> None:
         db_connection.execute("ALTER TABLE users ADD COLUMN sync_to_device_shelf_id INTEGER")
     except sqlite3.OperationalError:
         pass  # column already exists
-    # KOReader self-service sync removed 2026-07-29 — dropped in favor of already-hiding
-    # null/zero stats everywhere else, rather than needing a second signal to gate them on.
-    # DROP COLUMN needs SQLite 3.35+ (bundled with Python 3.12's sqlite3 module, well past that);
-    # a database that already had these columns dropped raises "no such column" here, not
-    # OperationalError, so that's caught too.
+    # KOReader self-service sync removed 2026-07-29. A DB that already dropped these columns
+    # raises "no such column" here, not OperationalError, so that's caught too.
     for column in ("koreader_username", "koreader_sync_enabled"):
         try:
             db_connection.execute(f"ALTER TABLE users DROP COLUMN {column}")
@@ -322,11 +319,8 @@ def init_db(db_connection: sqlite3.Connection) -> None:
         db_connection.execute("ALTER TABLE books ADD COLUMN format TEXT")
     except sqlite3.OperationalError:
         pass  # column already exists
-    # One-time backfill for wanted entries that predate sort_order — numbers each user's own
-    # wanted shelf by their current added_at DESC order (preserving today's effective order across
-    # the upgrade instead of scrambling it), 0 = first. Only touches sort_order IS NULL rows, so
-    # this is a no-op on every init_db() call after the first — new entries always get a
-    # non-null sort_order from add_tbr_entry itself, never relying on this running again.
+    # One-time backfill for wanted entries that predate sort_order, preserving today's added_at
+    # order. Only touches NULL rows, so it's a no-op after the first init_db() call.
     db_connection.execute(
         """
         UPDATE tbr_entries
@@ -724,9 +718,7 @@ def list_aggregate_tbr(db_connection: sqlite3.Connection) -> list[AggregateTBREn
 
 
 def add_tbr_entry(db_connection: sqlite3.Connection, user_id: int, book_id: int, status: str = "wanted") -> TBREntry:
-    # New wanted entries go to the *top* of the manually-ordered shelf (lowest sort_order sorts
-    # first — see set_wanted_order), matching the pre-ordering default of newest-added-first until
-    # the user drags it elsewhere. Left NULL for reading/finished, which never read sort_order.
+    # New wanted entries go to the top of the manually-ordered shelf (lowest sort_order first).
     sort_order = None
     if status == "wanted":
         row = db_connection.execute(
