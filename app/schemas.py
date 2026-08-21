@@ -163,13 +163,9 @@ class SettingsOut(BaseModel):
     grimmory_admin_configured: bool
     spice_labels: list[str]
     spice_level: int
-    # Whether the user has a stored Grimmory refresh token (see models.User.grimmory_refresh_token)
-    # — never the token itself. Settings.html's Jinja2 equivalent checked `user.grimmory_refresh_token`
-    # directly to decide whether /settings/sync needs a password field; this is that same check
-    # exposed as a plain boolean instead of the secret.
+    # Whether a Grimmory refresh token is stored - never the token itself.
     has_grimmory_session: bool
-    # Persisted Grimmory shelf ids only — no live Grimmory call happens for this route (see
-    # GET /api/settings/shelves for the live shelf-list fetch that powers the settings dropdowns).
+    # Persisted shelf ids only - GET /api/settings/shelves does the live shelf-list fetch.
     want_to_read_shelf_id: Optional[int] = None
     sync_to_device_enabled: bool = False
     sync_to_device_shelf_id: Optional[int] = None
@@ -186,8 +182,7 @@ class ShelfOptionOut(BaseModel):
 
 class ShelfOptionsOut(BaseModel):
     shelves: list[ShelfOptionOut]
-    # "reconnect_needed" | a not-configured message | a LibraryCheckUnavailable message — same
-    # soft-error convention as SyncResultOut/SpiceResultOut (always 200, never raised).
+    # "reconnect_needed" | not-configured | a LibraryCheckUnavailable message - always 200, never raised.
     error: Optional[str] = None
 
 
@@ -203,17 +198,14 @@ class SpiceResultOut(BaseModel):
 
 
 class AdminEntryOut(BaseModel):
-    # Book id — always set for needed_entries; set for owned_entries only when the row came from a
-    # manual match (drives the Unmatch action). None for a pure catalog row / auto-match.
+    # Set for owned_entries only when the row came from a manual match (drives Unmatch).
     id: Optional[int] = None
     title: str
     author: Optional[str] = None
     cover_url: Optional[str] = None
     wanted_by: list[str]
-    # Grimmory's own catalog id — always set for owned_entries, never set for needed_entries (a
-    # needed entry has no match yet).
+    # Grimmory's own catalog id - unset for needed_entries (no match yet).
     grimmory_id: Optional[int] = None
-    # True only for an owned_entries row sourced from an admin manual match, not an auto-match.
     manually_matched: bool = False
 
 
@@ -245,9 +237,8 @@ class AdminSettingsOut(BaseModel):
 
 
 # --- request bodies ---
-# JSON bodies for the /api/* routes, mirroring the Form(...) fields their HTML-route counterparts
-# take. A blank/omitted string on a "keep current secret unless replaced" field (password, API
-# key) means the same thing here as an empty Form field does today: leave it unchanged.
+# JSON bodies for the /api/* routes. A blank/omitted secret field (password, API key) means
+# "leave it unchanged".
 
 
 class LoginIn(BaseModel):

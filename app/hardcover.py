@@ -1,6 +1,4 @@
 # Hardcover.app GraphQL search client - a richer alternative to Open Library for adding books.
-# Grimmory's own catalog metadata usually traces back to Hardcover/GoodReads, so results sourced
-# from here are more likely to match what's already in the library (see app/library_check.py).
 # Requires a personal Hardcover API token (Bearer auth, no OAuth) - see /admin/settings.
 
 from __future__ import annotations

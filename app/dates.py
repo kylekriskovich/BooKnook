@@ -42,9 +42,7 @@ def parse_date(date_str: Optional[str]) -> Optional[date]:
 # - days: Dates to scan — order and duplicates don't matter, sorted/deduplicated internally.
 # Returns: Length of the longest consecutive run (int), 0 if `days` is empty.
 def longest_consecutive_run(days) -> int:
-    # Shared by stat_tiles.build_book_tiles' "Best Streak" tile (per-book reading days) and
-    # reading_calendar.best_streak (a calendar month's active days) - same algorithm, different
-    # day sets, previously implemented twice.
+    # Shared by stat_tiles' "Best Streak" tile and reading_calendar.best_streak.
     ordered = sorted(set(days))
     if not ordered:
         return 0

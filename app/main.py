@@ -63,10 +63,8 @@ from app.models import (
 )
 
 # Function Name: _resolve_log_level_name
-# Description: Validates a TBR_LOG_LEVEL value against logging's own level names, falling back to
-#   INFO for anything unrecognized - logging.basicConfig(level=...) raises ValueError and crashes
-#   the app at import time on an unrecognized string, so a typo'd env var must fall back rather
-#   than taking the whole app down.
+# Description: Validates a TBR_LOG_LEVEL value against logging's level names, falling back to
+#   INFO so a typo'd env var doesn't crash the app at import time.
 # Parameters:
 # - raw (str): Raw TBR_LOG_LEVEL env var value, already uppercased.
 # Returns: A valid logging level name (str)
@@ -74,11 +72,7 @@ def _resolve_log_level_name(raw: str) -> str:
     return raw if raw in logging.getLevelNamesMapping() else "INFO"
 
 
-# Configured here rather than left to whatever default uvicorn/the WSGI/ASGI server happens to
-# set up, so app.* loggers (notably app.grimmory_api - see app/grimmory_http.py) reliably show
-# every Grimmory request/response instead of only warnings/errors via Python's bare last-resort
-# stderr handler. TBR_LOG_LEVEL lets an operator turn this down without a code change if the
-# per-request INFO lines get too noisy in production.
+# Configured explicitly so app.* loggers (see app/grimmory_http.py) show INFO by default.
 logging.basicConfig(
     level=_resolve_log_level_name(os.environ.get("TBR_LOG_LEVEL", "INFO").upper()),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -86,20 +80,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 APP_DIR = os.path.dirname(__file__)
-# frontend-dist/ is the SvelteKit adapter-static build output — COPY'd there by the Dockerfile's
-# frontend-build stage. Absent in local backend-only dev (`uvicorn app.main:app --reload` without
-# ever running `npm run build`); see frontend/README.md, which runs its own Vite dev server
-# against this backend instead of hitting the routes below.
+# SvelteKit adapter-static build output, COPY'd here by the Dockerfile. Absent in backend-only dev.
 FRONTEND_DIST = os.path.join(os.path.dirname(APP_DIR), "frontend-dist")
 COOKIE_NAME = "tbr_user_id"
 SECRET_KEY_ENV = "TBR_SECRET_KEY"
 ADMIN_USERNAME_ENV = "TBR_ADMIN_USERNAME"
 
-# 30 days — matches Grimmory's own refresh-token lifetime (see app/grimmory_auth.py), so a TBR
-# session lasts about as long as Grimmory would keep the user's own stored refresh token valid.
-# Reading-status sync no longer depends on this cookie's lifetime for freshness — it now runs in
-# the background on Grimmory's own account, independent of login frequency (see
-# library_check.run_periodic_sync and SPEC.md > Reading-status auto-detection).
+# 30 days — matches Grimmory's own refresh-token lifetime (see app/grimmory_auth.py).
 SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 30
 
 
@@ -155,16 +142,12 @@ async def spa_fallback(full_path: str) -> FileResponse:
 
     if full_path:
         candidate = os.path.abspath(os.path.join(FRONTEND_DIST, full_path))
-        # Path-traversal guard (e.g. "/../../etc/passwd") — only ever serve a real file that
-        # resolves to somewhere inside the build output.
+        # Path-traversal guard - only serve a file inside the build output.
         if candidate.startswith(os.path.abspath(FRONTEND_DIST) + os.sep) and os.path.isfile(candidate):
             return FileResponse(candidate)
 
     response = FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
-    # index.html is the one URL that never changes across deploys and must always point at
-    # whichever content-hashed JS/CSS bundle is current — no-cache forces revalidation on every
-    # load. Everything else under frontend-dist/ is content-hashed and safe to let the browser
-    # cache indefinitely, unlike this file.
+    # index.html must always revalidate so it picks up the current content-hashed bundle.
     response.headers["Cache-Control"] = "no-cache"
     return response
 
@@ -177,18 +160,11 @@ async def lifespan(app: FastAPI):
     finally:
         db_connection.close()
 
-    # Mounted here rather than at module import time so it picks up whatever TBR_DB_PATH is
-    # actually configured at real startup (covers_dir() creates the directory relative to it) —
-    # importing this module alone must not create directories as a side effect (e.g. under
-    # pytest, before a test fixture gets a chance to set TBR_DB_PATH to a tmp path).
+    # Mounted here, not at import time, so it picks up TBR_DB_PATH as configured at real startup.
     app.mount("/covers", StaticFiles(directory=library_check.covers_dir()), name="covers")
 
-    # Also registered here rather than as module-level decorators/mounts, and specifically *after*
-    # /covers above: Starlette matches routes in registration order, and spa_fallback's
-    # /{full_path:path} matches literally everything (including /covers/*) — decorator-based
-    # routes register at import time, which would put spa_fallback *before* /covers in the list
-    # and let it shadow every cover image request. Skipped entirely if frontend-dist/ doesn't
-    # exist (local backend-only dev — see FRONTEND_DIST's comment above).
+    # Registered after /covers - Starlette matches routes in registration order, and
+    # spa_fallback's /{full_path:path} would otherwise shadow /covers/* if registered first.
     if os.path.isdir(FRONTEND_DIST):
         app.mount("/_app", StaticFiles(directory=os.path.join(FRONTEND_DIST, "_app")), name="frontend-app")
         icons_dir = os.path.join(FRONTEND_DIST, "icons")
@@ -196,8 +172,6 @@ async def lifespan(app: FastAPI):
             app.mount("/icons", StaticFiles(directory=icons_dir), name="frontend-icons")
         app.add_api_route("/{full_path:path}", spa_fallback, methods=["GET"], include_in_schema=False)
 
-    # Always runs — the loop itself checks library_settings each cycle, so settings saved via
-    # /admin/settings take effect without an app restart.
     sync_task = asyncio.create_task(library_check.run_periodic_sync())
 
     yield
@@ -372,11 +346,6 @@ def _calendar_context(db_connection, user_id: int, year: int, month: int, today:
     prev_year, prev_month = _shift_month(year, month, -1)
     next_year, next_month = _shift_month(year, month, 1)
 
-    # Calendar-specific tiles (session-approximate, computed from month_spans/days_active — not
-    # derivable from a plain entry collection) first, then the same session-independent collection
-    # tiles /api/stats uses, scoped to books finished in this month instead of this year — the
-    # whole point of stat_tiles.build_collection_tiles taking a plain entry list is that a
-    # different timeframe is just a different filter here, not new tile logic.
     calendar_tiles = [
         {"label": "Best Streak", "value": f"{reading_calendar.best_streak(days)}d"},
         {"label": "Days Read", "value": str(len(days))},
@@ -445,11 +414,7 @@ def _catalog_row(catalog_entry, wanted_by: list[str]) -> dict:
 # ---------------------------------------------------------------------------
 # JSON API
 # ---------------------------------------------------------------------------
-# Consumed by the SvelteKit frontend in frontend/ (built to frontend-dist/ and served by
-# spa_fallback above in production) — see the root CLAUDE.md for the overall architecture.
-#
-# /admin* routes have no in-app auth, gated at the reverse proxy instead (NPM Access List / Basic
-# Auth on /admin — see SPEC.md's access-control section). That's intentional, not an oversight.
+# /admin* routes have no in-app auth, intentionally - gated at the reverse proxy instead.
 
 
 def _is_admin(user: User) -> bool:
@@ -564,25 +529,18 @@ def _to_calendar_out(calendar_context: dict, calendar_view: str) -> schemas.Cale
 
 @app.post("/api/login", response_model=schemas.MeOut)
 def api_login(payload: schemas.LoginIn, db_connection: sqlite3.Connection = Depends(get_db)):
-    # response_model is declared for OpenAPI's benefit (see frontend/src/lib/api/schema.d.ts) —
-    # returning a raw JSONResponse below (needed to also set the session cookie) bypasses
-    # FastAPI's automatic response_model serialization/filtering, but the documented schema still
-    # comes from this declaration regardless of what the handler actually returns at runtime.
+    # response_model is for OpenAPI's benefit - the raw JSONResponse below (needed to also set
+    # the session cookie) bypasses FastAPI's automatic response_model serialization.
     try:
         access_token, refresh_token, expires_in = grimmory_auth.login(payload.username, payload.password)
     except GrimmoryLoginError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
     user = get_or_create_user(db_connection, payload.username)
-    # Locked so a concurrent get_valid_access_token/refresh() call for this same user can't read
-    # the pre-login refresh token and rotate it against Grimmory just as this write lands,
-    # clobbering this fresh login's token pair with a stale one - see grimmory_auth.refresh_lock.
+    # Locked so a concurrent get_valid_access_token/refresh() can't clobber this fresh login.
     with grimmory_auth.refresh_lock(user.id):
         set_grimmory_refresh_token(db_connection, user.id, refresh_token)
         grimmory_auth.log_token_write(user.id, refresh_token, "api_login")  # TEMPORARY diagnostic
-        # This access token is perfectly good, unused - caching it here means the *next* call to
-        # get_valid_access_token for this user (e.g. the first book detail page they open) reuses
-        # it instead of immediately making another refresh() call.
         grimmory_auth.cache_access_token(user.id, access_token, expires_in)
     base_url = os.environ.get(grimmory_auth.GRIMMORY_BASE_URL_ENV)
     if base_url:
@@ -664,8 +622,7 @@ def api_reorder_wanted_shelf(
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
     set_wanted_order(db_connection, user.id, payload.entry_ids)
-    # year is inert for the "wanted" shelf (_shelf_label/_entries_for_shelf only branch on it for
-    # "finished") - no client-supplied today needed here unlike the other _shelf_out callers.
+    # year is inert for the "wanted" shelf.
     return _shelf_out(db_connection, user.id, "wanted", datetime.now(timezone.utc).year)
 
 
@@ -719,11 +676,8 @@ def api_book_detail(
     burndown = stat_tiles.burndown_points(sessions)
     progress_percent = stat_tiles.latest_progress(sessions) if entry.status == "reading" else None
     if progress_percent is None and entry.status == "reading":
-        # Session-derived progress is never available for audiobooks (Grimmory's own audiobook
-        # player doesn't log endProgress on listening sessions - see
-        # tbr_entries.audiobook_progress_percent in app/models.py) - fall back to the
-        # independently-synced value from Grimmory's progress-update endpoint instead of just
-        # showing no progress at all.
+        # Audiobooks never get session-derived progress (Grimmory doesn't log it) - fall back to
+        # the independently-synced value instead.
         progress_percent = entry.audiobook_progress_percent
     estimated_page = (
         round(progress_percent / 100 * entry.book.page_count)
@@ -853,9 +807,7 @@ def api_settings_sync(
 def api_settings_shelves(
     user: User = Depends(require_user), db_connection: sqlite3.Connection = Depends(get_db)
 ):
-    # Live Grimmory shelf list for the Settings-page dropdowns — deliberately its own route rather
-    # than folded into GET /api/settings, so a slow/unreachable Grimmory only affects this section
-    # instead of the whole settings page load.
+    # Own route rather than folded into GET /api/settings, so a slow Grimmory only affects this.
     base_url = os.environ.get(grimmory_auth.GRIMMORY_BASE_URL_ENV)
     if not base_url:
         return schemas.ShelfOptionsOut(shelves=[], error="Grimmory login is not configured")
@@ -887,10 +839,8 @@ def api_settings_shelves_update(
     user: User = Depends(require_user),
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
-    # Pure local write, no live Grimmory validation call here — if a stale/foreign shelf id ever
-    # got persisted, Grimmory's own POST /api/v1/books/shelves already rejects assigning to a
-    # shelf the user doesn't own, so the next sync fails loud (self-correcting once fixed) rather
-    # than needing a second live round trip on every save.
+    # Pure local write - Grimmory itself rejects assigning to a shelf the user doesn't own, so a
+    # stale/foreign shelf id self-corrects loudly on the next sync.
     set_want_to_read_shelf_id(db_connection, user.id, payload.want_to_read_shelf_id)
     set_sync_to_device_enabled(db_connection, user.id, payload.sync_to_device_enabled)
     set_sync_to_device_shelf_id(db_connection, user.id, payload.sync_to_device_shelf_id)
@@ -1029,10 +979,7 @@ def api_add_to_tbr(
         published_date=payload.published_date or None,
     )
     entry = add_tbr_entry(db_connection, user.id, book.id)
-    # Fetch the real Grimmory cover in the background whenever we know the grimmory_id, even if
-    # payload.cover_url already carried a search-result placeholder (e.g. an Open Library
-    # thumbnail) - the real cover should win over that placeholder rather than waiting for the
-    # next periodic sync to notice and replace it (see library_check._has_local_cover).
+    # Fetch the real Grimmory cover in the background, overriding any search-result placeholder.
     if payload.grimmory_id:
         try:
             grimmory_id_int = int(payload.grimmory_id)
@@ -1143,24 +1090,18 @@ def api_admin(db_connection: sqlite3.Connection = Depends(get_db)):
         catalog = get_library_catalog(db_connection)
         sync_state = get_library_sync_state(db_connection)
 
-        # "In library" shows the whole catalog (not just requested-and-owned books), so
-        # browsing it doesn't depend on someone having added a book to their TBR first —
-        # carrying over wanted_by wherever a catalog entry does happen to also be requested.
+        # "In library" shows the whole catalog, not just requested-and-owned books.
         wanted_by_for_catalog: dict[int, list[str]] = {}
         needed_entries = []
         manual_owned_rows = []
-        # id(match) of catalog entries already represented via a manual-match row below, so the
-        # plain catalog pass doesn't also show them (each catalog entry appears exactly once).
+        # Catalog entries already shown via a manual-match row below - skip in the plain pass.
         represented_catalog_ids: set[int] = set()
         for entry in aggregate_entries:
             match = library_check.resolve_catalog_match(entry.book, catalog)
             if match is None:
                 needed_entries.append(_requested_row(entry))
             elif entry.book.manual_match_grimmory_id is not None:
-                # Manually matched: render using the book's own stored title/author/cover — this
-                # is admin-asserted certainty, not re-derived from a possibly differently-titled
-                # catalog row (see _catalog_row for the auto-match path, which does use the
-                # catalog row's own fields).
+                # Manually matched: render using the book's own stored title/author/cover.
                 row = _requested_row(entry)
                 row["grimmory_id"] = match.grimmory_id
                 row["manually_matched"] = True
@@ -1195,9 +1136,8 @@ async def api_admin_library_sync():
 
 @app.get("/api/admin/library-search", response_model=schemas.SearchOut)
 def api_admin_library_search(q: str = "", db_connection: sqlite3.Connection = Depends(get_db)):
-    # Ungated sibling of GET /api/search/library (which requires a household-user login) — the
-    # match picker needs to work for an admin who isn't also logged into the app itself, matching
-    # every other /api/admin/* route's reverse-proxy-gated-not-in-app-gated posture.
+    # Ungated sibling of GET /api/search/library - the match picker must work for an admin who
+    # isn't logged into the app itself.
     query = q.strip()
     catalog_matches = search_library_catalog(db_connection, query)
     results = [
@@ -1225,10 +1165,7 @@ def api_admin_match_book(
         raise HTTPException(status_code=404, detail="Not found")
 
     if payload.grimmory_id is None:
-        # Unmatch: clear the pin, then recompute grimmory_book_id from whatever the fuzzy matcher
-        # says right now (or None) — never leaves a stale manually-forced id behind. Both columns
-        # are written in one UPDATE (see set_book_manual_match_and_grimmory_id) so a crash between
-        # them can't leave the pin cleared but the old forced id still in place, or vice versa.
+        # Unmatch: clear the pin and recompute grimmory_book_id from the fuzzy matcher (or None).
         catalog = get_library_catalog(db_connection)
         fallback = library_check.find_catalog_match(book.title, book.isbn, book.author, catalog)
         set_book_manual_match_and_grimmory_id(

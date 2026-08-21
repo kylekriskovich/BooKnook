@@ -40,8 +40,7 @@ from app.models import (
 logger = logging.getLogger(__name__)
 
 # Grimmory REST API client + book matching for the library cross-check (phase 2). Connection
-# settings live in the library_settings SQLite table, editable at runtime from /admin/settings -
-# not environment variables - so they can be changed without a container restart.
+# settings live in the library_settings SQLite table, editable at /admin/settings.
 
 LOGIN_PATH = "/api/v1/auth/login"
 BOOKS_PATH = "/api/v1/books"
@@ -52,18 +51,14 @@ SHELVES_PATH = "/api/v1/shelves"
 SHELF_BOOKS_PATH = "/api/v1/shelves/{shelf_id}/books"
 BOOKS_SHELVES_PATH = "/api/v1/books/shelves"
 
-# Default names for the two Grimmory shelves this app keeps in sync (see sync_user_reading_status's
-# shelf-sync passes) - only used the first time a user's shelf id is resolved (see
-# _ensure_want_to_read_shelf/_ensure_sync_to_device_shelf); after that the resolved id is persisted
-# on users.want_to_read_shelf_id/sync_to_device_shelf_id and these names are never consulted again,
-# even if the user later renames the shelf directly in Grimmory.
+# Default names for the two Grimmory shelves this app keeps in sync - only used the first time a
+# user's shelf id is resolved; after that it's persisted on users.want_to_read_shelf_id/
+# sync_to_device_shelf_id.
 DEFAULT_WANT_TO_READ_SHELF_NAME = "Want to Read"
 DEFAULT_SYNC_TO_DEVICE_SHELF_NAME = "Booknook: Sync to Device"
 
-# Prefix set_book_cover_url always writes (see _maybe_download_cover) - distinguishes an already
-#-downloaded Grimmory cover from a book/isbn-search placeholder (e.g. an Open Library thumbnail
-# stored straight off a search result, see POST /tbr), which should still be replaced once we know
-# the real Grimmory cover, rather than treated as "already has a cover, don't bother".
+# Prefix set_book_cover_url always writes - distinguishes an already-downloaded Grimmory cover from
+# a search-result placeholder, which should still be replaced once we know the real cover.
 COVER_URL_PREFIX = "/covers/"
 
 
@@ -84,11 +79,8 @@ TITLE_MATCH_THRESHOLD = 90
 AUTHOR_MATCH_THRESHOLD = 80
 TITLE_ONLY_MATCH_THRESHOLD = 95
 
-# Grimmory ReadStatus values (model/enums/ReadStatus.java) that map onto our finished/reading
-# shelves. UNREAD/PAUSED/UNSET or no catalog match at all leave the TBR entry's current status
-# untouched — genuinely ambiguous, v1 deliberately never downgrades a reading/finished entry back
-# toward wanted on those. WONT_READ/ABANDONED are different: an explicit "I'm done with this"
-# signal, not ambiguous, so those actively remove a "reading" entry — see ABANDONED_READ_STATUSES.
+# Grimmory ReadStatus values that map onto our finished/reading shelves. UNREAD/PAUSED/UNSET leave
+# the entry's status untouched (ambiguous); WONT_READ/ABANDONED actively remove a "reading" entry.
 FINISHED_READ_STATUSES = {"READ"}
 READING_READ_STATUSES = {"READING", "RE_READING", "PARTIALLY_READ"}
 ABANDONED_READ_STATUSES = {"WONT_READ", "ABANDONED"}
@@ -97,12 +89,9 @@ ABANDONED_READ_STATUSES = {"WONT_READ", "ABANDONED"}
 class LibraryCheckUnavailable(Exception):
     """Raised when the Grimmory API can't be reached, isn't configured, or rejected a request.
 
-    status_code carries the HTTP status Grimmory actually returned, when known (i.e. the
-    underlying failure was an httpx.HTTPStatusError, not a connection error/timeout/malformed
-    response). Callers holding a cached access token use is_auth_rejection to decide whether to
-    evict it - a real 401/403 means the token's actually bad, but a transient 5xx or a connection
-    failure doesn't, and evicting on those would just force an unnecessary refresh-token rotation
-    on the next call.
+    status_code carries the HTTP status Grimmory returned, when known. is_auth_rejection is True
+    only for a real 401/403 - callers use it to decide whether a cached access token is worth
+    evicting (a transient 5xx/connection error doesn't mean the token itself is bad).
     """
 
     def __init__(self, message: str, status_code: Optional[int] = None):
@@ -178,8 +167,7 @@ def fetch_catalog(db_connection) -> list[LibraryCatalogEntry]:
 
     try:
         with grimmory_http.client(base_url=base_url, timeout=10.0) as client:
-            # No token persistence - a fresh login happens on every call, since this is only
-            # invoked periodically/on manual sync, never per-request.
+            # No token persistence - a fresh login happens on every call.
             login_response = client.post(
                 LOGIN_PATH, json={"username": username, "password": password}
             )
@@ -199,19 +187,14 @@ def fetch_catalog(db_connection) -> list[LibraryCatalogEntry]:
         raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
 
     entries = [_book_to_catalog_entry(book) for book in books]
-    # Backfill grimmory_book_id/covers for any locally-known book that matches this catalog -
-    # reuses the read-only service account's own token, so this runs unattended on every catalog
-    # sync rather than depending on a household member happening to be logged in (unlike the
-    # per-user cover download in sync_user_reading_status, which this complements).
+    # Backfill grimmory_book_id/covers for any locally-known book that matches - reuses the
+    # read-only service account's token, so this runs unattended without a user being logged in.
     _apply_catalog_matches_to_local_books(db_connection, base_url, access_token, entries)
     return entries
 
 # Function Name: _apply_catalog_matches_to_local_books
-# Description: For every local book that matches a freshly-fetched Grimmory catalog entry,
-#   records the catalog entry's grimmory id (same "always overwritten from Grimmory" convention
-#   as _sync_book_metadata) and best-effort fills in the real Grimmory cover, unless one's already
-#   been downloaded locally (see _has_local_cover - a search-result placeholder cover doesn't count
-#   and gets replaced).
+# Description: For every local book that matches a freshly-fetched Grimmory catalog entry, records
+#   the grimmory id and best-effort fills in the real cover if one isn't already local.
 # Parameters:
 # - db_connection: Database connection.
 # - base_url (str): Grimmory base URL.
@@ -279,11 +262,8 @@ def find_catalog_match(
 # Returns: Matching catalog entry, or None if no match is found.
 def resolve_catalog_match(book: Book, catalog: list[LibraryCatalogEntry]) -> Optional[LibraryCatalogEntry]:
     if book.manual_match_grimmory_id is not None:
-        # Looked up by grimmory_id in the given catalog, never by book.grimmory_book_id - that
-        # column may be stale relative to `catalog` (this is only ever computed against a
-        # freshly-fetched/cached catalog list). If the pin points at a book Grimmory no longer has
-        # (or the local catalog cache just hasn't caught up yet), this returns None rather than
-        # silently falling back to a guess - an admin can always rematch.
+        # Looked up by grimmory_id in the given catalog, not book.grimmory_book_id (which may be
+        # stale) - returns None rather than guessing if the pin no longer resolves.
         for entry in catalog:
             if entry.grimmory_id == book.manual_match_grimmory_id:
                 return entry
@@ -303,11 +283,8 @@ def resolve_catalog_match(book: Book, catalog: list[LibraryCatalogEntry]) -> Opt
 def find_owning_book_id(
     db_connection, grimmory_id: int, exclude_book_id: Optional[int] = None
 ) -> Optional[int]:
-    # Compares against each book's own persisted claim (manual pin, else grimmory_book_id) rather
-    # than routing through resolve_catalog_match/a freshly-loaded catalog list - that would only
-    # detect a conflict when the target id happens to still be present in whatever catalog was
-    # passed in, which is unnecessarily fragile against a stale/just-resynced cache. The persisted
-    # columns are the actual source of truth for "what does this book currently claim to be."
+    # Compares against each book's own persisted claim (manual pin, else grimmory_book_id) - the
+    # source of truth, rather than a possibly-stale freshly-loaded catalog list.
     for book in list_books(db_connection):
         if book.id == exclude_book_id:
             continue
@@ -327,9 +304,7 @@ def find_owning_book_id(
 def fetch_user_books(base_url: str, access_token: str) -> list[dict]:
     try:
         with grimmory_http.client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
-            # Includes readStatus/dateFinished (no stripForListView, unlike fetch_catalog) - called
-            # once at login for reading-status auto-detection; token isn't persisted here or by
-            # the caller.
+            # Includes readStatus/dateFinished (no stripForListView, unlike fetch_catalog).
             response = client.get(BOOKS_PATH, headers={"Authorization": f"Bearer {access_token}"})
             response.raise_for_status()
             return response.json()
@@ -363,10 +338,8 @@ def fetch_reading_sessions_for_book(
                 body = response.json()
                 sessions.extend(body.get("content") or [])
                 page += 1
-                # Grimmory paginates this endpoint with a *nested* Page format ({"content": [...],
-                # "page": {"totalPages": N, ...}}), not the flat shape a plain reading of "Spring
-                # Page response" suggests - getting this wrong silently truncates results
-                # (confirmed: undercounted a 118-session book by ~4h of reading time, no error).
+                # Nested Page format ({"content": [...], "page": {"totalPages": N}}), not flat -
+                # getting this wrong silently truncates results (confirmed in production).
                 total_pages = (body.get("page") or {}).get("totalPages") or 0
                 if page >= total_pages:
                     break
@@ -387,8 +360,7 @@ def fetch_reading_sessions_for_book(
 #   app/grimmory_auth.py:get_own_grimmory_user_id).
 # Returns: Raw shelf payloads owned by this user (list[dict])
 def list_own_shelves(base_url: str, access_token: str, own_grimmory_user_id: int) -> list[dict]:
-    # GET /api/v1/shelves returns own + public shelves mixed with no server-side owner filter, so
-    # filtering to "shelves I own" has to happen client-side here.
+    # GET /api/v1/shelves returns own + public shelves mixed, no server-side owner filter.
     try:
         with grimmory_http.client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
             response = client.get(SHELVES_PATH, headers={"Authorization": f"Bearer {access_token}"})
@@ -401,14 +373,9 @@ def list_own_shelves(base_url: str, access_token: str, own_grimmory_user_id: int
     return [shelf for shelf in shelves if shelf.get("userId") == own_grimmory_user_id]
 
 # Function Name: _shelf_name_key
-# Description: Normalizes a shelf name for matching - Grimmory's own duplicate-name check
-#   (existsByUserIdAndName) inherits MariaDB's default case-insensitive column collation, so a
-#   shelf named e.g. "Want To Read" already 409s a create of "Want to Read" even though a naive
-#   Python `==` wouldn't consider them equal. Matching case-insensitively (and trimmed) here keeps
-#   the two checks - "does Grimmory think this already exists" and "can we find it in the list" -
-#   in agreement, instead of get_or_create_shelf_by_name looping forever on a 409 it can never
-#   resolve (confirmed in production: a shelf named "Want To Read" left want_to_read_shelf_id
-#   permanently unresolved).
+# Description: Normalizes a shelf name for matching - Grimmory's duplicate-name check is
+#   case-insensitive (MariaDB's default collation), so this must be too or get_or_create_shelf_by_name
+#   loops forever on a 409 it can never resolve (confirmed in production).
 # Parameters:
 # - name (str): Raw shelf name.
 # Returns: Normalized name (str)
@@ -426,10 +393,8 @@ def _shelf_name_key(name: str) -> str:
 def get_or_create_shelf_by_name(
     base_url: str, access_token: str, own_grimmory_user_id: int, name: str
 ) -> int:
-    # GET-then-POST rather than relying on Grimmory's SHELF_ALREADY_EXISTS (409) on a duplicate
-    # POST - that's an error path, not a natural upsert - and this also means a shelf the user
-    # already made themselves under this name is silently adopted (Grimmory enforces unique shelf
-    # names per user, so a name match here is unambiguous).
+    # GET-then-POST rather than relying on Grimmory's SHELF_ALREADY_EXISTS (409) - also means a
+    # shelf the user already made under this name is silently adopted.
     target_key = _shelf_name_key(name)
     for shelf in list_own_shelves(base_url, access_token, own_grimmory_user_id):
         if shelf.get("id") is not None and _shelf_name_key(shelf.get("name") or "") == target_key:
@@ -442,11 +407,8 @@ def get_or_create_shelf_by_name(
                 headers={"Authorization": f"Bearer {access_token}"},
             )
             if response.status_code == 409:
-                # Lost a create race against another sync for the same user (the manual
-                # POST /api/settings/sync trigger and the periodic background loop can both
-                # reach here concurrently, e.g. while the library catalog cross-check isn't
-                # configured the periodic loop runs every 60s) - someone else already created
-                # this shelf between our GET above and this POST. Not an error: adopt it.
+                # Lost a create race against a concurrent sync for the same user - not an error,
+                # adopt the shelf someone else just created.
                 for shelf in list_own_shelves(base_url, access_token, own_grimmory_user_id):
                     if shelf.get("id") is not None and _shelf_name_key(shelf.get("name") or "") == target_key:
                         return shelf["id"]
@@ -551,20 +513,12 @@ def _sync_book_metadata(db_connection, book_id: int, entry_id: int, book: dict) 
     # Always overwritten from Grimmory, unlike tbr_entries.started_at.
     set_book_page_count(db_connection, book_id, metadata.get("pageCount"))
     set_tbr_entry_rating(db_connection, entry_id, book.get("personalRating"))
-    # Captured from the same response so reading sessions can be fetched on demand later (see
-    # app/stat_tiles.py), with no extra HTTP call here.
     set_book_grimmory_id(db_connection, book_id, book.get("id"))
-    # primaryFile.bookType ("EPUB", "AUDIOBOOK", ...) - lets app/stat_tiles.py label tiles
-    # correctly ("Time Spent Listening" vs "Time Spent Reading") without needing a reading session
-    # to already exist just to learn the book's media type.
+    # primaryFile.bookType ("EPUB", "AUDIOBOOK", ...) lets app/stat_tiles.py label tiles correctly.
     primary_file = book.get("primaryFile") or {}
     set_book_format(db_connection, book_id, primary_file.get("bookType"))
-    # Grimmory's reading-session log never populates startProgress/endProgress/progressDelta for
-    # AUDIOBOOK-type sessions (a gap in Grimmory's own audiobook player), which starves every
-    # session-driven progress calculation in app/stat_tiles.py for audiobook entries. This field
-    # comes from Grimmory's separate progress-update endpoint instead, so it stays current
-    # independent of that gap - non-audiobooks simply never have it set. See
-    # app/main.py:api_book_detail for where this is used as a fallback.
+    # Grimmory never populates session progress deltas for audiobooks - this comes from its
+    # separate progress-update endpoint instead, used as a fallback in app/main.py:api_book_detail.
     audiobook_progress = book.get("audiobookProgress") or {}
     set_tbr_entry_audiobook_progress_percent(db_connection, entry_id, audiobook_progress.get("percentage"))
 
@@ -586,17 +540,15 @@ def _apply_status(
     target_status: str,
     book: dict,
 ) -> None:
-    # Never downgrades an already reading/finished entry back toward wanted on an ambiguous
-    # Grimmory status (see FINISHED_READ_STATUSES/READING_READ_STATUSES above).
+    # Never downgrades an already reading/finished entry back toward wanted.
     if target_status == "finished" and current_status != "finished":
         finished_at = book.get("dateFinished") or datetime.now(timezone.utc).isoformat()
         set_tbr_entry_status(db_connection, entry_id, "finished", finished_at)
     elif target_status == "reading" and current_status == "wanted":
         set_tbr_entry_status(db_connection, entry_id, "reading")
         if current_started_at is None:
-            # Best-effort only - Grimmory has no session-independent "date started" field, so this
-            # is just "whenever we happened to sync". Only set when absent, so a later sync never
-            # clobbers a manual correction made via POST /tbr/{id}/started (see app/main.py).
+            # Best-effort "whenever we synced" - only set when absent so a manual correction via
+            # POST /tbr/{id}/started is never clobbered.
             set_tbr_entry_started_at(
                 db_connection, entry_id, datetime.now(timezone.utc).date().isoformat()
             )
@@ -611,9 +563,8 @@ def _apply_status(
 def fetch_book_cover(
     base_url: str, access_token: str, grimmory_book_id
 ) -> Optional[tuple[bytes, str]]:
-    # Grimmory only serves covers behind a short-lived per-request JWT (no stable public URL this
-    # app could store directly), so this downloads the bytes once and the caller serves them back
-    # out from local disk from then on.
+    # Grimmory only serves covers behind a short-lived JWT, so this downloads once and the caller
+    # serves the bytes back out from local disk from then on.
     try:
         with grimmory_http.client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
             response = client.get(
@@ -677,9 +628,7 @@ def _login_service_account(base_url: str, username: str, password: str) -> Optio
 
 # Function Name: download_cover_for_book
 # Description: Logs in with the read-only service account and downloads one book's cover -
-#   used to backfill a cover right away when a book is added straight from an "already in your
-#   library" search result (see POST /tbr), rather than waiting for the next periodic catalog
-#   sync to catch it.
+#   backfills right away when a book is added from an "already in your library" search result.
 # Parameters:
 # - db_connection: Database connection.
 # - book_id (int): Local book id.
@@ -696,9 +645,8 @@ def download_cover_for_book(db_connection, book_id: int, grimmory_book_id: int) 
     _maybe_download_cover(db_connection, base_url, access_token, book_id, grimmory_book_id)
 
 # Function Name: download_cover_for_book_now
-# Description: Runs download_cover_for_book with its own self-contained database connection -
-#   safe to run as a FastAPI background task (see POST /tbr), which outlives the request's own
-#   connection.
+# Description: Runs download_cover_for_book with its own connection - safe as a FastAPI background
+#   task, which outlives the request's own connection.
 # Parameters:
 # - book_id (int): Local book id.
 # - grimmory_book_id (int): Grimmory's own id for the book.
@@ -765,21 +713,16 @@ def _ensure_sync_to_device_shelf(db_connection, user, base_url: str, access_toke
 def sync_user_reading_status(
     db_connection, user_id: int, base_url: str, access_token: str
 ) -> None:
-    # Callers are expected to treat this as best-effort - a failed Grimmory call must not block
-    # login (see /login) or the on-demand sync (see /settings/sync).
+    # Best-effort - a failed Grimmory call must not block login or the on-demand sync.
     user = get_user(db_connection, user_id)
     if user is None:
-        # Deleted mid-sync (e.g. by an admin) between the caller resolving user_id and this
-        # running - surface the same exception type callers already expect, not an AttributeError
-        # from the shelf-sync passes' later `user.*` reads below.
+        # Deleted mid-sync - surface the exception type callers expect, not an AttributeError.
         raise LibraryCheckUnavailable(f"No such user_id={user_id}")
     books = fetch_user_books(base_url, access_token)
     catalog = [_book_to_catalog_entry(book) for book in books]
 
-    # Grimmory's own book id, once known, is a fully reliable match key - unlike title/isbn/author,
-    # which can drift slightly between syncs (a metadata refresh correcting an ISBN, adding an
-    # author) and silently fail the fuzzy matcher below. Built once per sync call, first occurrence
-    # wins for a repeated id - see the entry loop below for why a repeated id can happen at all.
+    # Grimmory's book id, once known, is a fully reliable match key - unlike title/isbn/author,
+    # which can drift between syncs and silently fail the fuzzy matcher below.
     books_by_grimmory_id: dict[int, int] = {}
     for i, book in enumerate(books):
         book_id = book.get("id")
@@ -788,17 +731,11 @@ def sync_user_reading_status(
 
     matched_indices: set[int] = set()
 
-    # Pass 1: match Grimmory books against existing tbr_entries - by grimmory_book_id when already
-    # known (see books_by_grimmory_id above), falling back to fuzzy ISBN/title/author matching only
-    # for a book not yet linked to a Grimmory id. Matching by grimmory_book_id first, rather than
-    # always re-deriving a fuzzy match, is what stops this pass from ever treating an
-    # already-tracked book as "unmatched" just because its title/isbn/author metadata changed
-    # slightly since the last sync - Pass 2 below would otherwise re-add it as a brand-new
-    # duplicate book+entry, which is exactly what happened in production (see GitHub issue #22)
-    # before this grimmory_book_id-first check existed. Also updates status/finished_at, or removes
-    # a "reading" entry outright if Grimmory now says WONT_READ/ABANDONED. Also downloads the real
-    # Grimmory cover (see fetch_book_cover/_maybe_download_cover) for any matched book that doesn't
-    # have one locally yet - see _has_local_cover.
+    # Pass 1: match Grimmory books against existing tbr_entries, by grimmory_book_id when already
+    # known, else fuzzy ISBN/title/author (matching by id first prevents re-adding an already
+    # tracked book as a duplicate when its metadata drifts slightly - see issue #22). Updates
+    # status/finished_at, removes a "reading" entry if now WONT_READ/ABANDONED, and downloads a
+    # missing cover.
     for entry in list_tbr_entries_with_books(db_connection, user_id):
         idx = None
         if entry.book.grimmory_book_id is not None:
@@ -810,11 +747,8 @@ def sync_user_reading_status(
             idx = next(i for i, catalog_entry in enumerate(catalog) if catalog_entry is match)
         matched_indices.add(idx)
         book = books[idx]
-        # An explicit abandon/won't-read signal removes a "reading" entry outright, rather than
-        # leaving it stuck on the Currently Reading shelf — unlike the ambiguous statuses above,
-        # this isn't "unknown", it's "not pursuing this anymore". If it's picked back up and
-        # marked reading/finished again later, the import pass below re-adds it (unmatched once
-        # removed), so this isn't a one-way trip.
+        # Explicit abandon/won't-read removes a "reading" entry outright - not a one-way trip, the
+        # import pass below re-adds it if picked back up later.
         if entry.status == "reading" and book.get("readStatus") in ABANDONED_READ_STATUSES:
             remove_tbr_entry(db_connection, entry.id)
             continue
@@ -852,12 +786,8 @@ def sync_user_reading_status(
         _sync_book_metadata(db_connection, new_book.id, new_entry.id, book)
         _maybe_download_cover(db_connection, base_url, access_token, new_book.id, book.get("id"))
 
-    # Pass 3: Want to Read shelf (always on) - pulls in any Grimmory-shelf book BooKnook doesn't
-    # know about yet (additive only - a manual removal on the Grimmory shelf is never mirrored
-    # back as a local delete), then re-diffs desired vs. current membership every sync so the
-    # shelf keeps reflecting "wanted + in library" as a standing invariant - including re-adding a
-    # book a user manually unassigned from the shelf directly in Grimmory, and correcting any
-    # shelf write left over from a prior sync that failed partway.
+    # Pass 3: Want to Read shelf (always on) - pulls in any unknown Grimmory-shelf book (additive
+    # only), then re-diffs desired vs. current membership every sync as a standing invariant.
     want_shelf_id = _ensure_want_to_read_shelf(db_connection, user, base_url, access_token)
     shelf_books = fetch_shelf_books(base_url, access_token, want_shelf_id)
     entries = list_tbr_entries_with_books(db_connection, user_id)
@@ -900,9 +830,8 @@ def sync_user_reading_status(
             base_url, access_token, to_unassign, shelves_to_unassign={want_shelf_id}
         )
 
-    # Pass 4: Sync to Device shelf (opt-in) - strictly additive, feeds the external
-    # grimmory.koplugin KOReader plugin. Never unassigned, even across a status change or a full
-    # local delete - see users.sync_to_device_enabled's schema comment.
+    # Pass 4: Sync to Device shelf (opt-in) - strictly additive, feeds the external KOReader
+    # plugin. Never unassigned, even across a status change or delete.
     if user.sync_to_device_enabled:
         device_shelf_id = _ensure_sync_to_device_shelf(db_connection, user, base_url, access_token)
         device_ids = {
@@ -977,10 +906,8 @@ def _sync_all_user_reading_status(db_connection) -> None:
         try:
             sync_user_reading_status(db_connection, user.id, base_url, access_token)
         except LibraryCheckUnavailable as exc:
-            # One user's failure never blocks the others or the catalog sync that follows. Evict
-            # the cached access token too, but only on an actual auth rejection - a transient 5xx
-            # or connection failure doesn't mean the token itself is bad (see
-            # grimmory_auth.evict_access_token, LibraryCheckUnavailable.is_auth_rejection).
+            # One user's failure never blocks the others. Evict the cached token only on an
+            # actual auth rejection, not a transient failure.
             if exc.is_auth_rejection:
                 grimmory_auth.evict_access_token(access_token)
             logger.exception("Background reading-status sync failed for user_id=%s", user.id)
