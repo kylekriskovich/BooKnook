@@ -702,6 +702,26 @@ def _ensure_sync_to_device_shelf(db_connection, user, base_url: str, access_toke
     user.sync_to_device_shelf_id = shelf_id
     return shelf_id
 
+# Function Name: _dedupe_by_grimmory_id
+# Description: Keeps only the first occurrence of each Grimmory book id. Grimmory's own
+#   GET /api/v1/books response has been observed to include the same book id more than once in a
+#   single call (see issue #22) - left un-deduped, only the first occurrence gets matched in Pass 1
+#   below, and every repeat reads as "unmatched" to Pass 2, minting a duplicate local book per repeat.
+# Parameters:
+# - books (list[dict]): Raw Grimmory book payloads, as returned by fetch_user_books.
+# Returns: The same payloads with repeat ids removed, order preserved.
+def _dedupe_by_grimmory_id(books: list[dict]) -> list[dict]:
+    seen: set[int] = set()
+    deduped = []
+    for book in books:
+        book_id = book.get("id")
+        if book_id is not None:
+            if book_id in seen:
+                continue
+            seen.add(book_id)
+        deduped.append(book)
+    return deduped
+
 # Function Name: sync_user_reading_status
 # Description: Reflects a user's own Grimmory reading status onto their TBR shelves.
 # Parameters:
@@ -718,7 +738,7 @@ def sync_user_reading_status(
     if user is None:
         # Deleted mid-sync - surface the exception type callers expect, not an AttributeError.
         raise LibraryCheckUnavailable(f"No such user_id={user_id}")
-    books = fetch_user_books(base_url, access_token)
+    books = _dedupe_by_grimmory_id(fetch_user_books(base_url, access_token))
     catalog = [_book_to_catalog_entry(book) for book in books]
 
     # Grimmory's book id, once known, is a fully reliable match key - unlike title/isbn/author,

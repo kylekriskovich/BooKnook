@@ -678,6 +678,36 @@ def test_sync_matches_by_grimmory_book_id_despite_drifted_metadata(conn, monkeyp
     assert entries[0].book.id == book.id
 
 
+def test_sync_dedupes_grimmory_response_containing_the_same_book_id_twice(conn, monkeypatch):
+    # Regression test: production kept creating duplicates even after the grimmory_book_id-first
+    # match above, because Grimmory's own GET /api/v1/books response has been observed to include
+    # the same book id more than once in a single call. books_by_grimmory_id.setdefault only ever
+    # records the *first* occurrence's index, so the repeat looked "unmatched" to Pass 2 and got a
+    # brand-new duplicate local book minted for it every time. The fetched list must be deduped by
+    # grimmory id before any matching runs, independent of what's causing Grimmory to repeat it.
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(
+        conn, title="Dungeon Crawler Carl", author="Matt Dinniman", cover_url="/covers/existing.jpg"
+    )
+    models.set_book_grimmory_id(conn, book.id, 400)
+    models.add_tbr_entry(conn, user.id, book.id)  # starts "wanted"
+    monkeypatch.setattr(library_check, "_maybe_download_cover", lambda *a, **k: None)
+
+    grimmory_book = {
+        "id": 400,
+        "metadata": {"title": "Dungeon Crawler Carl", "authors": ["Matt Dinniman"]},
+        "readStatus": "READING",
+    }
+    _fake_books_client([grimmory_book, dict(grimmory_book)], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entries = models.list_tbr_entries_with_books(conn, user.id)
+    assert len(entries) == 1
+    assert entries[0].status == "reading"
+    assert entries[0].book.id == book.id
+
+
 def test_sync_never_downgrades_finished_entry(conn, monkeypatch):
     user = models.get_or_create_user(conn, "alice")
     book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
