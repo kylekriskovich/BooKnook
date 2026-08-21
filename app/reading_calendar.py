@@ -14,8 +14,7 @@ class BookSpan:
     entry: TBREntryDetail
     start: date
     end: date
-    # Stable vertical bar slot for the month, assigned by _assign_lanes — see that function's
-    # docstring for why this needs to be a fixed per-span property rather than recomputed per day.
+    # Stable vertical bar slot for the month, assigned by _assign_lanes.
     lane: int = 0
 
     @property
@@ -56,17 +55,10 @@ def _all_spans(entries: list[TBREntryDetail], today: Optional[date] = None) -> l
     return [span for entry in entries if (span := _book_span(entry, today)) is not None]
 
 # Function Name: _assign_lanes
-# Description: Assigns each span a stable vertical bar lane via greedy interval scheduling (by
-# start date, tie-broken by book id) — the same "minimum platforms" algorithm used for calendar/
-# Gantt-style lane packing: walk spans in chronological order, reusing the lowest-numbered lane
-# whose previous occupant has already ended, or opening a new lane if none is free. This
-# guarantees two things the per-day bar rendering depends on: any spans overlapping on a given
-# day always land in different lanes, and — crucially — a span keeps the *same* lane for its
-# entire duration, so its connecting bar renders at one consistent vertical position across every
-# day it's active (see DayCell.bar_spans / _calendar_section.html), instead of jumping slot
-# whenever some unrelated span enters or leaves that day's mix (the bug this exists to fix: a
-# span's bridge segments ending up at two different heights either side of the jump, reading as
-# a doubled/broken line rather than one continuous one). Mutates spans in place.
+# Description: Assigns each span a stable vertical bar lane via greedy interval scheduling
+#   ("minimum platforms"): reuse the lowest-numbered lane whose occupant has ended, else open a
+#   new one. Keeps a span in the same lane for its whole duration so its bar doesn't jump vertical
+#   position mid-run. Mutates spans in place.
 # Parameters:
 # - spans (list[BookSpan]): spans to assign lanes to.
 # Returns: None.
@@ -174,9 +166,8 @@ class DayCell:
     active_spans: list[BookSpan] = field(default_factory=list)
 
     # Function Name: _milestone_order
-    # Description: Every span with a milestone (start or end) on this cell's date, priority order
-    # (index 0 is the "winner" — see cover_spans). Shared by cover_spans and _decluttered_spans so
-    # both agree on who the winner is without computing the ordering twice independently.
+    # Description: Spans with a milestone (start or end) on this date, priority order - index 0 is
+    #   the "winner" (see cover_spans). Shared with _decluttered_spans so both agree on the winner.
     # Returns: Milestone BookSpans, highest display priority first.
     def _milestone_order(self) -> list[BookSpan]:
         milestones = [
@@ -197,14 +188,9 @@ class DayCell:
         return sorted(milestones, key=sort_key)
 
     # Function Name: _decluttered_spans
-    # Description: Milestone spans hidden from *both* cover_spans and bar_spans today: a fanned
-    # (non-winner) span whose start is today and which finishes tomorrow. A 1-day-later finish is
-    # too short for the connecting bar to read as "one continuous book" rather than two unrelated
-    # one-off covers a day apart, so it's decluttered off the start day entirely — cover *and*
-    # bar — rather than just the cover. A hidden cover with its bar still showing used to read as
-    # a stray, unexplained second line (nothing on screen said *why* a second book's bar had
-    # appeared that day). It still gets its own (likely winning) card and bar on its actual finish
-    # day. The winner itself is never decluttered by this rule, regardless of its own duration.
+    # Description: Non-winner milestone spans hidden entirely (cover and bar) today: one that
+    #   starts today and finishes tomorrow - too short a gap for the bar to read as one continuous
+    #   book rather than two stray one-off covers.
     # Returns: Non-winner milestone spans to hide entirely today.
     @property
     def _decluttered_spans(self) -> list[BookSpan]:
@@ -219,14 +205,10 @@ class DayCell:
         ]
 
     # Function Name: cover_spans
-    # Description: Every span with a milestone (start or end) on this cell's date, ordered for
-    # display — index 0 is the "winner" (rendered centered, full prominence; see
-    # _calendar_section.html), any further spans fan out behind it by their own type. A book that
-    # starts and finishes the same day ranks highest (nothing else can be more specific to this
-    # date); next, a span finishing today outranks one merely starting today (finishing is the
-    # more notable event of the two); ties break by book id. The template only renders the top 3
-    # — this list itself is intentionally left uncapped so no milestone is ever silently dropped
-    # by the data layer, except for _decluttered_spans (see there).
+    # Description: Spans with a milestone on this date, display order - index 0 is the "winner"
+    #   (rendered centered/prominent), rest fan out behind it. Same-day start+finish ranks
+    #   highest, then a finish outranks a mere start, ties by book id. Uncapped here (the template
+    #   caps at 3) except for _decluttered_spans.
     # Returns: BookSpans with a milestone on this date, highest display priority first.
     @property
     def cover_spans(self) -> list[BookSpan]:
@@ -239,19 +221,10 @@ class DayCell:
         return [winner, *rest]
 
     # Function Name: bar_spans
-    # Description: This cell's active_spans — minus anything in _decluttered_spans, so a
-    # decluttered book's bar never shows up unexplained on the one day its cover is deliberately
-    # hidden — one slot per lane (see _assign_lanes) up to the display cap of 3, index i holding
-    # whatever occupies lane i today — or None if lane i is unoccupied today but a *higher* lane
-    # isn't (e.g. a long-running book sits alone in lane 1 for days, then a short book joins in
-    # lane 0: without a placeholder there, the long book's bar would visually compact up into slot
-    # 0 on its lone days and back down to slot 1 whenever lane 0 is briefly occupied — the exact
-    # same "jumps slot, bridge segments end up at two different heights" bug _assign_lanes exists
-    # to prevent, just still possible with lane 1 was the only occupied lane instead of book-id
-    # ordering being the culprit). A leading empty slot never appears alone — bar_spans is
-    # None-trimmed at both ends: nothing renders below the highest occupied lane, and lane 0 alone
-    # (the overwhelmingly common case) needs no padding at all. Only interior gaps (a lower lane
-    # empty while a higher one is occupied) become None.
+    # Description: active_spans minus _decluttered_spans, one slot per lane up to the display cap
+    #   of 3 (index == lane). None-trimmed at both ends - only an interior gap (a lower lane empty
+    #   while a higher one is occupied) becomes None, so a lane doesn't visually shift position
+    #   depending on which lanes above/below it happen to be occupied that day.
     # Returns: Up to 3 slots, index == lane, real BookSpans or None for an occupied-above gap.
     @property
     def bar_spans(self) -> list[Optional[BookSpan]]:

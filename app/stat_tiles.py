@@ -11,12 +11,8 @@ def session_date(session: dict) -> Optional[date]:
 
 
 def _has_meaningful_progress(session: dict) -> bool:
-    # Grimmory's own audiobook player never populates progressDelta/endProgress on a listening
-    # session (a gap in Grimmory itself, not this app - see tbr_entries.audiobook_progress_percent
-    # in app/models.py) - a plain progressDelta check would silently drop every audiobook session
-    # from Reading Days/Best Streak/Time Spent Reading/the burndown chart, even ones with real
-    # logged listening time. bookType is the one field Grimmory does set correctly on those
-    # sessions, so treat real durationSeconds as the activity signal for that book type instead.
+    # Grimmory never sets progressDelta on audiobook sessions - use durationSeconds instead so
+    # real listening time still counts.
     if (session.get("progressDelta") or 0) > 0:
         return True
     return session.get("bookType") == "AUDIOBOOK" and (session.get("durationSeconds") or 0) > 0
@@ -164,11 +160,8 @@ def build_book_tiles(entry, sessions: list[dict], today: Optional[date] = None) 
                 ]
                 latest_progress = max(end_progresses) if end_progresses else 0.0
             elif is_audiobook and entry.audiobook_progress_percent is not None:
-                # Grimmory's audiobook player never logs per-session progressDelta/endProgress (see
-                # _has_meaningful_progress above), so there's no session-level pace to sum here -
-                # fall back to the one number Grimmory does keep current for audiobooks (see
-                # tbr_entries.audiobook_progress_percent in app/models.py), averaged over the
-                # listening days actually observed so far.
+                # No session-level pace for audiobooks - fall back to the overall percentage,
+                # averaged over listening days observed so far.
                 pace_per_day = entry.audiobook_progress_percent / span_days
                 latest_progress = entry.audiobook_progress_percent
             else:
@@ -312,11 +305,8 @@ def burndown_points(sessions: list[dict]) -> list[tuple[date, int]]:
         for day, progress in sorted(by_date.items())
     ]
     if points:
-        # Synthetic "Day 0" point at 100% remaining, the day before the first logged session.
-        # Without it the first plotted point already reflects whatever was left after *that*
-        # day's own session (e.g. 85% remaining after an evening spent reading), which reads as
-        # progress appearing out of nowhere rather than the line burning down from the actual
-        # start of the book.
+        # Synthetic "Day 0" point at 100% remaining, the day before the first logged session, so
+        # the line burns down from the actual start rather than starting mid-progress.
         first_day = points[0][0]
         points.insert(0, (first_day - timedelta(days=1), 100))
     return points
