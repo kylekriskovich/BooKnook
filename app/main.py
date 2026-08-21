@@ -575,6 +575,7 @@ def api_login(payload: schemas.LoginIn, db_connection: sqlite3.Connection = Depe
 
     user = get_or_create_user(db_connection, payload.username)
     set_grimmory_refresh_token(db_connection, user.id, refresh_token)
+    grimmory_auth.log_token_write(user.id, refresh_token, "api_login")  # TEMPORARY diagnostic
     base_url = os.environ.get(grimmory_auth.GRIMMORY_BASE_URL_ENV)
     if base_url:
         try:
@@ -815,6 +816,7 @@ def api_settings_sync(
             error = str(exc)
         else:
             set_grimmory_refresh_token(db_connection, user.id, refresh_token)
+            grimmory_auth.log_token_write(user.id, refresh_token, "api_settings_sync")  # TEMPORARY
     else:
         access_token = grimmory_auth.get_valid_access_token(db_connection, user)
         if access_token is None:

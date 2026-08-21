@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import threading
@@ -46,6 +47,43 @@ RESTRICTION_TIERS = [6, 10, 13, 16, 18, 21]
 # and are revoked on use, so two concurrent refresh attempts for the same user would otherwise
 # race. Plain threading.Lock (not asyncio) since every route here runs in FastAPI's threadpool.
 _refresh_locks: "defaultdict[int, threading.Lock]" = defaultdict(threading.Lock)
+
+
+# TEMPORARY diagnostic (see the 2026-08-21 investigation: a household user's Grimmory session
+# kept getting force-invalidated seconds after a fresh login, with no explanation found in
+# Grimmory's own audit log). log_token_write/_token_fingerprint below let the logs show, per
+# user_id, exactly which refresh token was written by which code path and which one was read back
+# out before being submitted to Grimmory - so a live recurrence will show whether a failed refresh
+# used the token we *think* is current, or something already overwrote it first. Remove once the
+# root cause is confirmed.
+
+
+# Function Name: _token_fingerprint
+# Description: Short, non-reversible identifier for a refresh token, safe to log - lets diagnostic
+#   log lines confirm whether two operations touched the *same* token without ever logging the
+#   actual secret.
+# Parameters:
+# - token (Optional[str]): Refresh token value, or None.
+# Returns: 12-char hex fingerprint (str), or "none" if token is falsy.
+def _token_fingerprint(token: Optional[str]) -> str:
+    if not token:
+        return "none"
+    return hashlib.sha256(token.encode()).hexdigest()[:12]
+
+
+# Function Name: log_token_write
+# Description: Logs a fingerprint of a refresh token every time one is written to the DB, tagged
+#   with which code path wrote it and for which local user.
+# Parameters:
+# - user_id (int): Local user id the token belongs to.
+# - token (Optional[str]): The refresh token being written (None when clearing a rejected one).
+# - source (str): Which code path performed the write, e.g. "api_login".
+# Returns: None
+def log_token_write(user_id: int, token: Optional[str], source: str) -> None:
+    logger.info(
+        "Grimmory refresh token WRITE user_id=%s source=%s fingerprint=%s",
+        user_id, source, _token_fingerprint(token),
+    )
 
 
 class GrimmoryLoginError(Exception):
@@ -131,14 +169,21 @@ def get_valid_access_token(db_connection, user: User) -> Optional[str]:
         current = get_user(db_connection, user.id)
         if current is None or not current.grimmory_refresh_token:
             return None
+        # TEMPORARY diagnostic - see log_token_write above.
+        logger.info(
+            "Grimmory refresh token READ user_id=%s fingerprint=%s",
+            user.id, _token_fingerprint(current.grimmory_refresh_token),
+        )
         try:
             access_token, new_refresh_token = refresh(base_url, current.grimmory_refresh_token)
         except GrimmoryLoginError:
             set_grimmory_refresh_token(db_connection, user.id, None)
+            log_token_write(user.id, None, "get_valid_access_token(rejected)")
             user.grimmory_refresh_token = None
             return None
 
         set_grimmory_refresh_token(db_connection, user.id, new_refresh_token)
+        log_token_write(user.id, new_refresh_token, "get_valid_access_token")
         user.grimmory_refresh_token = new_refresh_token
         return access_token
 
