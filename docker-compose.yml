@@ -20,6 +20,8 @@ services:
       # Grimmory username whose nav settings icon shortcuts to /admin (UI convenience only —
       # /admin itself is still gated externally, not by this).
       - TBR_ADMIN_USERNAME=${TBR_ADMIN_USERNAME}
+      # Log level, including every Grimmory API call/response (see app/grimmory_http.py).
+      - TBR_LOG_LEVEL=${TBR_LOG_LEVEL:-INFO}
     volumes:
       - booknook-data:/data
 

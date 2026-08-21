@@ -117,6 +117,29 @@ def test_add_tbr_entry_is_idempotent(conn):
     assert len(models.list_tbr_entries_for_user(conn, user.id)) == 1
 
 
+def test_set_book_format(conn):
+    book = models.create_book(conn, "Dune", isbn="9780441172719")
+    assert book.format is None
+
+    models.set_book_format(conn, book.id, "AUDIOBOOK")
+
+    assert models.get_book(conn, book.id).format == "AUDIOBOOK"
+
+
+def test_set_tbr_entry_audiobook_progress_percent(conn):
+    user = models.create_user(conn, "Alice")
+    book = models.create_book(conn, "Dune", isbn="9780441172719")
+    entry = models.add_tbr_entry(conn, user.id, book.id)
+    assert entry.audiobook_progress_percent is None
+
+    models.set_tbr_entry_audiobook_progress_percent(conn, entry.id, 42.5)
+
+    updated = models.get_tbr_entry(conn, entry.id)
+    assert updated.audiobook_progress_percent == 42.5
+    detail = models.list_tbr_entries_with_books(conn, user.id)[0]
+    assert detail.audiobook_progress_percent == 42.5
+
+
 def test_remove_tbr_entry(conn):
     user = models.create_user(conn, "Alice")
     book = models.create_book(conn, "Dune", isbn="9780441172719")

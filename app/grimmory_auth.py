@@ -8,16 +8,21 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
+import time
 from collections import defaultdict
 from datetime import date
 from typing import Optional
 
 import httpx
 
+from app import grimmory_http
 from app.library_check import LOGIN_PATH, LibraryCheckUnavailable
 from app.models import User, get_grimmory_admin_settings, get_user, set_grimmory_refresh_token
+
+logger = logging.getLogger(__name__)
 
 GRIMMORY_BASE_URL_ENV = "GRIMMORY_BASE_URL"
 REFRESH_PATH = "/api/v1/auth/refresh"
@@ -62,14 +67,16 @@ def login(username: str, password: str) -> tuple[str, str]:
     if not base_url:
         raise GrimmoryLoginError("Grimmory login is not configured")
 
+    url = f"{base_url.rstrip('/')}{LOGIN_PATH}"
+    start = time.monotonic()
     try:
         response = httpx.post(
-            f"{base_url.rstrip('/')}{LOGIN_PATH}",
-            json={"username": username, "password": password},
-            timeout=10.0,
+            url, json={"username": username, "password": password}, timeout=10.0
         )
     except httpx.HTTPError as exc:
+        logger.warning("Grimmory login request failed for user %r: %s", username, exc)
         raise GrimmoryLoginError("Couldn't reach Grimmory — try again shortly") from exc
+    grimmory_http.log_call("POST", url, response.status_code, time.monotonic() - start)
 
     if response.status_code in INVALID_CREDENTIALS_STATUSES:
         raise GrimmoryLoginError("Invalid username or password")
@@ -88,14 +95,14 @@ def login(username: str, password: str) -> tuple[str, str]:
 def refresh(base_url: str, refresh_token: str) -> tuple[str, str]:
     # Grimmory rotates and revokes the old refresh token on every call - the returned refresh
     # token must replace the stored one immediately (see get_valid_access_token).
+    url = f"{base_url.rstrip('/')}{REFRESH_PATH}"
+    start = time.monotonic()
     try:
-        response = httpx.post(
-            f"{base_url.rstrip('/')}{REFRESH_PATH}",
-            json={"refreshToken": refresh_token},
-            timeout=10.0,
-        )
+        response = httpx.post(url, json={"refreshToken": refresh_token}, timeout=10.0)
     except httpx.HTTPError as exc:
+        logger.warning("Grimmory refresh request failed: %s", exc)
         raise GrimmoryLoginError("Couldn't reach Grimmory — try again shortly") from exc
+    grimmory_http.log_call("POST", url, response.status_code, time.monotonic() - start)
 
     if response.status_code >= 400:
         raise GrimmoryLoginError("Grimmory session expired")
@@ -148,9 +155,11 @@ def update_book_finished_date(
 ) -> None:
     # Callers are expected to swallow LibraryCheckUnavailable and keep the local edit regardless -
     # the local save must never depend on this succeeding.
+    url = f"{base_url.rstrip('/')}{BOOK_PROGRESS_PATH}"
+    start = time.monotonic()
     try:
         response = httpx.post(
-            f"{base_url.rstrip('/')}{BOOK_PROGRESS_PATH}",
+            url,
             json={
                 "bookId": grimmory_book_id,
                 "dateFinished": f"{finished_at.isoformat()}T00:00:00Z",
@@ -158,8 +167,10 @@ def update_book_finished_date(
             headers={"Authorization": f"Bearer {access_token}"},
             timeout=10.0,
         )
+        grimmory_http.log_call("POST", url, response.status_code, time.monotonic() - start)
         response.raise_for_status()
     except httpx.HTTPError as exc:
+        logger.warning("Grimmory book-progress update failed for book %s: %s", grimmory_book_id, exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
 
 # Function Name: get_own_grimmory_user_id
@@ -172,15 +183,15 @@ def get_own_grimmory_user_id(base_url: str, access_token: str) -> int:
     # Needed because GET /api/v1/shelves returns own + public shelves mixed with no server-side
     # owner filter - filtering a shelf list down to "shelves I own" requires knowing this first
     # (see app/library_check.py:list_own_shelves).
+    url = f"{base_url.rstrip('/')}{USERS_ME_PATH}"
+    start = time.monotonic()
     try:
-        response = httpx.get(
-            f"{base_url.rstrip('/')}{USERS_ME_PATH}",
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=10.0,
-        )
+        response = httpx.get(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=10.0)
+        grimmory_http.log_call("GET", url, response.status_code, time.monotonic() - start)
         response.raise_for_status()
         body = response.json()
     except httpx.HTTPError as exc:
+        logger.warning("Grimmory /users/me request failed: %s", exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
     except ValueError as exc:
         # response.json() raises json.JSONDecodeError (a ValueError subclass) on a non-JSON body
@@ -234,14 +245,16 @@ def get_admin_session(db_connection) -> Optional[tuple[str, str]]:
 # Returns: Admin access token (str)
 def _admin_login(base_url: str, username: str, password: str) -> str:
     # Refresh token is deliberately never persisted - this account only ever makes one call.
+    url = f"{base_url.rstrip('/')}{LOGIN_PATH}"
+    start = time.monotonic()
     try:
         response = httpx.post(
-            f"{base_url.rstrip('/')}{LOGIN_PATH}",
-            json={"username": username, "password": password},
-            timeout=10.0,
+            url, json={"username": username, "password": password}, timeout=10.0
         )
+        grimmory_http.log_call("POST", url, response.status_code, time.monotonic() - start)
         response.raise_for_status()
     except httpx.HTTPError as exc:
+        logger.warning("Grimmory admin login request failed: %s", exc)
         raise LibraryCheckUnavailable(f"Grimmory admin login failed: {exc}") from exc
     return response.json()["accessToken"]
 
@@ -253,12 +266,14 @@ def _admin_login(base_url: str, username: str, password: str) -> str:
 # - username (str): Username of the user.
 # Returns: User ID (int) or None if not found.
 def find_grimmory_user_id(base_url: str, admin_token: str, username: str) -> Optional[int]:
+    url = f"{base_url.rstrip('/')}{USERS_PATH}"
+    start = time.monotonic()
     try:
-        response = httpx.get(
-            f"{base_url.rstrip('/')}{USERS_PATH}", headers=_auth_header(admin_token), timeout=10.0
-        )
+        response = httpx.get(url, headers=_auth_header(admin_token), timeout=10.0)
+        grimmory_http.log_call("GET", url, response.status_code, time.monotonic() - start)
         response.raise_for_status()
     except httpx.HTTPError as exc:
+        logger.warning("Grimmory users list request failed: %s", exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
 
     for user in response.json():
@@ -274,14 +289,14 @@ def find_grimmory_user_id(base_url: str, admin_token: str, username: str) -> Opt
 # - user_id (int): Current user's id.
 # Returns: List of content restrictions (list[dict])
 def get_content_restrictions(base_url: str, admin_token: str, user_id: int) -> list[dict]:
+    url = f"{base_url.rstrip('/')}{CONTENT_RESTRICTIONS_PATH.format(user_id=user_id)}"
+    start = time.monotonic()
     try:
-        response = httpx.get(
-            f"{base_url.rstrip('/')}{CONTENT_RESTRICTIONS_PATH.format(user_id=user_id)}",
-            headers=_auth_header(admin_token),
-            timeout=10.0,
-        )
+        response = httpx.get(url, headers=_auth_header(admin_token), timeout=10.0)
+        grimmory_http.log_call("GET", url, response.status_code, time.monotonic() - start)
         response.raise_for_status()
     except httpx.HTTPError as exc:
+        logger.warning("Grimmory content-restrictions GET failed for user %s: %s", user_id, exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
     return response.json()
 
@@ -296,15 +311,16 @@ def get_content_restrictions(base_url: str, admin_token: str, user_id: int) -> l
 def put_content_restrictions(
     base_url: str, admin_token: str, user_id: int, restrictions: list[dict]
 ) -> None:
+    url = f"{base_url.rstrip('/')}{CONTENT_RESTRICTIONS_PATH.format(user_id=user_id)}"
+    start = time.monotonic()
     try:
         response = httpx.put(
-            f"{base_url.rstrip('/')}{CONTENT_RESTRICTIONS_PATH.format(user_id=user_id)}",
-            json=restrictions,
-            headers=_auth_header(admin_token),
-            timeout=10.0,
+            url, json=restrictions, headers=_auth_header(admin_token), timeout=10.0
         )
+        grimmory_http.log_call("PUT", url, response.status_code, time.monotonic() - start)
         response.raise_for_status()
     except httpx.HTTPError as exc:
+        logger.warning("Grimmory content-restrictions PUT failed for user %s: %s", user_id, exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
 
 # Function Name: sync_restriction_level

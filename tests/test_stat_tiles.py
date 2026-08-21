@@ -4,8 +4,11 @@ from app import stat_tiles
 from app.models import Book, TBREntryDetail
 
 
-def _entry(status="reading", started_at=None, finished_at=None, page_count=None):
-    book = Book(id=1, title="Dune", author="Frank Herbert", isbn="111", cover_url=None, page_count=page_count)
+def _entry(status="reading", started_at=None, finished_at=None, page_count=None, format=None):
+    book = Book(
+        id=1, title="Dune", author="Frank Herbert", isbn="111", cover_url=None,
+        page_count=page_count, format=format,
+    )
     return TBREntryDetail(
         id=1, status=status, added_at="2026-01-01", book=book,
         started_at=started_at, finished_at=finished_at,
@@ -24,6 +27,22 @@ def _session(day, start_progress, end_progress, duration_seconds=1800, hour="10"
         "startProgress": start_progress,
         "endProgress": end_progress,
         "progressDelta": delta,
+    }
+
+
+def _audiobook_session(day, duration_seconds=1800, hour="10"):
+    """Shaped like a real Grimmory AUDIOBOOK reading-session payload: bookType is set, but
+    startProgress/endProgress/progressDelta are always null - Grimmory's own audiobook player
+    never populates them (confirmed against its frontend source, 2026-08-21), unlike a normal
+    ebook session's _session() above."""
+    return {
+        "bookType": "AUDIOBOOK",
+        "startTime": f"{day}T{hour}:00:00Z",
+        "endTime": f"{day}T{hour}:30:00Z",
+        "durationSeconds": duration_seconds,
+        "startProgress": None,
+        "endProgress": None,
+        "progressDelta": None,
     }
 
 
@@ -117,6 +136,69 @@ def test_consecutive_days_yield_best_streak():
     assert by_label["Best Streak"] == "3 days"
 
 
+# --- audiobook sessions: progressDelta/endProgress always null, durationSeconds is the only
+# reliable activity signal Grimmory provides for these (see _audiobook_session above) ---
+
+
+def test_audiobook_sessions_with_no_progress_still_count_as_activity():
+    entry = _entry(status="reading", format="AUDIOBOOK")
+    sessions = [
+        _audiobook_session("2026-01-01", duration_seconds=1800),
+        _audiobook_session("2026-01-02", duration_seconds=1800),
+    ]
+    tiles = stat_tiles.build_book_tiles(entry, sessions)
+    by_label = {t["label"]: t["value"] for t in tiles}
+    assert by_label["Listening Days"] == "2"
+    assert by_label["Best Streak"] == "2 days"
+    assert by_label["Time Spent Listening"] == "1h"
+
+
+def test_audiobook_tiles_use_generic_labels_when_book_format_unknown():
+    # entry.book.format (synced from Grimmory's primaryFile.bookType) is the source of truth for
+    # which labels to use, not a session's own bookType - a book that hasn't been format-synced
+    # yet must not show mislabeled "Listening" tiles just because its sessions happen to be
+    # AUDIOBOOK-typed.
+    entry = _entry(status="reading", format=None)
+    sessions = [_audiobook_session("2026-01-01", duration_seconds=1800)]
+    tiles = stat_tiles.build_book_tiles(entry, sessions)
+    by_label = {t["label"]: t["value"] for t in tiles}
+    assert by_label["Reading Days"] == "1"
+    assert by_label["Time Spent Reading"] == "30m"
+
+
+def test_audiobook_session_with_zero_duration_is_not_meaningful():
+    entry = _entry(status="reading")
+    sessions = [_audiobook_session("2026-01-01", duration_seconds=0)]
+    tiles = stat_tiles.build_book_tiles(entry, sessions)
+    assert tiles == []
+
+
+def test_non_audiobook_session_with_null_progress_still_excluded():
+    # A null-progress session for a non-audiobook type must not get swept in by the AUDIOBOOK
+    # carve-out - _has_meaningful_progress's duration fallback is keyed specifically on
+    # bookType == "AUDIOBOOK", not "no progress data at all".
+    entry = _entry(status="reading")
+    sessions = [
+        {
+            "startTime": "2026-01-01T10:00:00Z",
+            "endTime": "2026-01-01T10:30:00Z",
+            "durationSeconds": 1800,
+            "startProgress": None,
+            "endProgress": None,
+            "progressDelta": None,
+        }
+    ]
+    tiles = stat_tiles.build_book_tiles(entry, sessions)
+    assert tiles == []
+
+
+def test_burndown_still_empty_for_audiobook_sessions():
+    # burndown_points needs a real endProgress time series, which Grimmory never provides for
+    # audiobooks - the duration-based activity fix must not fabricate one.
+    sessions = [_audiobook_session("2026-01-01"), _audiobook_session("2026-01-02")]
+    assert stat_tiles.burndown_points(sessions) == []
+
+
 def test_pages_per_session_and_best_session_use_page_count():
     entry = _entry(status="reading", page_count=300)
     sessions = [
@@ -154,6 +236,23 @@ def test_estimated_completion_present_with_pace_and_remaining_progress():
     assert any(t["label"] == "Estimated Completion" for t in tiles)
 
 
+def test_estimated_completion_uses_client_supplied_today_not_server_utc(monkeypatch):
+    # Regression test: the server's UTC "today" can lag a viewer's actual local day by up to many
+    # hours (see app/main.py:_resolve_client_today) - the estimate must be computed from the
+    # caller's own `today`, not whatever today_utc() says.
+    monkeypatch.setattr(stat_tiles, "today_utc", lambda: dt.date(2020, 1, 1))
+    entry = _entry(status="reading")
+    sessions = [
+        _session("2026-01-01", 0, 10),
+        _session("2026-01-02", 10, 20),
+    ]
+    tiles = stat_tiles.build_book_tiles(entry, sessions, today=dt.date(2026, 1, 3))
+    by_label = {t["label"]: t["value"] for t in tiles}
+    # pace = 10%/day, remaining = 80% -> 8 days from the client's today (Jan 3), not from
+    # today_utc()'s mocked 2020 date.
+    assert by_label["Estimated Completion"] == "Jan 11, 2026"
+
+
 def test_estimated_completion_omitted_when_finished_status():
     entry = _entry(status="finished")
     sessions = [
@@ -162,6 +261,16 @@ def test_estimated_completion_omitted_when_finished_status():
     ]
     tiles = stat_tiles.build_book_tiles(entry, sessions)
     assert not any(t["label"] == "Estimated Completion" for t in tiles)
+
+
+def test_pages_per_day_fallback_uses_client_supplied_today_not_server_utc(monkeypatch):
+    monkeypatch.setattr(stat_tiles, "today_utc", lambda: dt.date(2020, 1, 1))
+    entry = _entry(status="reading", started_at="2026-01-01", page_count=300)
+    tiles = stat_tiles.build_book_tiles(entry, [], today=dt.date(2026, 1, 10))
+    by_label = {t["label"]: t["value"] for t in tiles}
+    # 10 elapsed days (Jan 1 - Jan 10 inclusive) -> 300 / 10 = 30 pages/day, computed from the
+    # client's today, not today_utc()'s mocked 2020 date.
+    assert by_label["Pages per day"] == "30"
 
 
 def test_sessions_present_skip_pages_per_day_fallback():
@@ -226,6 +335,13 @@ def test_first_meaningful_session_date_ignores_zero_delta_sessions_before_and_af
         _session("2026-01-02", 0, 0),  # zero-delta, out of order, still before Jan 3
         _session("2026-01-04", 5, 10),  # later real reading
     ]
+    assert stat_tiles.first_meaningful_session_date(sessions) == dt.date(2026, 1, 3)
+
+
+def test_first_meaningful_session_date_counts_audiobook_sessions():
+    import datetime as dt
+
+    sessions = [_audiobook_session("2026-01-01", duration_seconds=0), _audiobook_session("2026-01-03")]
     assert stat_tiles.first_meaningful_session_date(sessions) == dt.date(2026, 1, 3)
 
 

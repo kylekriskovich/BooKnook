@@ -9,6 +9,7 @@ from typing import Iterable, Optional
 import httpx
 from rapidfuzz import fuzz
 
+from app import grimmory_http
 from app.models import (
     Book,
     LibraryCatalogEntry,
@@ -24,10 +25,12 @@ from app.models import (
     remove_tbr_entry,
     replace_library_catalog,
     set_book_cover_url,
+    set_book_format,
     set_book_grimmory_id,
     set_book_page_count,
     set_library_sync_state,
     set_sync_to_device_shelf_id,
+    set_tbr_entry_audiobook_progress_percent,
     set_tbr_entry_rating,
     set_tbr_entry_started_at,
     set_tbr_entry_status,
@@ -153,7 +156,7 @@ def fetch_catalog(db_connection) -> list[LibraryCatalogEntry]:
     base_url, username, password = config
 
     try:
-        with httpx.Client(base_url=base_url, timeout=10.0) as client:
+        with grimmory_http.client(base_url=base_url, timeout=10.0) as client:
             # No token persistence - a fresh login happens on every call, since this is only
             # invoked periodically/on manual sync, never per-request.
             login_response = client.post(
@@ -170,6 +173,7 @@ def fetch_catalog(db_connection) -> list[LibraryCatalogEntry]:
             books_response.raise_for_status()
             books = books_response.json()
     except httpx.HTTPError as exc:
+        logger.warning("Grimmory catalog fetch failed: %s", exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
 
     entries = [_book_to_catalog_entry(book) for book in books]
@@ -300,7 +304,7 @@ def find_owning_book_id(
 # Returns: Raw book payloads for the user's library (list[dict])
 def fetch_user_books(base_url: str, access_token: str) -> list[dict]:
     try:
-        with httpx.Client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
+        with grimmory_http.client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
             # Includes readStatus/dateFinished (no stripForListView, unlike fetch_catalog) - called
             # once at login for reading-status auto-detection; token isn't persisted here or by
             # the caller.
@@ -308,6 +312,7 @@ def fetch_user_books(base_url: str, access_token: str) -> list[dict]:
             response.raise_for_status()
             return response.json()
     except httpx.HTTPError as exc:
+        logger.warning("Grimmory user-books fetch failed: %s", exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
 
 # Function Name: fetch_reading_sessions_for_book
@@ -323,7 +328,7 @@ def fetch_reading_sessions_for_book(
 ) -> list[dict]:
     sessions: list[dict] = []
     try:
-        with httpx.Client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
+        with grimmory_http.client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
             page = 0
             while True:
                 response = client.get(
@@ -343,6 +348,7 @@ def fetch_reading_sessions_for_book(
                 if page >= total_pages:
                     break
     except httpx.HTTPError as exc:
+        logger.warning("Grimmory reading-sessions fetch failed for book %s: %s", grimmory_book_id, exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
     return sessions
 
@@ -358,11 +364,12 @@ def list_own_shelves(base_url: str, access_token: str, own_grimmory_user_id: int
     # GET /api/v1/shelves returns own + public shelves mixed with no server-side owner filter, so
     # filtering to "shelves I own" has to happen client-side here.
     try:
-        with httpx.Client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
+        with grimmory_http.client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
             response = client.get(SHELVES_PATH, headers={"Authorization": f"Bearer {access_token}"})
             response.raise_for_status()
             shelves = response.json()
     except httpx.HTTPError as exc:
+        logger.warning("Grimmory shelves fetch failed: %s", exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
     return [shelf for shelf in shelves if shelf.get("userId") == own_grimmory_user_id]
 
@@ -401,7 +408,7 @@ def get_or_create_shelf_by_name(
         if shelf.get("id") is not None and _shelf_name_key(shelf.get("name") or "") == target_key:
             return shelf["id"]
     try:
-        with httpx.Client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
+        with grimmory_http.client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
             response = client.post(
                 SHELVES_PATH,
                 json={"name": name, "publicShelf": False},
@@ -427,6 +434,7 @@ def get_or_create_shelf_by_name(
                 )
             return body["id"]
     except httpx.HTTPError as exc:
+        logger.warning("Grimmory get-or-create shelf %r failed: %s", name, exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
 
 # Function Name: fetch_shelf_books
@@ -438,7 +446,7 @@ def get_or_create_shelf_by_name(
 # Returns: Raw book payloads (list[dict]), same shape as fetch_user_books' response.
 def fetch_shelf_books(base_url: str, access_token: str, shelf_id: int) -> list[dict]:
     try:
-        with httpx.Client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
+        with grimmory_http.client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
             response = client.get(
                 SHELF_BOOKS_PATH.format(shelf_id=shelf_id),
                 headers={"Authorization": f"Bearer {access_token}"},
@@ -446,6 +454,7 @@ def fetch_shelf_books(base_url: str, access_token: str, shelf_id: int) -> list[d
             response.raise_for_status()
             return response.json()
     except httpx.HTTPError as exc:
+        logger.warning("Grimmory shelf-books fetch failed for shelf %s: %s", shelf_id, exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
 
 # Function Name: assign_book_shelves
@@ -470,7 +479,7 @@ def assign_book_shelves(
     if not book_ids:
         return
     try:
-        with httpx.Client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
+        with grimmory_http.client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
             response = client.post(
                 BOOKS_SHELVES_PATH,
                 json={
@@ -482,6 +491,7 @@ def assign_book_shelves(
             )
             response.raise_for_status()
     except httpx.HTTPError as exc:
+        logger.warning("Grimmory assign-book-shelves failed: %s", exc)
         raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
 
 # Function Name: _target_status
@@ -498,7 +508,8 @@ def _target_status(book: dict) -> Optional[str]:
     return None
 
 # Function Name: _sync_book_metadata
-# Description: Refreshes page_count/rating/grimmory_id from Grimmory's own book metadata.
+# Description: Refreshes page_count/rating/grimmory_id/format/audiobook progress from Grimmory's
+#   own book metadata.
 # Parameters:
 # - db_connection: Database connection.
 # - book_id (int): Local TBR book id.
@@ -513,6 +524,19 @@ def _sync_book_metadata(db_connection, book_id: int, entry_id: int, book: dict) 
     # Captured from the same response so reading sessions can be fetched on demand later (see
     # app/stat_tiles.py), with no extra HTTP call here.
     set_book_grimmory_id(db_connection, book_id, book.get("id"))
+    # primaryFile.bookType ("EPUB", "AUDIOBOOK", ...) - lets app/stat_tiles.py label tiles
+    # correctly ("Time Spent Listening" vs "Time Spent Reading") without needing a reading session
+    # to already exist just to learn the book's media type.
+    primary_file = book.get("primaryFile") or {}
+    set_book_format(db_connection, book_id, primary_file.get("bookType"))
+    # Grimmory's reading-session log never populates startProgress/endProgress/progressDelta for
+    # AUDIOBOOK-type sessions (a gap in Grimmory's own audiobook player), which starves every
+    # session-driven progress calculation in app/stat_tiles.py for audiobook entries. This field
+    # comes from Grimmory's separate progress-update endpoint instead, so it stays current
+    # independent of that gap - non-audiobooks simply never have it set. See
+    # app/main.py:api_book_detail for where this is used as a fallback.
+    audiobook_progress = book.get("audiobookProgress") or {}
+    set_tbr_entry_audiobook_progress_percent(db_connection, entry_id, audiobook_progress.get("percentage"))
 
 # Function Name: _apply_status
 # Description: Applies a target shelf (finished/reading) to a TBR entry, without downgrading it.
@@ -561,18 +585,20 @@ def fetch_book_cover(
     # app could store directly), so this downloads the bytes once and the caller serves them back
     # out from local disk from then on.
     try:
-        with httpx.Client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
+        with grimmory_http.client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
             response = client.get(
                 COVER_PATH.format(book_id=grimmory_book_id),
                 headers={"Authorization": f"Bearer {access_token}"},
             )
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
+        logger.warning("Grimmory cover fetch failed for book %s: %s", grimmory_book_id, exc)
         return None
     if response.status_code == 404:
         return None
     try:
         response.raise_for_status()
-    except httpx.HTTPStatusError:
+    except httpx.HTTPStatusError as exc:
+        logger.warning("Grimmory cover fetch returned an error for book %s: %s", grimmory_book_id, exc)
         return None
     return response.content, response.headers.get("content-type", "image/jpeg")
 
@@ -610,11 +636,12 @@ def _maybe_download_cover(
 # Returns: Access token (str), or None if the login fails.
 def _login_service_account(base_url: str, username: str, password: str) -> Optional[str]:
     try:
-        with httpx.Client(base_url=base_url, timeout=10.0) as client:
+        with grimmory_http.client(base_url=base_url, timeout=10.0) as client:
             login_response = client.post(LOGIN_PATH, json={"username": username, "password": password})
             login_response.raise_for_status()
             return login_response.json()["accessToken"]
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
+        logger.warning("Grimmory service-account login failed: %s", exc)
         return None
 
 # Function Name: download_cover_for_book

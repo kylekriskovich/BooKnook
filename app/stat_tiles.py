@@ -11,7 +11,15 @@ def session_date(session: dict) -> Optional[date]:
 
 
 def _has_meaningful_progress(session: dict) -> bool:
-    return (session.get("progressDelta") or 0) > 0
+    # Grimmory's own audiobook player never populates progressDelta/endProgress on a listening
+    # session (a gap in Grimmory itself, not this app - see tbr_entries.audiobook_progress_percent
+    # in app/models.py) - a plain progressDelta check would silently drop every audiobook session
+    # from Reading Days/Best Streak/Time Spent Reading/the burndown chart, even ones with real
+    # logged listening time. bookType is the one field Grimmory does set correctly on those
+    # sessions, so treat real durationSeconds as the activity signal for that book type instead.
+    if (session.get("progressDelta") or 0) > 0:
+        return True
+    return session.get("bookType") == "AUDIOBOOK" and (session.get("durationSeconds") or 0) > 0
 
 
 def format_duration(total_seconds: int) -> str:
@@ -75,16 +83,17 @@ def _days_to_complete_tile(entry) -> Optional[dict]:
     return {"label": "Days to Complete", "value": f"{days}d"}
 
 
-def _pages_per_day_fallback_tile(entry) -> Optional[dict]:
+def _pages_per_day_fallback_tile(entry, today: Optional[date] = None) -> Optional[dict]:
+    today = today or today_utc()
     page_count = entry.book.page_count
     if not page_count or not entry.started_at:
         return None
     started = parse_date(entry.started_at)
     if started is None:
         return None
-    end = parse_date(entry.finished_at) if entry.finished_at else today_utc()
+    end = parse_date(entry.finished_at) if entry.finished_at else today
     if end is None:
-        end = today_utc()
+        end = today
     days_elapsed = max((end - started).days + 1, 1)  # inclusive day count, floor for bad data
     pages_per_day = round(page_count / days_elapsed)
     if pages_per_day <= 0:
@@ -92,16 +101,21 @@ def _pages_per_day_fallback_tile(entry) -> Optional[dict]:
     return {"label": "Pages per day", "value": str(pages_per_day)}
 
 
-def build_book_tiles(entry, sessions: list[dict]) -> list[dict]:
+def build_book_tiles(entry, sessions: list[dict], today: Optional[date] = None) -> list[dict]:
     """Session-dependent tiles for one book (GET /book/{entry_id}) - only meaningful given a
     single book's own reading-session log, not aggregatable across many books without fetching
-    every one's sessions (which the collection tiles below deliberately never do)."""
+    every one's sessions (which the collection tiles below deliberately never do). `today` should
+    be the caller's own local date (see app/main.py:_resolve_client_today) - defaults to the
+    server's UTC date only for direct/test callers that don't have a client to ask."""
+    today = today or today_utc()
     tiles: list[dict] = []
     page_count = entry.book.page_count
+    is_audiobook = entry.book.format == "AUDIOBOOK"
     reading_dates = get_reading_dates(sessions)
 
     if reading_dates:
-        tiles.append({"label": "Reading Days", "value": str(len(reading_dates))})
+        days_label = "Listening Days" if is_audiobook else "Reading Days"
+        tiles.append({"label": days_label, "value": str(len(reading_dates))})
 
         streak = longest_consecutive_run(reading_dates)
         if streak > 1:
@@ -109,7 +123,8 @@ def build_book_tiles(entry, sessions: list[dict]) -> list[dict]:
 
         total_seconds = sum(s.get("durationSeconds") or 0 for s in sessions)
         if total_seconds:
-            tiles.append({"label": "Time Spent Reading", "value": format_duration(total_seconds)})
+            time_label = "Time Spent Listening" if is_audiobook else "Time Spent Reading"
+            tiles.append({"label": time_label, "value": format_duration(total_seconds)})
 
         deltas = [s.get("progressDelta") for s in sessions if s.get("progressDelta")]
         if deltas:
@@ -148,12 +163,12 @@ def build_book_tiles(entry, sessions: list[dict]) -> list[dict]:
             remaining = max(0.0, 100.0 - latest_progress)
             if pace_per_day > 0 and remaining > 0:
                 days_remaining = remaining / pace_per_day
-                estimated = today_utc() + timedelta(days=round(days_remaining))
+                estimated = today + timedelta(days=round(days_remaining))
                 tiles.append(
                     {"label": "Estimated Completion", "value": estimated.strftime("%b %-d, %Y")}
                 )
     else:
-        fallback = _pages_per_day_fallback_tile(entry)
+        fallback = _pages_per_day_fallback_tile(entry, today)
         if fallback:
             tiles.append(fallback)
 

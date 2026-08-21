@@ -125,6 +125,26 @@ def test_api_home_lists_shelves(client):
     assert shelves["finished"]["entries"] == []
 
 
+def test_api_home_finished_shelf_uses_client_today_not_server_utc(client, monkeypatch):
+    # Regression test: on Jan 1, the server's UTC clock can still read Dec 31 of the previous year
+    # for a viewer east of UTC (see app/main.py:_resolve_client_today) - the "Finished in {year}"
+    # shelf must bucket by the client's year, not a stale UTC one.
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id)
+    models.set_tbr_entry_status(conn, entry.id, "finished", "2027-01-01T00:30:00+00:00")
+    conn.close()
+    monkeypatch.setattr(main.dates, "today_utc", lambda: date(2026, 12, 31))
+
+    response = client.get("/api/home", params={"today": "2027-01-01"})
+
+    assert response.status_code == 200
+    shelves = {shelf["status"]: shelf for shelf in response.json()["shelves"]}
+    assert shelves["finished"]["label"] == "Finished in 2027"
+    assert [e["book"]["title"] for e in shelves["finished"]["entries"]] == ["Dune"]
+
+
 def test_api_shelf_rejects_unknown_status(client):
     _logged_in_client(client)
     response = client.get("/api/shelf/bogus")
@@ -146,6 +166,23 @@ def test_api_shelf_returns_matching_entries_only(client):
     body = response.json()
     assert body["label"] == "Currently Reading"
     assert [e["book"]["title"] for e in body["entries"]] == ["Reading Book"]
+
+
+def test_api_shelf_finished_uses_client_today_not_server_utc(client, monkeypatch):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id)
+    models.set_tbr_entry_status(conn, entry.id, "finished", "2027-01-01T00:30:00+00:00")
+    conn.close()
+    monkeypatch.setattr(main.dates, "today_utc", lambda: date(2026, 12, 31))
+
+    response = client.get("/api/shelf/finished", params={"today": "2027-01-01"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["label"] == "Finished in 2027"
+    assert [e["book"]["title"] for e in body["entries"]] == ["Dune"]
 
 
 # --- onboarding ---
@@ -396,6 +433,67 @@ def test_api_book_detail_includes_tiles_and_burndown(client, monkeypatch):
     assert any(t["label"] == "Reading Days" for t in body["tiles"])
 
 
+def test_api_book_detail_falls_back_to_audiobook_progress_percent(client, monkeypatch):
+    # Grimmory never populates endProgress on AUDIOBOOK-type reading sessions (see
+    # app/stat_tiles.py:_has_meaningful_progress) - progress_percent must fall back to the
+    # independently-synced tbr_entries.audiobook_progress_percent instead of coming back None.
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="A Memory Called Empire")
+    models.set_book_grimmory_id(conn, book.id, 42)
+    models.set_book_format(conn, book.id, "AUDIOBOOK")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="reading")
+    models.set_tbr_entry_started_at(conn, entry.id, "2026-01-01", manual=True)
+    models.set_tbr_entry_audiobook_progress_percent(conn, entry.id, 63.2)
+    models.set_grimmory_refresh_token(conn, user.id, "stored-refresh")
+    conn.close()
+
+    monkeypatch.setattr(grimmory_auth, "get_valid_access_token", lambda conn, u: "access-token")
+    monkeypatch.setattr(
+        library_check,
+        "fetch_reading_sessions_for_book",
+        lambda base_url, token, book_id: [
+            {
+                "bookType": "AUDIOBOOK",
+                "startTime": "2026-01-01T10:00:00Z",
+                "endProgress": None,
+                "progressDelta": None,
+                "durationSeconds": 1800,
+            }
+        ],
+    )
+
+    response = client.get(f"/api/book/{entry.id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["progress_percent"] == 63.2
+    assert any(t["label"] == "Listening Days" for t in body["tiles"])
+    assert any(t["label"] == "Time Spent Listening" for t in body["tiles"])
+
+
+def test_api_book_detail_pages_per_day_uses_client_today_not_server_utc(client, monkeypatch):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    models.set_book_page_count(conn, book.id, 300)
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="reading")
+    models.set_tbr_entry_started_at(conn, entry.id, "2026-01-01", manual=True)
+    conn.close()
+
+    # No grimmory_book_id set, so the sessions fetch is skipped entirely — this exercises the
+    # no-sessions Pages-per-day fallback path in app/stat_tiles.py.
+    monkeypatch.setattr(main.dates, "today_utc", lambda: date(2020, 1, 1))
+
+    response = client.get(f"/api/book/{entry.id}", params={"today": "2026-01-10"})
+
+    assert response.status_code == 200
+    body = response.json()
+    # 10 elapsed days (Jan 1 - Jan 10 inclusive) -> 300 / 10 = 30 pages/day, computed from the
+    # client-supplied today, not the mocked-UTC 2020 date.
+    assert any(t["label"] == "Pages per day" and t["value"] == "30" for t in body["tiles"])
+
+
 # --- stats / calendar ---
 
 
@@ -415,6 +513,26 @@ def test_api_stats_counts_books_finished_this_year(client):
     assert body["year"] == year
     assert body["finished_count"] == 1
     assert any(t["label"] == "Books finished" and t["value"] == "1" for t in body["tiles"])
+
+
+def test_api_stats_year_uses_client_today_not_server_utc(client, monkeypatch):
+    # Regression test: on Jan 1, the server's UTC clock can still read Dec 31 of the previous year
+    # for a viewer east of UTC (see app/main.py:_resolve_client_today) - /api/stats must use the
+    # client-supplied year, not fall back to a stale UTC year.
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id)
+    models.set_tbr_entry_status(conn, entry.id, "finished", "2027-01-01T00:30:00+00:00")
+    conn.close()
+    monkeypatch.setattr(main.dates, "today_utc", lambda: date(2026, 12, 31))
+
+    response = client.get("/api/stats", params={"today": "2027-01-01"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["year"] == 2027
+    assert body["finished_count"] == 1
 
 
 def test_api_calendar_places_reading_span_on_grid(client):
@@ -438,6 +556,39 @@ def test_api_calendar_places_reading_span_on_grid(client):
     assert cell["cover_entry_ids"] == [entry.id]
 
 
+def test_api_calendar_month_defaults_to_client_today_not_server_utc(client, monkeypatch):
+    # Regression test: the server's UTC clock rolls over up to many hours later than a viewer
+    # east of UTC's actual local day (e.g. not until 8am local at UTC+8) - without a client-
+    # supplied "today", a request made right after local midnight but before the server's UTC day
+    # has advanced would silently fall back to the *previous* month's calendar. Simulate that by
+    # mocking the server's UTC "now" into a different month than the client's real local today.
+    _logged_in_client(client)
+    monkeypatch.setattr(main.dates, "today_utc", lambda: date(2026, 7, 31))
+
+    response = client.get("/api/calendar", params={"today": "2026-08-01"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert (body["year"], body["month"]) == (2026, 8)
+
+
+def test_api_calendar_is_today_follows_client_supplied_today(client, monkeypatch):
+    _logged_in_client(client)
+    monkeypatch.setattr(main.dates, "today_utc", lambda: date(2026, 8, 20))
+
+    response = client.get(
+        "/api/calendar", params={"month": "2026-08", "today": "2026-08-21"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    cells = {c["date"]: c for week in body["grid"] for c in week}
+    assert cells["2026-08-21"]["is_today"] is True
+    assert cells["2026-08-21"]["is_future"] is False
+    assert cells["2026-08-20"]["is_today"] is False
+    assert cells["2026-08-22"]["is_future"] is True
+
+
 # --- settings ---
 
 
@@ -454,6 +605,16 @@ def test_api_settings_returns_goal_and_spice_labels(client):
     assert body["goal"]["target_count"] == 12
     assert body["grimmory_admin_configured"] is False
     assert len(body["spice_labels"]) == 6
+
+
+def test_api_settings_goal_year_uses_client_today_not_server_utc(client, monkeypatch):
+    _logged_in_client(client)
+    monkeypatch.setattr(main.dates, "today_utc", lambda: date(2026, 12, 31))
+
+    response = client.get("/api/settings", params={"today": "2027-01-01"})
+
+    assert response.status_code == 200
+    assert response.json()["goal_year"] == 2027
 
 
 def test_api_settings_goal_upserts(client):

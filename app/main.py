@@ -62,6 +62,15 @@ from app.models import (
     upsert_goal,
 )
 
+# Configured here rather than left to whatever default uvicorn/the WSGI/ASGI server happens to
+# set up, so app.* loggers (notably app.grimmory_api - see app/grimmory_http.py) reliably show
+# every Grimmory request/response instead of only warnings/errors via Python's bare last-resort
+# stderr handler. TBR_LOG_LEVEL lets an operator turn this down without a code change if the
+# per-request INFO lines get too noisy in production.
+logging.basicConfig(
+    level=os.environ.get("TBR_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 APP_DIR = os.path.dirname(__file__)
@@ -307,8 +316,28 @@ def _shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
     return index // 12, index % 12 + 1
 
 
-def _parse_calendar_month(raw: str) -> tuple[int, int]:
-    """Parses a "YYYY-MM" query param, falling back to the current UTC month for anything
+def _resolve_client_today(raw: str) -> date:
+    """Parses a client-supplied "YYYY-MM-DD" local date, falling back to the current UTC date if
+    missing/malformed. Every route that needs "today" for something the user actually sees
+    (calendar highlighting/month default, book-detail's Estimated Completion/Pages-per-day,
+    /api/stats' current-year default) takes this as a query param, and the frontend always sends
+    the browser's own local date (see e.g. frontend/src/lib/utils/dates.ts) rather than leaving it
+    to the server's UTC clock - for anyone whose local timezone is ahead of UTC (e.g. UTC+8),
+    "today" per the server doesn't roll over to the viewer's actual calendar day until well into
+    their morning (at UTC+8, not until 8am local), which would otherwise show yesterday's
+    calendar, a stale year-boundary stats page, and completion estimates off by a day. A bad/
+    stale/missing query param (older cached frontend build, direct API call) falls back to the
+    previous UTC-only behavior rather than erroring."""
+    if raw:
+        try:
+            return date.fromisoformat(raw)
+        except ValueError:
+            pass
+    return dates.today_utc()
+
+
+def _parse_calendar_month(raw: str, today: date) -> tuple[int, int]:
+    """Parses a "YYYY-MM" query param, falling back to the given "today"'s month for anything
     missing/malformed rather than erroring — a bad/stale query param shouldn't break the page."""
     if raw:
         try:
@@ -318,14 +347,13 @@ def _parse_calendar_month(raw: str) -> tuple[int, int]:
                 return year, month
         except ValueError:
             pass
-    today = dates.today_utc()
     return today.year, today.month
 
 
-def _calendar_context(db_connection, user_id: int, year: int, month: int) -> dict:
+def _calendar_context(db_connection, user_id: int, year: int, month: int, today: date) -> dict:
     """Shared aggregation behind GET /api/calendar."""
     entries = list_tbr_entries_with_books(db_connection, user_id)
-    spans = reading_calendar.month_spans(entries, year, month)
+    spans = reading_calendar.month_spans(entries, year, month, today)
     for span in spans:
         cover_color.ensure_cover_color(db_connection, span.entry.book)
     days = reading_calendar.days_active(spans, year, month)
@@ -363,7 +391,7 @@ def _calendar_context(db_connection, user_id: int, year: int, month: int) -> dic
         "calendar_month_label": f"{calendar.month_name[month]} {year}",
         "calendar_prev": f"{prev_year:04d}-{prev_month:02d}",
         "calendar_next": f"{next_year:04d}-{next_month:02d}",
-        "calendar_grid": reading_calendar.calendar_grid(year, month, spans),
+        "calendar_grid": reading_calendar.calendar_grid(year, month, spans, today),
         "calendar_spans": spans,
         "calendar_tiles": calendar_tiles,
     }
@@ -569,8 +597,12 @@ def api_me(user: Optional[User] = Depends(get_current_user)) -> "schemas.MeOut |
 
 
 @app.get("/api/home", response_model=schemas.HomeOut)
-def api_home(user: User = Depends(require_user), db_connection: sqlite3.Connection = Depends(get_db)):
-    shelves = _shelves_for_user(db_connection, user.id, datetime.now(timezone.utc).year)
+def api_home(
+    today: str = "",
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    shelves = _shelves_for_user(db_connection, user.id, _resolve_client_today(today).year)
     return schemas.HomeOut(
         shelves=[
             schemas.ShelfOut(
@@ -593,12 +625,13 @@ def _shelf_out(db_connection, user_id: int, status: str, year: int) -> schemas.S
 @app.get("/api/shelf/{status}", response_model=schemas.ShelfOut)
 def api_shelf(
     status: str,
+    today: str = "",
     user: User = Depends(require_user),
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
     if status not in SHELF_STATUSES:
         raise HTTPException(status_code=404, detail="Unknown shelf")
-    return _shelf_out(db_connection, user.id, status, datetime.now(timezone.utc).year)
+    return _shelf_out(db_connection, user.id, status, _resolve_client_today(today).year)
 
 
 @app.post("/api/shelf/wanted/reorder", response_model=schemas.ShelfOut)
@@ -608,6 +641,8 @@ def api_reorder_wanted_shelf(
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
     set_wanted_order(db_connection, user.id, payload.entry_ids)
+    # year is inert for the "wanted" shelf (_shelf_label/_entries_for_shelf only branch on it for
+    # "finished") - no client-supplied today needed here unlike the other _shelf_out callers.
     return _shelf_out(db_connection, user.id, "wanted", datetime.now(timezone.utc).year)
 
 
@@ -629,9 +664,11 @@ def api_onboarding(
 @app.get("/api/book/{entry_id}", response_model=schemas.BookDetailOut)
 def api_book_detail(
     entry_id: int,
+    today: str = "",
     user: User = Depends(require_user),
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
+    resolved_today = _resolve_client_today(today)
     entry = _find_entry_detail(db_connection, user.id, entry_id)
     if entry is None:
         raise HTTPException(status_code=404, detail="Not found")
@@ -652,9 +689,16 @@ def api_book_detail(
             set_tbr_entry_started_at(db_connection, entry.id, derived.isoformat(), manual=False)
             entry.started_at = derived.isoformat()
 
-    tiles = stat_tiles.build_book_tiles(entry, sessions)
+    tiles = stat_tiles.build_book_tiles(entry, sessions, resolved_today)
     burndown = stat_tiles.burndown_points(sessions)
     progress_percent = stat_tiles.latest_progress(sessions) if entry.status == "reading" else None
+    if progress_percent is None and entry.status == "reading":
+        # Session-derived progress is never available for audiobooks (Grimmory's own audiobook
+        # player doesn't log endProgress on listening sessions - see
+        # tbr_entries.audiobook_progress_percent in app/models.py) - fall back to the
+        # independently-synced value from Grimmory's progress-update endpoint instead of just
+        # showing no progress at all.
+        progress_percent = entry.audiobook_progress_percent
     estimated_page = (
         round(progress_percent / 100 * entry.book.page_count)
         if progress_percent is not None and entry.book.page_count
@@ -675,8 +719,12 @@ def api_book_detail(
 
 
 @app.get("/api/stats", response_model=schemas.StatsOut)
-def api_stats(user: User = Depends(require_user), db_connection: sqlite3.Connection = Depends(get_db)):
-    year = datetime.now(timezone.utc).year
+def api_stats(
+    today: str = "",
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    year = _resolve_client_today(today).year
     goal = get_goal(db_connection, user.id, "year")
     finished_this_year = [
         entry
@@ -695,11 +743,13 @@ def api_stats(user: User = Depends(require_user), db_connection: sqlite3.Connect
 @app.get("/api/calendar", response_model=schemas.CalendarOut)
 def api_calendar(
     month: str = "",
+    today: str = "",
     user: User = Depends(require_user),
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
-    cal_year, cal_month = _parse_calendar_month(month)
-    calendar_context = _calendar_context(db_connection, user.id, cal_year, cal_month)
+    resolved_today = _resolve_client_today(today)
+    cal_year, cal_month = _parse_calendar_month(month, resolved_today)
+    calendar_context = _calendar_context(db_connection, user.id, cal_year, cal_month, resolved_today)
     return _to_calendar_out(calendar_context, user.calendar_view_preference)
 
 
@@ -707,11 +757,15 @@ def api_calendar(
 
 
 @app.get("/api/settings", response_model=schemas.SettingsOut)
-def api_settings(user: User = Depends(require_user), db_connection: sqlite3.Connection = Depends(get_db)):
+def api_settings(
+    today: str = "",
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
     goal = get_goal(db_connection, user.id, "year")
     return schemas.SettingsOut(
         goal=_to_goal_out(goal),
-        goal_year=datetime.now(timezone.utc).year,
+        goal_year=_resolve_client_today(today).year,
         grimmory_admin_configured=grimmory_auth.is_configured(db_connection),
         spice_labels=_spice_labels(),
         spice_level=user.spice_level,

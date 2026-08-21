@@ -1175,7 +1175,9 @@ export interface operations {
     };
     api_home_api_home_get: {
         parameters: {
-            query?: never;
+            query?: {
+                today?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -1191,11 +1193,22 @@ export interface operations {
                     "application/json": components["schemas"]["HomeOut"];
                 };
             };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
         };
     };
     api_shelf_api_shelf__status__get: {
         parameters: {
-            query?: never;
+            query?: {
+                today?: string;
+            };
             header?: never;
             path: {
                 status: string;
@@ -1292,7 +1305,9 @@ export interface operations {
     };
     api_book_detail_api_book__entry_id__get: {
         parameters: {
-            query?: never;
+            query?: {
+                today?: string;
+            };
             header?: never;
             path: {
                 entry_id: number;
@@ -1323,7 +1338,9 @@ export interface operations {
     };
     api_stats_api_stats_get: {
         parameters: {
-            query?: never;
+            query?: {
+                today?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -1339,12 +1356,22 @@ export interface operations {
                     "application/json": components["schemas"]["StatsOut"];
                 };
             };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
         };
     };
     api_calendar_api_calendar_get: {
         parameters: {
             query?: {
                 month?: string;
+                today?: string;
             };
             header?: never;
             path?: never;
@@ -1374,7 +1401,9 @@ export interface operations {
     };
     api_settings_api_settings_get: {
         parameters: {
-            query?: never;
+            query?: {
+                today?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -1388,6 +1417,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SettingsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

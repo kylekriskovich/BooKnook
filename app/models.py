@@ -76,6 +76,13 @@ CREATE TABLE IF NOT EXISTS users (
 -- grimmory_book_id above, not a loosening of that column's "not user-editable" contract —
 -- grimmory_book_id itself remains only ever machine-derived, just from two candidate sources now.
 -- Cleared back to NULL by the unmatch action.
+-- format is Grimmory's own BookFile.bookType for this book's primary file (e.g. "EPUB", "PDF",
+-- "AUDIOBOOK") — captured the same way as page_count, from the same /api/v1/books response
+-- (book.primaryFile.bookType), always overwritten from Grimmory, not user-editable. Exists so
+-- app/stat_tiles.py can label session tiles correctly ("Time Spent Listening" vs "Time Spent
+-- Reading") without having to infer media type from a reading session's own bookType field, which
+-- isn't available at all until a session has actually been fetched. NULL until synced, or for a
+-- book added via search that hasn't been Grimmory-matched yet.
 CREATE TABLE IF NOT EXISTS books (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
@@ -86,7 +93,8 @@ CREATE TABLE IF NOT EXISTS books (
     page_count INTEGER,
     grimmory_book_id INTEGER,
     cover_color TEXT,
-    manual_match_grimmory_id INTEGER
+    manual_match_grimmory_id INTEGER,
+    format TEXT
 );
 
 -- status is 'wanted' | 'reading' | 'finished' — driven automatically by the Grimmory reading-
@@ -111,6 +119,16 @@ CREATE TABLE IF NOT EXISTS books (
 -- set_wanted_order) — lower sorts earlier. NULL until backfilled/set (see init_db's backfill and
 -- add_tbr_entry), never NULL for a live wanted entry afterward. reading/finished ignore this
 -- entirely (they order by added_at/finished_at instead — see app/main.py:_entries_for_shelf).
+-- audiobook_progress_percent (0-100, nullable) mirrors Grimmory's Book.audiobookProgress.percentage
+-- (app/library_check.py:_sync_book_metadata) — always overwritten from Grimmory like rating/
+-- page_count above, not user-editable. Exists because Grimmory's reading-session log never
+-- populates startProgress/endProgress/progressDelta for AUDIOBOOK-type sessions (a gap in
+-- Grimmory's own audiobook player, not this app), which silently starves every session-driven
+-- progress calculation in app/stat_tiles.py (see get_reading_dates/latest_progress/
+-- burndown_points) for audiobook entries. This column is a second, independent progress source —
+-- Grimmory's normal progress-update endpoint keeps it current even though the session log can't —
+-- used as a fallback wherever session data comes back empty for an audiobook (see
+-- app/main.py:api_book_detail).
 CREATE TABLE IF NOT EXISTS tbr_entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id),
@@ -122,6 +140,7 @@ CREATE TABLE IF NOT EXISTS tbr_entries (
     started_at_manual INTEGER NOT NULL DEFAULT 0,
     rating INTEGER,
     sort_order INTEGER,
+    audiobook_progress_percent REAL,
     UNIQUE(user_id, book_id)
 );
 
@@ -295,6 +314,14 @@ def init_db(db_connection: sqlite3.Connection) -> None:
         db_connection.execute("ALTER TABLE books ADD COLUMN manual_match_grimmory_id INTEGER")
     except sqlite3.OperationalError:
         pass  # column already exists
+    try:
+        db_connection.execute("ALTER TABLE tbr_entries ADD COLUMN audiobook_progress_percent REAL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    try:
+        db_connection.execute("ALTER TABLE books ADD COLUMN format TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     # One-time backfill for wanted entries that predate sort_order — numbers each user's own
     # wanted shelf by their current added_at DESC order (preserving today's effective order across
     # the upgrade instead of scrambling it), 0 = first. Only touches sort_order IS NULL rows, so
@@ -341,6 +368,7 @@ class Book:
     grimmory_book_id: Optional[int] = None
     cover_color: Optional[str] = None
     manual_match_grimmory_id: Optional[int] = None
+    format: Optional[str] = None
 
 
 @dataclass
@@ -355,6 +383,7 @@ class TBREntry:
     started_at_manual: bool = False
     rating: Optional[int] = None
     sort_order: Optional[int] = None
+    audiobook_progress_percent: Optional[float] = None
 
 
 @dataclass
@@ -369,6 +398,7 @@ class TBREntryDetail:
     started_at_manual: bool = False
     rating: Optional[int] = None
     sort_order: Optional[int] = None
+    audiobook_progress_percent: Optional[float] = None
 
 
 @dataclass
@@ -449,6 +479,7 @@ def _row_to_book(row: sqlite3.Row) -> Book:
         grimmory_book_id=row["grimmory_book_id"],
         cover_color=row["cover_color"],
         manual_match_grimmory_id=row["manual_match_grimmory_id"],
+        format=row["format"],
     )
 
 
@@ -464,6 +495,7 @@ def _row_to_tbr_entry(row: sqlite3.Row) -> TBREntry:
         started_at_manual=bool(row["started_at_manual"]),
         rating=row["rating"],
         sort_order=row["sort_order"],
+        audiobook_progress_percent=row["audiobook_progress_percent"],
     )
 
 
@@ -619,9 +651,10 @@ def list_tbr_entries_with_books(db_connection: sqlite3.Connection, user_id: int)
         """
         SELECT tbr_entries.id AS entry_id, tbr_entries.status, tbr_entries.added_at,
                tbr_entries.finished_at, tbr_entries.started_at, tbr_entries.started_at_manual,
-               tbr_entries.rating, tbr_entries.sort_order,
+               tbr_entries.rating, tbr_entries.sort_order, tbr_entries.audiobook_progress_percent,
                books.id AS book_id, books.title, books.author, books.isbn, books.cover_url,
-               books.published_date, books.page_count, books.grimmory_book_id, books.cover_color
+               books.published_date, books.page_count, books.grimmory_book_id, books.cover_color,
+               books.format
         FROM tbr_entries
         JOIN books ON books.id = tbr_entries.book_id
         WHERE tbr_entries.user_id = ?
@@ -639,6 +672,7 @@ def list_tbr_entries_with_books(db_connection: sqlite3.Connection, user_id: int)
             started_at_manual=bool(row["started_at_manual"]),
             rating=row["rating"],
             sort_order=row["sort_order"],
+            audiobook_progress_percent=row["audiobook_progress_percent"],
             book=Book(
                 id=row["book_id"],
                 title=row["title"],
@@ -649,6 +683,7 @@ def list_tbr_entries_with_books(db_connection: sqlite3.Connection, user_id: int)
                 page_count=row["page_count"],
                 grimmory_book_id=row["grimmory_book_id"],
                 cover_color=row["cover_color"],
+                format=row["format"],
             ),
         )
         for row in rows
@@ -781,6 +816,11 @@ def set_book_page_count(db_connection: sqlite3.Connection, book_id: int, page_co
     db_connection.commit()
 
 
+def set_book_format(db_connection: sqlite3.Connection, book_id: int, book_format: Optional[str]) -> None:
+    db_connection.execute("UPDATE books SET format = ? WHERE id = ?", (book_format, book_id))
+    db_connection.commit()
+
+
 def set_book_grimmory_id(
     db_connection: sqlite3.Connection, book_id: int, grimmory_book_id: Optional[int]
 ) -> None:
@@ -817,6 +857,15 @@ def set_book_manual_match_and_grimmory_id(
 
 def set_tbr_entry_rating(db_connection: sqlite3.Connection, entry_id: int, rating: Optional[int]) -> None:
     db_connection.execute("UPDATE tbr_entries SET rating = ? WHERE id = ?", (rating, entry_id))
+    db_connection.commit()
+
+
+def set_tbr_entry_audiobook_progress_percent(
+    db_connection: sqlite3.Connection, entry_id: int, percent: Optional[float]
+) -> None:
+    db_connection.execute(
+        "UPDATE tbr_entries SET audiobook_progress_percent = ? WHERE id = ?", (percent, entry_id)
+    )
     db_connection.commit()
 
 

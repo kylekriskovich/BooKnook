@@ -589,6 +589,46 @@ def test_sync_updates_matched_entry_to_finished_with_grimmory_date(conn, monkeyp
     assert entry.finished_at == "2026-03-01T00:00:00Z"
 
 
+def test_sync_captures_audiobook_progress_percent(conn, monkeypatch):
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
+    models.add_tbr_entry(conn, user.id, book.id)
+    grimmory_book = _grimmory_book(read_status="READING")
+    grimmory_book["audiobookProgress"] = {"percentage": 42.5}
+    _fake_books_client([grimmory_book], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entry = models.list_tbr_entries_with_books(conn, user.id)[0]
+    assert entry.audiobook_progress_percent == 42.5
+
+
+def test_sync_captures_book_format_from_primary_file(conn, monkeypatch):
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
+    models.add_tbr_entry(conn, user.id, book.id)
+    grimmory_book = _grimmory_book(read_status="READING")
+    grimmory_book["primaryFile"] = {"bookType": "AUDIOBOOK"}
+    _fake_books_client([grimmory_book], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entry = models.list_tbr_entries_with_books(conn, user.id)[0]
+    assert entry.book.format == "AUDIOBOOK"
+
+
+def test_sync_leaves_audiobook_progress_percent_none_for_non_audiobooks(conn, monkeypatch):
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
+    models.add_tbr_entry(conn, user.id, book.id)
+    _fake_books_client([_grimmory_book(read_status="READING")], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entry = models.list_tbr_entries_with_books(conn, user.id)[0]
+    assert entry.audiobook_progress_percent is None
+
+
 def test_sync_never_downgrades_finished_entry(conn, monkeypatch):
     user = models.get_or_create_user(conn, "alice")
     book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")

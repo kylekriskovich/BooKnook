@@ -34,6 +34,7 @@ cloning is the easiest way to grab both).
    | `TBR_SECRET_KEY` | Yes | Random key used to sign session cookies. Generate one: `openssl rand -hex 32` |
    | `TBR_ADMIN_USERNAME` | Yes | Grimmory username of the app admin — their account gets an "Admin" shortcut in the nav. UI convenience only; it does **not** gate the `/admin` pages themselves (see below). |
    | `TBR_PORT` | No (default `8011`) | Host port to publish the app on. |
+   | `TBR_LOG_LEVEL` | No (default `INFO`) | Log level, including every Grimmory API call/response (method, URL, status, timing). Set to `WARNING` to only see failures. |
 
 3. Build and start:
 
