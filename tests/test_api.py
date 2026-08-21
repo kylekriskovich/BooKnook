@@ -538,6 +538,31 @@ def test_api_book_detail_pages_per_day_uses_client_today_not_server_utc(client, 
     assert any(t["label"] == "Pages per day" and t["value"] == "30" for t in body["tiles"])
 
 
+def test_api_book_detail_evicts_rejected_access_token_on_fetch_failure(client, monkeypatch):
+    # Regression test: a cached access token that Grimmory has actually rejected (revoked early,
+    # a signing-key rotation, anything our own cached deadline can't know about) must not keep
+    # getting handed back for up to ~2 hours - see grimmory_auth.evict_access_token.
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    models.set_book_grimmory_id(conn, book.id, 42)
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="reading")
+    models.set_grimmory_refresh_token(conn, user.id, "stored-refresh")
+    conn.close()
+
+    grimmory_auth.cache_access_token(user.id, "stale-rejected-token", 7200)
+
+    def fail(*a, **k):
+        raise library_check.LibraryCheckUnavailable("Grimmory API request failed: 401")
+
+    monkeypatch.setattr(library_check, "fetch_reading_sessions_for_book", fail)
+
+    response = client.get(f"/api/book/{entry.id}")
+
+    assert response.status_code == 200
+    assert grimmory_auth._access_token_cache.get(user.id) is None
+
+
 # --- stats / calendar ---
 
 

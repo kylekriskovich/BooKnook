@@ -936,7 +936,11 @@ def _sync_all_user_reading_status(db_connection) -> None:
         try:
             sync_user_reading_status(db_connection, user.id, base_url, access_token)
         except LibraryCheckUnavailable:
-            # One user's failure never blocks the others or the catalog sync that follows.
+            # One user's failure never blocks the others or the catalog sync that follows. Evict
+            # the cached access token too - if Grimmory rejected a call using it, don't keep
+            # handing the same rejected token back for up to ~2 hours (see
+            # grimmory_auth.evict_access_token).
+            grimmory_auth.evict_access_token(access_token)
             logger.exception("Background reading-status sync failed for user_id=%s", user.id)
 
 # Function Name: _run_sync_cycle

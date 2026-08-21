@@ -1,3 +1,6 @@
+import threading
+import time
+
 import httpx
 import pytest
 
@@ -28,8 +31,8 @@ class FakeResponse:
         }
 
     @property
-    def text(self):
-        return str(self.json())
+    def content(self):
+        return str(self.json()).encode()
 
 
 @pytest.fixture
@@ -208,6 +211,43 @@ def test_cache_access_token_skips_caching_when_expires_in_within_safety_margin(b
     assert refresh_calls == [1]
 
 
+# --- evict_access_token ---
+
+
+def test_evict_access_token_removes_matching_cache_entry():
+    grimmory_auth.cache_access_token(1, "the-token", 7200)
+
+    grimmory_auth.evict_access_token("the-token")
+
+    assert grimmory_auth._access_token_cache.get(1) is None
+
+
+def test_evict_access_token_ignores_non_matching_value():
+    grimmory_auth.cache_access_token(1, "the-token", 7200)
+
+    grimmory_auth.evict_access_token("some-other-token")
+
+    cached = grimmory_auth._access_token_cache.get(1)
+    assert cached is not None and cached[0] == "the-token"
+
+
+def test_evicted_access_token_is_not_reused_by_get_valid_access_token(base_url, conn, monkeypatch):
+    created = get_or_create_user(conn, "kyle")
+    set_grimmory_refresh_token(conn, created.id, "some-refresh")
+    user = User(id=created.id, name="kyle", grimmory_refresh_token="some-refresh")
+
+    grimmory_auth.cache_access_token(created.id, "rejected-by-grimmory", 7200)
+    grimmory_auth.evict_access_token("rejected-by-grimmory")
+
+    monkeypatch.setattr(
+        grimmory_auth,
+        "refresh",
+        lambda base_url, refresh_token: ("fresh-access", "new-refresh", 7200),
+    )
+
+    assert grimmory_auth.get_valid_access_token(conn, user) == "fresh-access"
+
+
 def test_get_valid_access_token_returns_none_when_unconfigured(monkeypatch, conn):
     monkeypatch.delenv(grimmory_auth.GRIMMORY_BASE_URL_ENV, raising=False)
     user = User(id=1, name="kyle", grimmory_refresh_token="some-token")
@@ -300,13 +340,71 @@ def test_get_valid_access_token_uses_fresh_db_token_not_stale_caller_object(
     assert row["grimmory_refresh_token"] == "token-c"
 
 
+# --- refresh_lock ---
+
+
+def test_refresh_lock_is_the_same_lock_get_valid_access_token_uses_internally():
+    # refresh_lock's whole point is that a caller writing a refresh token directly (see
+    # app/main.py's /api/login) can't race get_valid_access_token's own refresh() - that only
+    # holds if they're actually contending for the exact same lock object, not just two separate
+    # locks that happen to share a name.
+    assert grimmory_auth.refresh_lock(42) is grimmory_auth._refresh_locks[42]
+
+
+def test_refresh_lock_blocks_concurrent_get_valid_access_token_for_same_user(
+    base_url, conn, monkeypatch
+):
+    created = get_or_create_user(conn, "kyle")
+    set_grimmory_refresh_token(conn, created.id, "some-refresh")
+    user = User(id=created.id, name="kyle", grimmory_refresh_token="some-refresh")
+
+    monkeypatch.setattr(
+        grimmory_auth,
+        "refresh",
+        lambda base_url, refresh_token: ("fresh-access", "new-refresh", 7200),
+    )
+
+    entered_get_valid_access_token = threading.Event()
+    release_refresh_lock = threading.Event()
+    result: dict = {}
+
+    def hold_refresh_lock_like_api_login():
+        with grimmory_auth.refresh_lock(created.id):
+            entered_get_valid_access_token.set()  # signal the other thread it's safe to try now
+            # Blocks here exactly like /api/login's DB write would - proves a concurrent
+            # get_valid_access_token call genuinely can't proceed past its own lock acquisition
+            # while this "login" is still writing.
+            release_refresh_lock.wait(timeout=2)
+
+    def call_get_valid_access_token():
+        entered_get_valid_access_token.wait(timeout=2)
+        result["token"] = grimmory_auth.get_valid_access_token(conn, user)
+
+    holder = threading.Thread(target=hold_refresh_lock_like_api_login)
+    caller = threading.Thread(target=call_get_valid_access_token)
+    holder.start()
+    holder.join(timeout=0.2)  # give the holder time to actually acquire the lock first
+    caller.start()
+
+    # While the "login" thread still holds the lock, get_valid_access_token must not have
+    # returned yet - it's blocked waiting for the same lock, not racing past it.
+    time.sleep(0.1)
+    assert "token" not in result
+
+    release_refresh_lock.set()
+    holder.join(timeout=2)
+    caller.join(timeout=2)
+
+    assert result.get("token") == "fresh-access"
+
+
 # --- update_book_finished_date ---
 
 
 class FakeHttpResponse:
     def __init__(self, status_code=200):
         self.status_code = status_code
-        self.text = "{}"
+        self.content = b"{}"
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -353,7 +451,7 @@ class FakeMeResponse:
     def __init__(self, payload, status_code=200):
         self._payload = payload
         self.status_code = status_code
-        self.text = str(payload)
+        self.content = str(payload).encode()
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -398,7 +496,7 @@ def test_get_own_grimmory_user_id_raises_when_id_missing(monkeypatch):
 def test_get_own_grimmory_user_id_raises_on_invalid_json(monkeypatch):
     class NonJsonResponse:
         status_code = 200
-        text = "<html>not json</html>"
+        content = b"<html>not json</html>"
 
         def raise_for_status(self):
             pass
@@ -419,7 +517,7 @@ class FakeAdminResponse:
     def __init__(self, payload, status_code=200):
         self._payload = payload
         self.status_code = status_code
-        self.text = str(payload)
+        self.content = str(payload).encode()
 
     def raise_for_status(self):
         if self.status_code >= 400:

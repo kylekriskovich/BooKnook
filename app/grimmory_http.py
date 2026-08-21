@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Optional
 
 import httpx
 
@@ -22,16 +21,16 @@ _START_TIME_KEY = "booknook_request_start"
 # Response bodies are only ever logged for error responses (see _format_status below) - a status
 # code alone doesn't say *why* Grimmory rejected a request (invalid credentials? rate limited?
 # something else entirely?), and Grimmory's own error responses are a small JSON message, never a
-# secret. Truncated defensively in case something unexpected (an HTML error page from a proxy
-# in front of Grimmory, say) returns something much larger.
-_ERROR_BODY_LOG_LIMIT = 500
+# secret. Sliced off the raw bytes *before* decoding (not off the fully-decoded text) so a
+# surprisingly large body (an HTML error page from a proxy in front of Grimmory, say) only ever
+# costs a bounded decode, not a decode of however much the client already buffered in memory.
+_ERROR_BODY_LOG_LIMIT_BYTES = 500
 
 
-def _truncate_body(text: str) -> str:
-    text = text.strip()
-    if len(text) > _ERROR_BODY_LOG_LIMIT:
-        return text[:_ERROR_BODY_LOG_LIMIT] + "... (truncated)"
-    return text
+def _truncate_body(content: bytes) -> str:
+    truncated = len(content) > _ERROR_BODY_LOG_LIMIT_BYTES
+    text = content[:_ERROR_BODY_LOG_LIMIT_BYTES].decode("utf-8", errors="replace").strip()
+    return text + "... (truncated)" if truncated else text
 
 
 def _on_request(request: httpx.Request) -> None:
@@ -47,9 +46,13 @@ def _on_response(response: httpx.Response) -> None:
     status = response.status_code
     log = logger.error if status >= 500 else logger.warning if status >= 400 else logger.info
     if status >= 400:
+        # response.read() is a no-op here in the common case - these calls are all non-streaming
+        # (plain client.get/post/put), which httpx already buffers in full before this hook ever
+        # fires. Kept as a defensive no-op for the (currently theoretical) case of a streamed call
+        # being routed through client() in the future.
         try:
             response.read()
-            body = _truncate_body(response.text)
+            body = _truncate_body(response.content)
         except httpx.HTTPError:
             body = "<unreadable>"
         log(
@@ -75,24 +78,24 @@ def client(**kwargs) -> httpx.Client:
 # Description: Same request/response logging as client() above, for the handful of call sites
 #   (app/grimmory_auth.py) that use the bare httpx.get/post/put functions instead of a Client -
 #   those aren't compatible with event_hooks, so callers log explicitly with the values they
-#   already have in scope rather than pulling them back off the response.
+#   already have in scope rather than pulling them back off the response. Takes the response
+#   object itself (not a pre-extracted status/body) so a successful call - the overwhelming
+#   majority - never pays for decoding a body it's not going to log; only an error response gets
+#   its (bounded) body decoded at all.
 # Parameters:
 # - method (str): HTTP method, e.g. "POST".
 # - url (str): Full request URL.
-# - status_code (int): Response status code.
+# - response (httpx.Response): The response received.
 # - elapsed_seconds (float): Wall-clock time the request took.
-# - body (Optional[str]): Response body text, logged only when status_code is an error - pass
-#   `response.text` unconditionally, this decides whether it's worth including.
 # Returns: None
-def log_call(
-    method: str, url: str, status_code: int, elapsed_seconds: float, body: Optional[str] = None
-) -> None:
+def log_call(method: str, url: str, response: httpx.Response, elapsed_seconds: float) -> None:
+    status_code = response.status_code
     elapsed = f"{elapsed_seconds * 1000:.0f}ms"
     log = logger.error if status_code >= 500 else logger.warning if status_code >= 400 else logger.info
-    if status_code >= 400 and body:
+    if status_code >= 400:
         log(
             "Grimmory %s %s -> %s (%s): %s",
-            method, url, status_code, elapsed, _truncate_body(body),
+            method, url, status_code, elapsed, _truncate_body(response.content),
         )
     else:
         log("Grimmory %s %s -> %s (%s)", method, url, status_code, elapsed)
