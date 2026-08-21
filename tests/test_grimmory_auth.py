@@ -4,7 +4,7 @@ import time
 import httpx
 import pytest
 
-from app import grimmory_auth
+from app import grimmory_auth, library_check
 from app.models import (
     User,
     get_connection,
@@ -209,6 +209,41 @@ def test_cache_access_token_skips_caching_when_expires_in_within_safety_margin(b
 
     assert grimmory_auth.get_valid_access_token(conn, user) == "fresh-access"
     assert refresh_calls == [1]
+
+
+# --- LibraryCheckUnavailable.is_auth_rejection / from_http_error ---
+
+
+def test_is_auth_rejection_true_for_401_and_403():
+    assert library_check.LibraryCheckUnavailable("x", status_code=401).is_auth_rejection
+    assert library_check.LibraryCheckUnavailable("x", status_code=403).is_auth_rejection
+
+
+def test_is_auth_rejection_false_for_other_statuses_and_none():
+    assert not library_check.LibraryCheckUnavailable("x", status_code=500).is_auth_rejection
+    assert not library_check.LibraryCheckUnavailable("x", status_code=409).is_auth_rejection
+    assert not library_check.LibraryCheckUnavailable("x").is_auth_rejection
+
+
+def test_from_http_error_carries_status_code_from_http_status_error():
+    request = httpx.Request("GET", "https://example.test/x")
+    response = httpx.Response(401, request=request)
+    exc = httpx.HTTPStatusError("boom", request=request, response=response)
+
+    unavailable = library_check.LibraryCheckUnavailable.from_http_error(exc, "message")
+
+    assert unavailable.status_code == 401
+    assert unavailable.is_auth_rejection
+
+
+def test_from_http_error_has_no_status_code_for_connection_errors():
+    request = httpx.Request("GET", "https://example.test/x")
+    exc = httpx.ConnectError("refused", request=request)
+
+    unavailable = library_check.LibraryCheckUnavailable.from_http_error(exc, "message")
+
+    assert unavailable.status_code is None
+    assert not unavailable.is_auth_rejection
 
 
 # --- evict_access_token ---

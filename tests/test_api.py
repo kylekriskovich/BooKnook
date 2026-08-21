@@ -553,7 +553,9 @@ def test_api_book_detail_evicts_rejected_access_token_on_fetch_failure(client, m
     grimmory_auth.cache_access_token(user.id, "stale-rejected-token", 7200)
 
     def fail(*a, **k):
-        raise library_check.LibraryCheckUnavailable("Grimmory API request failed: 401")
+        raise library_check.LibraryCheckUnavailable(
+            "Grimmory API request failed: 401", status_code=401
+        )
 
     monkeypatch.setattr(library_check, "fetch_reading_sessions_for_book", fail)
 
@@ -561,6 +563,32 @@ def test_api_book_detail_evicts_rejected_access_token_on_fetch_failure(client, m
 
     assert response.status_code == 200
     assert grimmory_auth._access_token_cache.get(user.id) is None
+
+
+def test_api_book_detail_keeps_cached_access_token_on_transient_fetch_failure(client, monkeypatch):
+    # A transient failure (5xx, timeout, connection error) doesn't mean the token itself is bad -
+    # evicting it here would just force an unnecessary refresh-token rotation on the next request.
+    # See LibraryCheckUnavailable.is_auth_rejection.
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    models.set_book_grimmory_id(conn, book.id, 42)
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="reading")
+    models.set_grimmory_refresh_token(conn, user.id, "stored-refresh")
+    conn.close()
+
+    grimmory_auth.cache_access_token(user.id, "still-good-token", 7200)
+
+    def fail(*a, **k):
+        raise library_check.LibraryCheckUnavailable("Grimmory API request failed: 503")
+
+    monkeypatch.setattr(library_check, "fetch_reading_sessions_for_book", fail)
+
+    response = client.get(f"/api/book/{entry.id}")
+
+    assert response.status_code == 200
+    cached = grimmory_auth._access_token_cache.get(user.id)
+    assert cached is not None and cached[0] == "still-good-token"
 
 
 # --- stats / calendar ---

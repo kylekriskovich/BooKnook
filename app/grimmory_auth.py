@@ -76,6 +76,16 @@ def refresh_lock(user_id: int) -> threading.Lock:
 # as today's behavior.
 _access_token_cache: "dict[int, tuple[str, float]]" = {}
 
+# Guards writes to _access_token_cache (set in cache_access_token, deleted in evict_access_token).
+# FastAPI's threadpool and the periodic background sync loop can call either concurrently for
+# different users; without this, evict_access_token's scan of .items() while another thread's
+# cache_access_token/evict_access_token mutates the same dict can raise "dictionary changed size
+# during iteration". Deliberately a separate lock from the per-user _refresh_locks above - those
+# guard the (much slower) refresh() network call, and reusing one of them here would make an
+# unrelated user's cache write block on this user's in-flight refresh for no reason. Plain reads
+# (get_valid_access_token's cache-hit check) stay lock-free by design - see there.
+_cache_lock = threading.Lock()
+
 # Refreshed this long before Grimmory's own expiry, not right up against it - a token that's about
 # to expire mid-request is worse than refreshing a little early.
 _ACCESS_TOKEN_SAFETY_MARGIN_SECONDS = 5 * 60
@@ -94,12 +104,13 @@ _ACCESS_TOKEN_SAFETY_MARGIN_SECONDS = 5 * 60
 #   to today's behavior of refreshing on the next call.
 # Returns: None
 def cache_access_token(user_id: int, access_token: str, expires_in: Optional[int]) -> None:
-    if not expires_in or expires_in <= _ACCESS_TOKEN_SAFETY_MARGIN_SECONDS:
-        _access_token_cache.pop(user_id, None)
-        return
-    _access_token_cache[user_id] = (
-        access_token, time.monotonic() + expires_in - _ACCESS_TOKEN_SAFETY_MARGIN_SECONDS
-    )
+    with _cache_lock:
+        if not expires_in or expires_in <= _ACCESS_TOKEN_SAFETY_MARGIN_SECONDS:
+            _access_token_cache.pop(user_id, None)
+            return
+        _access_token_cache[user_id] = (
+            access_token, time.monotonic() + expires_in - _ACCESS_TOKEN_SAFETY_MARGIN_SECONDS
+        )
 
 
 # Function Name: evict_access_token
@@ -116,13 +127,14 @@ def cache_access_token(user_id: int, access_token: str, expires_in: Optional[int
 # - access_token (str): The access token that was rejected.
 # Returns: None
 def evict_access_token(access_token: str) -> None:
-    stale_user_ids = [
-        user_id
-        for user_id, (cached_token, _deadline) in _access_token_cache.items()
-        if cached_token == access_token
-    ]
-    for user_id in stale_user_ids:
-        _access_token_cache.pop(user_id, None)
+    with _cache_lock:
+        stale_user_ids = [
+            user_id
+            for user_id, (cached_token, _deadline) in _access_token_cache.items()
+            if cached_token == access_token
+        ]
+        for user_id in stale_user_ids:
+            _access_token_cache.pop(user_id, None)
 
 
 # TEMPORARY diagnostic (see the 2026-08-21 investigation: a household user's Grimmory session
@@ -274,7 +286,8 @@ def get_valid_access_token(db_connection, user: User) -> Optional[str]:
             set_grimmory_refresh_token(db_connection, user.id, None)
             log_token_write(user.id, None, "get_valid_access_token(rejected)")
             user.grimmory_refresh_token = None
-            _access_token_cache.pop(user.id, None)
+            with _cache_lock:
+                _access_token_cache.pop(user.id, None)
             return None
 
         set_grimmory_refresh_token(db_connection, user.id, new_refresh_token)
@@ -313,7 +326,7 @@ def update_book_finished_date(
     except httpx.HTTPError as exc:
         if not grimmory_http.already_logged(exc):
             logger.warning("Grimmory book-progress update failed for book %s: %s", grimmory_book_id, exc)
-        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
 
 # Function Name: get_own_grimmory_user_id
 # Description: Returns the calling user's own Grimmory numeric user id.
@@ -335,7 +348,7 @@ def get_own_grimmory_user_id(base_url: str, access_token: str) -> int:
     except httpx.HTTPError as exc:
         if not grimmory_http.already_logged(exc):
             logger.warning("Grimmory /users/me request failed: %s", exc)
-        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
     except ValueError as exc:
         # response.json() raises json.JSONDecodeError (a ValueError subclass) on a non-JSON body
         # (e.g. an HTML error page from a proxy in front of Grimmory).
@@ -419,7 +432,7 @@ def find_grimmory_user_id(base_url: str, admin_token: str, username: str) -> Opt
     except httpx.HTTPError as exc:
         if not grimmory_http.already_logged(exc):
             logger.warning("Grimmory users list request failed: %s", exc)
-        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
 
     for user in response.json():
         if user.get("username") == username:
@@ -443,7 +456,7 @@ def get_content_restrictions(base_url: str, admin_token: str, user_id: int) -> l
     except httpx.HTTPError as exc:
         if not grimmory_http.already_logged(exc):
             logger.warning("Grimmory content-restrictions GET failed for user %s: %s", user_id, exc)
-        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
     return response.json()
 
 # Function Name: put_content_restrictions
@@ -468,7 +481,7 @@ def put_content_restrictions(
     except httpx.HTTPError as exc:
         if not grimmory_http.already_logged(exc):
             logger.warning("Grimmory content-restrictions PUT failed for user %s: %s", user_id, exc)
-        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
 
 # Function Name: sync_restriction_level
 # Description: Updates a user's content restrictions based on their preferred "spice" level.

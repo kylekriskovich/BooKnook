@@ -588,7 +588,9 @@ def api_login(payload: schemas.LoginIn, db_connection: sqlite3.Connection = Depe
     if base_url:
         try:
             library_check.sync_user_reading_status(db_connection, user.id, base_url, access_token)
-        except LibraryCheckUnavailable:
+        except LibraryCheckUnavailable as exc:
+            if exc.is_auth_rejection:
+                grimmory_auth.evict_access_token(access_token)
             logger.exception("Grimmory reading-status sync failed")
 
     response = JSONResponse(_to_me_out(user).model_dump(mode="json"))
@@ -703,8 +705,9 @@ def api_book_detail(
                 sessions = library_check.fetch_reading_sessions_for_book(
                     base_url, access_token, entry.book.grimmory_book_id
                 )
-            except LibraryCheckUnavailable:
-                grimmory_auth.evict_access_token(access_token)
+            except LibraryCheckUnavailable as exc:
+                if exc.is_auth_rejection:
+                    grimmory_auth.evict_access_token(access_token)
 
     if sessions and not entry.started_at_manual:
         derived = stat_tiles.first_meaningful_session_date(sessions)
@@ -839,7 +842,8 @@ def api_settings_sync(
         try:
             library_check.sync_user_reading_status(db_connection, user.id, base_url, access_token)
         except LibraryCheckUnavailable as exc:
-            grimmory_auth.evict_access_token(access_token)
+            if exc.is_auth_rejection:
+                grimmory_auth.evict_access_token(access_token)
             error = str(exc)
 
     return schemas.SyncResultOut(error=error)
@@ -864,7 +868,8 @@ def api_settings_shelves(
         own_id = grimmory_auth.get_own_grimmory_user_id(base_url, access_token)
         shelves = library_check.list_own_shelves(base_url, access_token, own_id)
     except LibraryCheckUnavailable as exc:
-        grimmory_auth.evict_access_token(access_token)
+        if exc.is_auth_rejection:
+            grimmory_auth.evict_access_token(access_token)
         return schemas.ShelfOptionsOut(shelves=[], error=str(exc))
 
     return schemas.ShelfOptionsOut(
@@ -1088,8 +1093,9 @@ def api_set_tbr_dates(
                         grimmory_auth.update_book_finished_date(
                             base_url, access_token, book.grimmory_book_id, finished_date
                         )
-                    except LibraryCheckUnavailable:
-                        grimmory_auth.evict_access_token(access_token)
+                    except LibraryCheckUnavailable as exc:
+                        if exc.is_auth_rejection:
+                            grimmory_auth.evict_access_token(access_token)
     elif entry.status == "finished":
         set_tbr_entry_finished_at(db_connection, entry_id, None)
 

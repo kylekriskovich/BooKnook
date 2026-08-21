@@ -95,7 +95,28 @@ ABANDONED_READ_STATUSES = {"WONT_READ", "ABANDONED"}
 
 
 class LibraryCheckUnavailable(Exception):
-    """Raised when the Grimmory API can't be reached, or isn't configured."""
+    """Raised when the Grimmory API can't be reached, isn't configured, or rejected a request.
+
+    status_code carries the HTTP status Grimmory actually returned, when known (i.e. the
+    underlying failure was an httpx.HTTPStatusError, not a connection error/timeout/malformed
+    response). Callers holding a cached access token use is_auth_rejection to decide whether to
+    evict it - a real 401/403 means the token's actually bad, but a transient 5xx or a connection
+    failure doesn't, and evicting on those would just force an unnecessary refresh-token rotation
+    on the next call.
+    """
+
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+    @property
+    def is_auth_rejection(self) -> bool:
+        return self.status_code in (401, 403)
+
+    @classmethod
+    def from_http_error(cls, exc: httpx.HTTPError, message: str) -> "LibraryCheckUnavailable":
+        status_code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+        return cls(message, status_code=status_code)
 
 # Function Name: _config
 # Description: Reads the Grimmory connection settings, if fully configured.
@@ -175,7 +196,7 @@ def fetch_catalog(db_connection) -> list[LibraryCatalogEntry]:
     except httpx.HTTPError as exc:
         if not grimmory_http.already_logged(exc):
             logger.warning("Grimmory catalog fetch failed: %s", exc)
-        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
 
     entries = [_book_to_catalog_entry(book) for book in books]
     # Backfill grimmory_book_id/covers for any locally-known book that matches this catalog -
@@ -315,7 +336,7 @@ def fetch_user_books(base_url: str, access_token: str) -> list[dict]:
     except httpx.HTTPError as exc:
         if not grimmory_http.already_logged(exc):
             logger.warning("Grimmory user-books fetch failed: %s", exc)
-        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
 
 # Function Name: fetch_reading_sessions_for_book
 # Description: Fetches every reading session Grimmory has recorded for one book, for the calling
@@ -354,7 +375,7 @@ def fetch_reading_sessions_for_book(
             logger.warning(
                 "Grimmory reading-sessions fetch failed for book %s: %s", grimmory_book_id, exc
             )
-        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
     return sessions
 
 # Function Name: list_own_shelves
@@ -376,7 +397,7 @@ def list_own_shelves(base_url: str, access_token: str, own_grimmory_user_id: int
     except httpx.HTTPError as exc:
         if not grimmory_http.already_logged(exc):
             logger.warning("Grimmory shelves fetch failed: %s", exc)
-        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
     return [shelf for shelf in shelves if shelf.get("userId") == own_grimmory_user_id]
 
 # Function Name: _shelf_name_key
@@ -442,7 +463,7 @@ def get_or_create_shelf_by_name(
     except httpx.HTTPError as exc:
         if not grimmory_http.already_logged(exc):
             logger.warning("Grimmory get-or-create shelf %r failed: %s", name, exc)
-        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
 
 # Function Name: fetch_shelf_books
 # Description: Fetches every book currently on a Grimmory shelf.
@@ -463,7 +484,7 @@ def fetch_shelf_books(base_url: str, access_token: str, shelf_id: int) -> list[d
     except httpx.HTTPError as exc:
         if not grimmory_http.already_logged(exc):
             logger.warning("Grimmory shelf-books fetch failed for shelf %s: %s", shelf_id, exc)
-        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
 
 # Function Name: assign_book_shelves
 # Description: Batched shelf-membership assign/unassign for one or more books.
@@ -501,7 +522,7 @@ def assign_book_shelves(
     except httpx.HTTPError as exc:
         if not grimmory_http.already_logged(exc):
             logger.warning("Grimmory assign-book-shelves failed: %s", exc)
-        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
 
 # Function Name: _target_status
 # Description: Determines the shelf a Grimmory book belongs on, based on its readStatus.
@@ -935,12 +956,13 @@ def _sync_all_user_reading_status(db_connection) -> None:
             continue
         try:
             sync_user_reading_status(db_connection, user.id, base_url, access_token)
-        except LibraryCheckUnavailable:
+        except LibraryCheckUnavailable as exc:
             # One user's failure never blocks the others or the catalog sync that follows. Evict
-            # the cached access token too - if Grimmory rejected a call using it, don't keep
-            # handing the same rejected token back for up to ~2 hours (see
-            # grimmory_auth.evict_access_token).
-            grimmory_auth.evict_access_token(access_token)
+            # the cached access token too, but only on an actual auth rejection - a transient 5xx
+            # or connection failure doesn't mean the token itself is bad (see
+            # grimmory_auth.evict_access_token, LibraryCheckUnavailable.is_auth_rejection).
+            if exc.is_auth_rejection:
+                grimmory_auth.evict_access_token(access_token)
             logger.exception("Background reading-status sync failed for user_id=%s", user.id)
 
 # Function Name: _run_sync_cycle
