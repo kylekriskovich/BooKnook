@@ -1,11 +1,13 @@
 services:
   booknook:
     # Builds straight from GitHub rather than a local checkout — deploying only needs this file
-    # (plus .env) present, not a full clone. Tracks the `latest` tag (a moving pointer, not a
-    # branch) rather than `main` directly, so a release is only "live" once that tag is
-    # deliberately moved — see the Releasing a new version section in SETUP.md.
+    # (plus .env) present, not a full clone. TEMPORARILY tracking the `develop` branch instead of
+    # the `latest` tag while heavy changes are in flight, so `docker compose up -d --build` picks
+    # up develop's current HEAD on every rebuild instead of the last tagged release — switch this
+    # back to `#latest` once things stabilize (see the Releasing a new version section in
+    # SETUP.md; normally a release is only "live" once that tag is deliberately moved).
     build:
-      context: https://github.com/kylekriskovich/BooKnook.git#latest
+      context: https://github.com/kylekriskovich/BooKnook.git#develop
     container_name: booknook
     restart: unless-stopped
     # Host-side port comes from TBR_PORT (see .env.example), defaulting to 8011 if unset.
