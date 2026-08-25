@@ -85,6 +85,18 @@ FINISHED_READ_STATUSES = {"READ"}
 READING_READ_STATUSES = {"READING", "RE_READING", "PARTIALLY_READ"}
 ABANDONED_READ_STATUSES = {"WONT_READ", "ABANDONED"}
 
+# Audiobook support (format sync, the audiobook_progress_percent fallback, "Listening" tile labels
+# in app/stat_tiles.py and app/main.py:api_book_detail) is switched off for now - Grimmory's own
+# gaps in audiobook session/progress data were producing duplicate shelf entries and broken stats
+# in practice. Flip this back to True to re-enable; nothing else needs to change, since every
+# audiobook-specific branch elsewhere only ever triggers for a book whose format is "AUDIOBOOK",
+# and no book gets tagged that way while this is False.
+AUDIOBOOKS_ENABLED = False
+
+
+def _is_audiobook(book: dict) -> bool:
+    return (book.get("primaryFile") or {}).get("bookType") == "AUDIOBOOK"
+
 
 class LibraryCheckUnavailable(Exception):
     """Raised when the Grimmory API can't be reached, isn't configured, or rejected a request.
@@ -739,6 +751,8 @@ def sync_user_reading_status(
         # Deleted mid-sync - surface the exception type callers expect, not an AttributeError.
         raise LibraryCheckUnavailable(f"No such user_id={user_id}")
     books = _dedupe_by_grimmory_id(fetch_user_books(base_url, access_token))
+    if not AUDIOBOOKS_ENABLED:
+        books = [book for book in books if not _is_audiobook(book)]
     catalog = [_book_to_catalog_entry(book) for book in books]
 
     # Grimmory's book id, once known, is a fully reliable match key - unlike title/isbn/author,
@@ -757,6 +771,11 @@ def sync_user_reading_status(
     # status/finished_at, removes a "reading" entry if now WONT_READ/ABANDONED, and downloads a
     # missing cover.
     for entry in list_tbr_entries_with_books(db_connection, user_id):
+        if not AUDIOBOOKS_ENABLED and entry.book.format == "AUDIOBOOK":
+            # Was tracked from an earlier sync, before audiobook support was switched off - drop it
+            # now rather than leaving a stale entry with no further updates.
+            remove_tbr_entry(db_connection, entry.id)
+            continue
         idx = None
         if entry.book.grimmory_book_id is not None:
             idx = books_by_grimmory_id.get(entry.book.grimmory_book_id)
@@ -810,6 +829,8 @@ def sync_user_reading_status(
     # only), then re-diffs desired vs. current membership every sync as a standing invariant.
     want_shelf_id = _ensure_want_to_read_shelf(db_connection, user, base_url, access_token)
     shelf_books = fetch_shelf_books(base_url, access_token, want_shelf_id)
+    if not AUDIOBOOKS_ENABLED:
+        shelf_books = [book for book in shelf_books if not _is_audiobook(book)]
     entries = list_tbr_entries_with_books(db_connection, user_id)
     known_grimmory_ids = {
         entry.book.grimmory_book_id for entry in entries if entry.book.grimmory_book_id is not None

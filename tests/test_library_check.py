@@ -608,13 +608,40 @@ def test_sync_captures_book_format_from_primary_file(conn, monkeypatch):
     book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
     models.add_tbr_entry(conn, user.id, book.id)
     grimmory_book = _grimmory_book(read_status="READING")
-    grimmory_book["primaryFile"] = {"bookType": "AUDIOBOOK"}
+    grimmory_book["primaryFile"] = {"bookType": "EPUB"}
     _fake_books_client([grimmory_book], monkeypatch)
 
     library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
 
     entry = models.list_tbr_entries_with_books(conn, user.id)[0]
-    assert entry.book.format == "AUDIOBOOK"
+    assert entry.book.format == "EPUB"
+
+
+def test_sync_excludes_audiobook_from_new_entries(conn, monkeypatch):
+    # Audiobook support is switched off (library_check.AUDIOBOOKS_ENABLED) - a Grimmory book whose
+    # primaryFile is an audiobook must never be picked up as a new TBR entry.
+    user = models.get_or_create_user(conn, "alice")
+    grimmory_book = _grimmory_book(read_status="READING")
+    grimmory_book["primaryFile"] = {"bookType": "AUDIOBOOK"}
+    _fake_books_client([grimmory_book], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    assert models.list_tbr_entries_with_books(conn, user.id) == []
+
+
+def test_sync_removes_already_tracked_audiobook_entry(conn, monkeypatch):
+    # A book tracked before audiobook support was switched off must be dropped on the next sync
+    # rather than left stale.
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
+    models.set_book_format(conn, book.id, "AUDIOBOOK")
+    models.add_tbr_entry(conn, user.id, book.id)
+    _fake_books_client([], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    assert models.list_tbr_entries_with_books(conn, user.id) == []
 
 
 def test_sync_leaves_audiobook_progress_percent_none_for_non_audiobooks(conn, monkeypatch):
