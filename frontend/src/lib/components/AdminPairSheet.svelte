@@ -25,24 +25,28 @@
 
 	// Reset search state each time a different audiobook is targeted, so stale results from a
 	// previous pairing attempt never show for the newly-opened row - then pre-fill and run a search
-	// from the audiobook's own (cleaned) title as a starting point.
+	// from the audiobook's own (cleaned) title as a starting point. Computes the prefill into a
+	// local instead of reading `query` back after writing it - reading query here too would make
+	// this effect depend on its own output, so every edit (including backspacing) would immediately
+	// re-trigger it and reset the input right back to the prefilled title.
 	$effect(() => {
 		void adminPairTarget.audiobookGrimmoryId;
-		query = baseTitle(adminPairTarget.title);
+		const prefill = baseTitle(adminPairTarget.title);
+		query = prefill;
 		results = [];
 		hasSearched = false;
 		pairError = null;
 		searchError = null;
-		if (query) search();
+		if (prefill) search(prefill);
 	});
 
 	function onInput() {
 		clearTimeout(searchTimer);
-		searchTimer = setTimeout(search, 150);
+		searchTimer = setTimeout(() => search(query), 150);
 	}
 
-	async function search() {
-		const q = query.trim();
+	async function search(q: string) {
+		q = q.trim();
 		if (!q) {
 			results = [];
 			hasSearched = false;
@@ -68,7 +72,7 @@
 	function onSubmit(event: SubmitEvent) {
 		event.preventDefault();
 		clearTimeout(searchTimer);
-		search();
+		search(query);
 	}
 
 	async function pair(result: SearchResult) {
