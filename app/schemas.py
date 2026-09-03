@@ -42,6 +42,7 @@ class TBREntryOut(BaseModel):
     added_at: str
     book: BookOut
     owned: Optional[bool] = None
+    has_paired_audiobook: Optional[bool] = None
     finished_at: Optional[str] = None
     started_at: Optional[str] = None
     started_at_manual: bool = False
@@ -89,6 +90,13 @@ class BookDetailOut(BaseModel):
     burndown_day_span: int
     progress_percent: Optional[float] = None
     estimated_page: Optional[int] = None
+    # Same shape as the fields above, but for the paired audiobook's own sessions (see
+    # entry.has_paired_audiobook) - empty/None whenever there's no pairing or no session data yet.
+    audiobook_tiles: list[StatTileOut] = []
+    audiobook_burndown: list[BurndownPointOut] = []
+    audiobook_burndown_day_span: int = 0
+    audiobook_progress_percent: Optional[float] = None
+    audiobook_estimated_page: Optional[int] = None
 
 
 class CalendarBookOut(BaseModel):
@@ -207,11 +215,17 @@ class AdminEntryOut(BaseModel):
     # Grimmory's own catalog id - unset for needed_entries (no match yet).
     grimmory_id: Optional[int] = None
     manually_matched: bool = False
+    # Set only on an audiobook_entries row that's been paired to an ebook - see AdminPairAudiobookIn.
+    paired_ebook_title: Optional[str] = None
 
 
 class AdminOut(BaseModel):
     needed_entries: list[AdminEntryOut]
     owned_entries: list[AdminEntryOut]
+    # In-library books whose primaryFile is an audiobook - split out from owned_entries so the
+    # admin page can list them separately (see library_check.AUDIOBOOKS_ENABLED for why they're
+    # excluded from everywhere else).
+    audiobook_entries: list[AdminEntryOut]
     library_check_enabled: bool
     last_synced_at: Optional[str] = None
     last_error: Optional[str] = None
@@ -260,6 +274,10 @@ class SyncIn(BaseModel):
 
 class SpiceIn(BaseModel):
     level: int
+
+
+class AdminPairAudiobookIn(BaseModel):
+    ebook_grimmory_id: Optional[int] = None
 
 
 class AdminMatchIn(BaseModel):

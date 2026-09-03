@@ -145,6 +145,8 @@ CREATE TABLE IF NOT EXISTS tbr_entries (
 );
 
 -- Local cache of the Grimmory catalog, refreshed by app.library_check.
+-- format mirrors books.format above (Grimmory's primaryFile.bookType) - lets the admin "In
+-- library" list split off audiobooks into their own section without a per-book lookup.
 CREATE TABLE IF NOT EXISTS library_catalog (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
@@ -152,7 +154,18 @@ CREATE TABLE IF NOT EXISTS library_catalog (
     isbn10 TEXT,
     authors TEXT,
     published_date TEXT,
-    grimmory_id INTEGER
+    grimmory_id INTEGER,
+    format TEXT
+);
+
+-- Manual admin-asserted pairing between an audiobook and its ebook counterpart, both left as
+-- separate Grimmory books (see AUDIOBOOKS_ENABLED in app/library_check.py for why). Purely
+-- bookkeeping for the admin UI - the ebook stays the source of truth for reading status/stats,
+-- which continue to come only from the ebook's own Grimmory data. Keyed by Grimmory's own catalog
+-- ids (stable across every library_catalog rebuild), never library_catalog.id.
+CREATE TABLE IF NOT EXISTS audiobook_pairings (
+    audiobook_grimmory_id INTEGER PRIMARY KEY,
+    ebook_grimmory_id INTEGER NOT NULL
 );
 
 -- Single-row table tracking the last catalog sync attempt.
@@ -319,6 +332,10 @@ def init_db(db_connection: sqlite3.Connection) -> None:
         db_connection.execute("ALTER TABLE books ADD COLUMN format TEXT")
     except sqlite3.OperationalError:
         pass  # column already exists
+    try:
+        db_connection.execute("ALTER TABLE library_catalog ADD COLUMN format TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     # One-time backfill for wanted entries that predate sort_order, preserving today's added_at
     # order. Only touches NULL rows, so it's a no-op after the first init_db() call.
     db_connection.execute(
@@ -387,6 +404,11 @@ class TBREntryDetail:
     added_at: str
     book: Book
     owned: Optional[bool] = None
+    # Whether the owned-check's matched catalog entry has an admin-paired audiobook edition (see
+    # app.models.audiobook_pairings) - drives the "Audiobook available" badge, computed alongside
+    # `owned` in app.main._tbr_entries_for_user. None whenever `owned` is also None (library-check
+    # unconfigured).
+    has_paired_audiobook: Optional[bool] = None
     finished_at: Optional[str] = None
     started_at: Optional[str] = None
     started_at_manual: bool = False
@@ -410,6 +432,7 @@ class LibraryCatalogEntry:
     authors: list[str] = field(default_factory=list)
     published_date: Optional[str] = None
     grimmory_id: Optional[int] = None
+    format: Optional[str] = None
 
 
 @dataclass
@@ -718,14 +741,14 @@ def list_aggregate_tbr(db_connection: sqlite3.Connection) -> list[AggregateTBREn
 
 
 def add_tbr_entry(db_connection: sqlite3.Connection, user_id: int, book_id: int, status: str = "wanted") -> TBREntry:
-    # New wanted entries go to the top of the manually-ordered shelf (lowest sort_order first).
+    # New wanted entries go to the bottom of the manually-ordered shelf (highest sort_order last).
     sort_order = None
     if status == "wanted":
         row = db_connection.execute(
-            "SELECT MIN(sort_order) AS min_order FROM tbr_entries WHERE user_id = ? AND status = 'wanted'",
+            "SELECT MAX(sort_order) AS max_order FROM tbr_entries WHERE user_id = ? AND status = 'wanted'",
             (user_id,),
         ).fetchone()
-        sort_order = (row["min_order"] - 1) if row["min_order"] is not None else 0
+        sort_order = (row["max_order"] + 1) if row["max_order"] is not None else 0
 
     cur = db_connection.execute(
         "INSERT OR IGNORE INTO tbr_entries (user_id, book_id, status, sort_order) VALUES (?, ?, ?, ?)",
@@ -871,6 +894,7 @@ def _row_to_library_catalog_entry(row: sqlite3.Row) -> LibraryCatalogEntry:
         authors=json.loads(row["authors"]) if row["authors"] else [],
         published_date=row["published_date"],
         grimmory_id=row["grimmory_id"],
+        format=row["format"],
     )
 
 
@@ -878,11 +902,11 @@ def replace_library_catalog(db_connection: sqlite3.Connection, entries: list[Lib
     db_connection.execute("DELETE FROM library_catalog")
     db_connection.executemany(
         """
-        INSERT INTO library_catalog (title, isbn13, isbn10, authors, published_date, grimmory_id)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO library_catalog (title, isbn13, isbn10, authors, published_date, grimmory_id, format)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         [
-            (e.title, e.isbn13, e.isbn10, json.dumps(e.authors), e.published_date, e.grimmory_id)
+            (e.title, e.isbn13, e.isbn10, json.dumps(e.authors), e.published_date, e.grimmory_id, e.format)
             for e in entries
         ],
     )
@@ -912,6 +936,33 @@ def search_library_catalog(
         (like, like, limit),
     ).fetchall()
     return [_row_to_library_catalog_entry(r) for r in rows]
+
+
+def set_audiobook_pairing(
+    db_connection: sqlite3.Connection, audiobook_grimmory_id: int, ebook_grimmory_id: int
+) -> None:
+    db_connection.execute(
+        """
+        INSERT INTO audiobook_pairings (audiobook_grimmory_id, ebook_grimmory_id) VALUES (?, ?)
+        ON CONFLICT(audiobook_grimmory_id) DO UPDATE SET ebook_grimmory_id = excluded.ebook_grimmory_id
+        """,
+        (audiobook_grimmory_id, ebook_grimmory_id),
+    )
+    db_connection.commit()
+
+
+def clear_audiobook_pairing(db_connection: sqlite3.Connection, audiobook_grimmory_id: int) -> None:
+    db_connection.execute(
+        "DELETE FROM audiobook_pairings WHERE audiobook_grimmory_id = ?", (audiobook_grimmory_id,)
+    )
+    db_connection.commit()
+
+
+def get_audiobook_pairings(db_connection: sqlite3.Connection) -> dict[int, int]:
+    rows = db_connection.execute(
+        "SELECT audiobook_grimmory_id, ebook_grimmory_id FROM audiobook_pairings"
+    ).fetchall()
+    return {row["audiobook_grimmory_id"]: row["ebook_grimmory_id"] for row in rows}
 
 
 def get_library_sync_state(db_connection: sqlite3.Connection) -> Optional[LibrarySyncState]:

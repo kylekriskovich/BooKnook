@@ -174,6 +174,28 @@ def test_audiobook_tiles_use_generic_labels_when_book_format_unknown():
     assert by_label["Time Spent Reading"] == "30m"
 
 
+def test_is_audiobook_param_overrides_book_format():
+    # Under the audiobook-pairing model an entry's own book is always the ebook - callers showing
+    # a paired audiobook's own stats (e.g. the Listening tab) pass is_audiobook explicitly rather
+    # than relying on entry.book.format, which is never "AUDIOBOOK" in that case.
+    entry = _entry(status="reading", format="EPUB")
+    sessions = [_audiobook_session("2026-01-01", duration_seconds=1800)]
+    tiles = stat_tiles.build_book_tiles(entry, sessions, is_audiobook=True)
+    by_label = {t["label"]: t["value"] for t in tiles}
+    assert by_label["Listening Days"] == "1"
+    assert by_label["Time Spent Listening"] == "30m"
+
+
+def test_is_audiobook_true_suppresses_pages_per_day_fallback_with_no_sessions():
+    # "Pages per day" is ebook-specific wording and shouldn't appear as a no-data stand-in on a
+    # Listening tab, even though page_count/started_at are set (see test_no_sessions_reading_with_
+    # page_count_falls_back_to_pages_per_day for the is_audiobook=False/default behavior this must
+    # not disturb).
+    entry = _entry(status="reading", started_at="2026-01-01", page_count=300)
+    tiles = stat_tiles.build_book_tiles(entry, [], today=dt.date(2026, 1, 11), is_audiobook=True)
+    assert not any(t["label"] == "Pages per day" for t in tiles)
+
+
 def test_audiobook_session_with_zero_duration_is_not_meaningful():
     entry = _entry(status="reading")
     sessions = [_audiobook_session("2026-01-01", duration_seconds=0)]

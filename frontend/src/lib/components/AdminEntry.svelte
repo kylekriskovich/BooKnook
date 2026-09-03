@@ -3,6 +3,7 @@
 	import { api, ApiError, unwrap } from '$lib/api/client';
 	import type { components } from '$lib/api/schema';
 	import { adminMatchTarget } from '$lib/stores/adminMatch.svelte';
+	import { adminPairTarget } from '$lib/stores/adminPair.svelte';
 
 	type AdminEntry = components['schemas']['AdminEntryOut'];
 
@@ -10,10 +11,12 @@
 		row,
 		mode,
 		matchable = true
-	}: { row: AdminEntry; mode: 'needed' | 'owned'; matchable?: boolean } = $props();
+	}: { row: AdminEntry; mode: 'needed' | 'owned' | 'audiobook'; matchable?: boolean } = $props();
 
 	let unmatching = $state(false);
 	let unmatchError = $state<string | null>(null);
+	let unpairing = $state(false);
+	let unpairError = $state<string | null>(null);
 
 	function openMatchSheet() {
 		if (row.id == null) return;
@@ -38,6 +41,30 @@
 			unmatching = false;
 		}
 	}
+
+	function openPairSheet() {
+		if (row.grimmory_id == null) return;
+		adminPairTarget.set(row.grimmory_id, row.title);
+	}
+
+	async function unpair() {
+		if (row.grimmory_id == null) return;
+		unpairing = true;
+		unpairError = null;
+		try {
+			unwrap(
+				await api.POST('/api/admin/audiobooks/{audiobook_grimmory_id}/pair', {
+					params: { path: { audiobook_grimmory_id: row.grimmory_id } },
+					body: { ebook_grimmory_id: null }
+				})
+			);
+			await invalidateAll();
+		} catch (err) {
+			unpairError = err instanceof ApiError ? err.message : 'Could not reach the server — try again.';
+		} finally {
+			unpairing = false;
+		}
+	}
 </script>
 
 <li class="entry-card">
@@ -50,7 +77,11 @@
 		{#if row.wanted_by.length && mode === 'needed'}
 			<span class="wanted-by">Wanted by: {row.wanted_by.join(', ')}</span>
 		{/if}
+		{#if mode === 'audiobook' && row.paired_ebook_title}
+			<span class="wanted-by">Paired with: {row.paired_ebook_title}</span>
+		{/if}
 		{#if unmatchError}<span class="error">{unmatchError}</span>{/if}
+		{#if unpairError}<span class="error">{unpairError}</span>{/if}
 	</div>
 	{#if mode === 'needed' && matchable && row.id != null}
 		<button
@@ -65,5 +96,20 @@
 		<button type="button" class="btn btn-ghost" disabled={unmatching} onclick={unmatch}>
 			Unmatch
 		</button>
+	{:else if mode === 'audiobook'}
+		{#if row.paired_ebook_title}
+			<button type="button" class="btn btn-ghost" disabled={unpairing} onclick={unpair}>
+				Unpair
+			</button>
+		{:else if row.grimmory_id != null}
+			<button
+				type="button"
+				class="btn btn-ghost"
+				popovertarget="admin-pair-sheet"
+				onclick={openPairSheet}
+			>
+				Pair to ebook
+			</button>
+		{/if}
 	{/if}
 </li>

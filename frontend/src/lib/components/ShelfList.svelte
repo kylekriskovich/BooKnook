@@ -21,7 +21,8 @@
 		entries = initialEntries;
 	});
 
-	const draggable = $derived(status === 'wanted');
+	let editing = $state(false);
+	const draggable = $derived(status === 'wanted' && editing);
 
 	function handleConsider(event: CustomEvent<{ items: typeof entries }>) {
 		entries = event.detail.items;
@@ -42,6 +43,11 @@
 		</a>
 		<span class="list-title">{label}</span>
 		<span class="list-count">{entries.length}</span>
+		{#if status === 'wanted' && entries.length > 1}
+			<button type="button" class="btn btn-ghost" onclick={() => (editing = !editing)}>
+				{editing ? 'Done' : 'Edit'}
+			</button>
+		{/if}
 	</div>
 
 	{#if entries.length}

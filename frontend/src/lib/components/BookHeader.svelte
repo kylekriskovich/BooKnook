@@ -18,6 +18,9 @@
 				{entry.owned ? 'In Library' : 'Requested'}
 			</span>
 		{/if}
+		{#if entry.has_paired_audiobook}
+			<span class="badge badge-audiobook">Audiobook available</span>
+		{/if}
 		{#if entry.book.author}
 			<div class="book-modal-meta">
 				<svg viewBox="0 -960 960 960" fill="currentColor" aria-hidden="true">

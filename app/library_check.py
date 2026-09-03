@@ -16,6 +16,7 @@ from app.models import (
     add_tbr_entry,
     covers_dir,
     create_book,
+    get_audiobook_pairings,
     get_connection,
     get_library_settings,
     get_user,
@@ -91,6 +92,10 @@ ABANDONED_READ_STATUSES = {"WONT_READ", "ABANDONED"}
 # in practice. Flip this back to True to re-enable; nothing else needs to change, since every
 # audiobook-specific branch elsewhere only ever triggers for a book whose format is "AUDIOBOOK",
 # and no book gets tagged that way while this is False.
+#
+# The paired-audiobook status pass in sync_user_reading_status (search for get_audiobook_pairings)
+# is independent of this flag - it never treats an audiobook as its own trackable book, only as a
+# secondary status signal for its paired ebook, so it doesn't re-enable anything this flag gates.
 AUDIOBOOKS_ENABLED = False
 
 
@@ -164,6 +169,7 @@ def _book_to_catalog_entry(book: dict) -> LibraryCatalogEntry:
         authors=metadata.get("authors") or [],
         published_date=metadata.get("publishedDate"),
         grimmory_id=book.get("id"),
+        format=(book.get("primaryFile") or {}).get("bookType"),
     )
 
 # Function Name: fetch_catalog
@@ -243,6 +249,14 @@ def _normalize_isbn(isbn: str) -> str:
 def find_catalog_match(
     title: str, isbn: Optional[str], author: Optional[str], catalog: list[LibraryCatalogEntry]
 ) -> Optional[LibraryCatalogEntry]:
+    # Audiobooks are never a valid match target for a plain title/ISBN/author lookup - an ebook and
+    # its audiobook counterpart can share identical metadata in Grimmory, and without this a book
+    # only available as an audiobook could get badged "In Library" (see app/main.py's
+    # _tbr_entries_for_user) or auto-matched as owned via an edition that isn't actually readable.
+    # The only sanctioned way to associate the two is an explicit admin pairing (see
+    # app.models.audiobook_pairings) - resolve_catalog_match's manual_match_grimmory_id branch
+    # bypasses this function entirely, so an admin can still explicitly pin to an audiobook id.
+    catalog = [entry for entry in catalog if entry.format != "AUDIOBOOK"]
     if isbn:
         normalized = _normalize_isbn(isbn)
         for entry in catalog:
@@ -750,7 +764,8 @@ def sync_user_reading_status(
     if user is None:
         # Deleted mid-sync - surface the exception type callers expect, not an AttributeError.
         raise LibraryCheckUnavailable(f"No such user_id={user_id}")
-    books = _dedupe_by_grimmory_id(fetch_user_books(base_url, access_token))
+    raw_books = _dedupe_by_grimmory_id(fetch_user_books(base_url, access_token))
+    books = raw_books
     if not AUDIOBOOKS_ENABLED:
         books = [book for book in books if not _is_audiobook(book)]
     catalog = [_book_to_catalog_entry(book) for book in books]
@@ -824,6 +839,66 @@ def sync_user_reading_status(
         )
         _sync_book_metadata(db_connection, new_book.id, new_entry.id, book)
         _maybe_download_cover(db_connection, base_url, access_token, new_book.id, book.get("id"))
+
+    # Pass 2b: paired audiobooks (see app.models.audiobook_pairings) contribute their own
+    # reading/finished status onto their paired ebook's entry - never as a separate trackable book
+    # (unpaired audiobooks are excluded from `books`/`catalog` above and never reach here). Runs
+    # after the ebook-only passes above so the ebook's own status/dates are always established
+    # first; _apply_status never downgrades, so a tie always favors what Pass 1/2 just set, and an
+    # audiobook only ever pushes the entry further (wanted->reading->finished), using its own
+    # dateFinished when it's the one supplying the upgrade.
+    pairings = get_audiobook_pairings(db_connection)
+    paired_audiobooks = [b for b in raw_books if _is_audiobook(b) and b.get("id") in pairings]
+    if paired_audiobooks:
+        entries_by_ebook_grimmory_id = {
+            e.book.grimmory_book_id: e
+            for e in list_tbr_entries_with_books(db_connection, user_id)
+            if e.book.grimmory_book_id is not None
+        }
+        for audiobook_book in paired_audiobooks:
+            target = _target_status(audiobook_book)
+            if target is None:
+                continue  # unread/paused/abandoned on the audiobook side - no effect, by design
+            ebook_grimmory_id = pairings[audiobook_book["id"]]
+            entry = entries_by_ebook_grimmory_id.get(ebook_grimmory_id)
+            if entry is not None:
+                _apply_status(
+                    db_connection, entry.id, entry.status, entry.started_at, target, audiobook_book
+                )
+                audiobook_progress = audiobook_book.get("audiobookProgress") or {}
+                set_tbr_entry_audiobook_progress_percent(
+                    db_connection, entry.id, audiobook_progress.get("percentage")
+                )
+                continue
+            ebook_idx = books_by_grimmory_id.get(ebook_grimmory_id)
+            if ebook_idx is None:
+                continue  # ebook isn't in this user's own Grimmory book list at all
+            catalog_entry = catalog[ebook_idx]
+            if not catalog_entry.title:
+                continue
+            new_book = create_book(
+                db_connection,
+                title=catalog_entry.title,
+                author=", ".join(catalog_entry.authors) or None,
+                isbn=catalog_entry.isbn13 or catalog_entry.isbn10,
+                published_date=catalog_entry.published_date,
+            )
+            new_entry = add_tbr_entry(db_connection, user_id, new_book.id)
+            _apply_status(
+                db_connection, new_entry.id, new_entry.status, new_entry.started_at, target, audiobook_book
+            )
+            # Always the ebook's own data - never the audiobook's. _sync_book_metadata also writes
+            # audiobook_progress_percent (from whichever book dict it's given), always None for a
+            # plain ebook dict - the real audiobook-derived value below must be written after this
+            # call, not before, or this would clobber it straight back to None.
+            _sync_book_metadata(db_connection, new_book.id, new_entry.id, books[ebook_idx])
+            audiobook_progress = audiobook_book.get("audiobookProgress") or {}
+            set_tbr_entry_audiobook_progress_percent(
+                db_connection, new_entry.id, audiobook_progress.get("percentage")
+            )
+            _maybe_download_cover(
+                db_connection, base_url, access_token, new_book.id, books[ebook_idx].get("id")
+            )
 
     # Pass 3: Want to Read shelf (always on) - pulls in any unknown Grimmory-shelf book (additive
     # only), then re-diffs desired vs. current membership every sync as a standing invariant.

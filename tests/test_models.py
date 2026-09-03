@@ -158,13 +158,13 @@ def test_add_tbr_entry_first_wanted_entry_gets_sort_order_zero(conn):
     assert entry.sort_order == 0
 
 
-def test_add_tbr_entry_new_wanted_entries_go_to_the_top(conn):
+def test_add_tbr_entry_new_wanted_entries_go_to_the_bottom(conn):
     user = models.create_user(conn, "Alice")
     dune = models.create_book(conn, "Dune")
     hobbit = models.create_book(conn, "The Hobbit")
     first = models.add_tbr_entry(conn, user.id, dune.id)
     second = models.add_tbr_entry(conn, user.id, hobbit.id)
-    assert second.sort_order < first.sort_order
+    assert second.sort_order > first.sort_order
 
 
 def test_add_tbr_entry_leaves_sort_order_none_for_non_wanted_status(conn):
@@ -351,3 +351,31 @@ def test_search_library_catalog_round_trips_grimmory_id(conn):
         [models.LibraryCatalogEntry(title="Dune", isbn13=None, isbn10=None, authors=[], grimmory_id=42)],
     )
     assert [e.grimmory_id for e in models.search_library_catalog(conn, "dune")] == [42]
+
+
+def test_get_library_catalog_round_trips_format(conn):
+    models.replace_library_catalog(
+        conn,
+        [models.LibraryCatalogEntry(title="Dune", isbn13=None, isbn10=None, authors=[], format="AUDIOBOOK")],
+    )
+    assert [e.format for e in models.get_library_catalog(conn)] == ["AUDIOBOOK"]
+
+
+# --- audiobook_pairings ---
+
+
+def test_set_audiobook_pairing_round_trips(conn):
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=2, ebook_grimmory_id=1)
+    assert models.get_audiobook_pairings(conn) == {2: 1}
+
+
+def test_set_audiobook_pairing_overwrites_existing_pairing_for_same_audiobook(conn):
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=2, ebook_grimmory_id=1)
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=2, ebook_grimmory_id=99)
+    assert models.get_audiobook_pairings(conn) == {2: 99}
+
+
+def test_clear_audiobook_pairing_removes_it(conn):
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=2, ebook_grimmory_id=1)
+    models.clear_audiobook_pairing(conn, audiobook_grimmory_id=2)
+    assert models.get_audiobook_pairings(conn) == {}

@@ -169,6 +169,43 @@ def test_api_home_lists_shelves(client):
     assert shelves["finished"]["entries"] == []
 
 
+def test_api_home_entry_flags_paired_audiobook_availability(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    models.set_library_settings(
+        conn, base_url="https://grimmory.example.com", username="tbr-sync", password="hunter2",
+        sync_interval_minutes=60,
+    )
+    paired_book = models.create_book(conn, title="Dune", author="Frank Herbert")
+    models.add_tbr_entry(conn, user.id, paired_book.id)
+    unpaired_book = models.create_book(conn, title="Project Hail Mary", author="Andy Weir")
+    models.add_tbr_entry(conn, user.id, unpaired_book.id)
+    models.replace_library_catalog(
+        conn,
+        [
+            models.LibraryCatalogEntry(
+                title="Dune", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+                grimmory_id=1, format="EPUB",
+            ),
+            models.LibraryCatalogEntry(
+                title="Project Hail Mary", isbn13=None, isbn10=None, authors=["Andy Weir"],
+                grimmory_id=2, format="EPUB",
+            ),
+        ],
+    )
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=99, ebook_grimmory_id=1)
+    conn.close()
+
+    response = client.get("/api/home")
+
+    entries = {
+        e["book"]["title"]: e["has_paired_audiobook"]
+        for shelf in response.json()["shelves"] for e in shelf["entries"]
+    }
+    assert entries["Dune"] is True
+    assert entries["Project Hail Mary"] is False
+
+
 def test_api_home_finished_shelf_uses_client_today_not_server_utc(client, monkeypatch):
     # Regression test: on Jan 1, the server's UTC clock can still read Dec 31 of the previous year
     # for a viewer east of UTC (see app/main.py:_resolve_client_today) - the "Finished in {year}"
@@ -477,10 +514,12 @@ def test_api_book_detail_includes_tiles_and_burndown(client, monkeypatch):
     assert any(t["label"] == "Reading Days" for t in body["tiles"])
 
 
-def test_api_book_detail_falls_back_to_audiobook_progress_percent(client, monkeypatch):
-    # Grimmory never populates endProgress on AUDIOBOOK-type reading sessions (see
-    # app/stat_tiles.py:_has_meaningful_progress) - progress_percent must fall back to the
-    # independently-synced tbr_entries.audiobook_progress_percent instead of coming back None.
+def test_api_book_detail_does_not_fall_back_to_audiobook_progress_percent_when_unpaired(client, monkeypatch):
+    # entry.audiobook_progress_percent now belongs to a *paired* audiobook (see
+    # library_check.sync_user_reading_status's Pass 2b), never this book's own - without a pairing,
+    # progress_percent must stay None rather than leaking that column's value in, and tiles must
+    # never show "Listening" labels just because the book's own format happens to be AUDIOBOOK
+    # (a legacy/unsupported state now that pairing, not format, decides the Listening tab's data).
     user = _logged_in_client(client)
     conn = models.get_connection()
     book = models.create_book(conn, title="A Memory Called Empire")
@@ -511,9 +550,64 @@ def test_api_book_detail_falls_back_to_audiobook_progress_percent(client, monkey
 
     assert response.status_code == 200
     body = response.json()
-    assert body["progress_percent"] == 63.2
-    assert any(t["label"] == "Listening Days" for t in body["tiles"])
-    assert any(t["label"] == "Time Spent Listening" for t in body["tiles"])
+    assert body["progress_percent"] is None
+    assert not any(t["label"] == "Listening Days" for t in body["tiles"])
+    assert any(t["label"] == "Reading Days" for t in body["tiles"])
+    assert body["entry"]["has_paired_audiobook"] is False
+    assert body["audiobook_tiles"] == []
+    assert body["audiobook_progress_percent"] is None
+
+
+def test_api_book_detail_includes_paired_audiobook_stats(client, monkeypatch):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    ebook = models.create_book(conn, title="A Memory Called Empire")
+    models.set_book_grimmory_id(conn, ebook.id, 42)
+    entry = models.add_tbr_entry(conn, user.id, ebook.id, status="reading")
+    models.set_tbr_entry_started_at(conn, entry.id, "2026-01-01", manual=True)
+    models.set_tbr_entry_audiobook_progress_percent(conn, entry.id, 63.2)
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=99, ebook_grimmory_id=42)
+    models.set_grimmory_refresh_token(conn, user.id, "stored-refresh")
+    conn.close()
+
+    def fake_sessions(base_url, token, book_id):
+        if book_id == 42:
+            return [
+                {
+                    "startTime": "2026-01-01T10:00:00Z",
+                    "endProgress": 10.0,
+                    "progressDelta": 10.0,
+                    "durationSeconds": 600,
+                }
+            ]
+        assert book_id == 99
+        return [
+            {
+                "bookType": "AUDIOBOOK",
+                "startTime": "2026-01-02T10:00:00Z",
+                "endProgress": None,
+                "progressDelta": None,
+                "durationSeconds": 1800,
+            }
+        ]
+
+    monkeypatch.setattr(grimmory_auth, "get_valid_access_token", lambda conn, u: "access-token")
+    monkeypatch.setattr(library_check, "fetch_reading_sessions_for_book", fake_sessions)
+
+    response = client.get(f"/api/book/{entry.id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["entry"]["has_paired_audiobook"] is True
+    # Ebook side: real session-derived progress, "Reading" labels.
+    assert body["progress_percent"] == 10.0
+    assert any(t["label"] == "Reading Days" for t in body["tiles"])
+    # Audiobook side: no session-level progress, falls back to the synced percentage; "Listening"
+    # labels, and a burndown distinct from the ebook's own.
+    assert body["audiobook_progress_percent"] == 63.2
+    assert any(t["label"] == "Listening Days" for t in body["audiobook_tiles"])
+    assert any(t["label"] == "Time Spent Listening" for t in body["audiobook_tiles"])
+    assert body["audiobook_burndown"] != body["burndown"]
 
 
 def test_api_book_detail_pages_per_day_uses_client_today_not_server_utc(client, monkeypatch):
@@ -921,6 +1015,28 @@ def test_api_search_library_finds_catalog_match(client):
     assert body["results"][0]["title"] == "Dune"
 
 
+def test_api_search_library_never_returns_audiobooks(client):
+    _logged_in_client(client)
+    conn = models.get_connection()
+    models.replace_library_catalog(
+        conn,
+        [
+            models.LibraryCatalogEntry(
+                title="Dune", isbn13=None, isbn10=None, authors=["Frank Herbert"], format="EPUB",
+            ),
+            models.LibraryCatalogEntry(
+                title="Dune (Audiobook)", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+                format="AUDIOBOOK",
+            ),
+        ],
+    )
+    conn.close()
+
+    response = client.get("/api/search/library", params={"q": "dune"})
+
+    assert [r["title"] for r in response.json()["results"]] == ["Dune"]
+
+
 def test_api_search_uses_hardcover_when_configured(client, monkeypatch):
     _logged_in_client(client)
     conn = models.get_connection()
@@ -1072,6 +1188,211 @@ def test_api_admin_manual_match_moves_entry_to_owned_using_book_fields(client):
     assert owned["author"] == "Some Author"
     assert owned["manually_matched"] is True
     assert owned["grimmory_id"] == 42
+
+
+def test_api_admin_splits_audiobooks_into_their_own_list(client):
+    _configure_library_check()
+    conn = models.get_connection()
+    models.replace_library_catalog(
+        conn,
+        [
+            models.LibraryCatalogEntry(
+                title="Dune", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+                grimmory_id=1, format="EPUB",
+            ),
+            models.LibraryCatalogEntry(
+                title="Dune (Audiobook)", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+                grimmory_id=2, format="AUDIOBOOK",
+            ),
+        ],
+    )
+    conn.close()
+
+    body = client.get("/api/admin").json()
+
+    assert [row["title"] for row in body["owned_entries"]] == ["Dune"]
+    assert [row["title"] for row in body["audiobook_entries"]] == ["Dune (Audiobook)"]
+
+
+def test_api_admin_pair_audiobook_sets_paired_ebook_title(client):
+    _configure_library_check()
+    conn = models.get_connection()
+    models.replace_library_catalog(
+        conn,
+        [
+            models.LibraryCatalogEntry(
+                title="Dune", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+                grimmory_id=1, format="EPUB",
+            ),
+            models.LibraryCatalogEntry(
+                title="Dune (Audiobook)", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+                grimmory_id=2, format="AUDIOBOOK",
+            ),
+        ],
+    )
+    conn.close()
+
+    response = client.post("/api/admin/audiobooks/2/pair", json={"ebook_grimmory_id": 1})
+    assert response.status_code == 204
+
+    body = client.get("/api/admin").json()
+    assert body["audiobook_entries"][0]["paired_ebook_title"] == "Dune"
+
+
+def test_api_admin_pair_audiobook_unpair_clears_it(client):
+    _configure_library_check()
+    conn = models.get_connection()
+    models.replace_library_catalog(
+        conn,
+        [
+            models.LibraryCatalogEntry(
+                title="Dune", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+                grimmory_id=1, format="EPUB",
+            ),
+            models.LibraryCatalogEntry(
+                title="Dune (Audiobook)", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+                grimmory_id=2, format="AUDIOBOOK",
+            ),
+        ],
+    )
+    conn.close()
+    assert client.post("/api/admin/audiobooks/2/pair", json={"ebook_grimmory_id": 1}).status_code == 204
+
+    response = client.post("/api/admin/audiobooks/2/pair", json={"ebook_grimmory_id": None})
+    assert response.status_code == 204
+
+    body = client.get("/api/admin").json()
+    assert body["audiobook_entries"][0]["paired_ebook_title"] is None
+
+
+def test_api_admin_pair_audiobook_404s_for_non_audiobook_id(client):
+    _configure_library_check()
+    conn = models.get_connection()
+    models.replace_library_catalog(
+        conn,
+        [models.LibraryCatalogEntry(
+            title="Dune", isbn13=None, isbn10=None, authors=["Frank Herbert"], grimmory_id=1, format="EPUB",
+        )],
+    )
+    conn.close()
+
+    response = client.post("/api/admin/audiobooks/1/pair", json={"ebook_grimmory_id": None})
+
+    assert response.status_code == 404
+
+
+def test_api_admin_pair_audiobook_404s_for_unknown_ebook_id(client):
+    _configure_library_check()
+    conn = models.get_connection()
+    models.replace_library_catalog(
+        conn,
+        [models.LibraryCatalogEntry(
+            title="Dune (Audiobook)", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+            grimmory_id=2, format="AUDIOBOOK",
+        )],
+    )
+    conn.close()
+
+    response = client.post("/api/admin/audiobooks/2/pair", json={"ebook_grimmory_id": 999})
+
+    assert response.status_code == 404
+
+
+def test_api_admin_pair_audiobook_422s_when_pairing_to_another_audiobook(client):
+    _configure_library_check()
+    conn = models.get_connection()
+    models.replace_library_catalog(
+        conn,
+        [
+            models.LibraryCatalogEntry(
+                title="Dune (Audiobook)", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+                grimmory_id=2, format="AUDIOBOOK",
+            ),
+            models.LibraryCatalogEntry(
+                title="Hobbit (Audiobook)", isbn13=None, isbn10=None, authors=["J.R.R. Tolkien"],
+                grimmory_id=3, format="AUDIOBOOK",
+            ),
+        ],
+    )
+    conn.close()
+
+    response = client.post("/api/admin/audiobooks/2/pair", json={"ebook_grimmory_id": 3})
+
+    assert response.status_code == 422
+
+
+def test_api_admin_library_search_excludes_audiobooks_when_requested(client):
+    conn = models.get_connection()
+    models.replace_library_catalog(
+        conn,
+        [
+            models.LibraryCatalogEntry(
+                title="Dune", isbn13=None, isbn10=None, authors=["Frank Herbert"], format="EPUB",
+            ),
+            models.LibraryCatalogEntry(
+                title="Dune (Audiobook)", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+                format="AUDIOBOOK",
+            ),
+        ],
+    )
+    conn.close()
+
+    response = client.get(
+        "/api/admin/library-search", params={"q": "dune", "exclude_audiobooks": "true"}
+    )
+
+    assert [r["title"] for r in response.json()["results"]] == ["Dune"]
+
+
+def test_api_admin_library_search_excludes_already_paired_ebooks_when_pairing(client):
+    conn = models.get_connection()
+    models.replace_library_catalog(
+        conn,
+        [
+            models.LibraryCatalogEntry(
+                title="Dune", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+                grimmory_id=1, format="EPUB",
+            ),
+            models.LibraryCatalogEntry(
+                title="Dune (Illustrated)", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+                grimmory_id=2, format="EPUB",
+            ),
+            models.LibraryCatalogEntry(
+                title="Dune (Audiobook)", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+                grimmory_id=3, format="AUDIOBOOK",
+            ),
+        ],
+    )
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=3, ebook_grimmory_id=1)
+    conn.close()
+
+    response = client.get(
+        "/api/admin/library-search", params={"q": "dune", "exclude_audiobooks": "true"}
+    )
+
+    assert [r["title"] for r in response.json()["results"]] == ["Dune (Illustrated)"]
+
+
+def test_api_admin_library_search_does_not_exclude_paired_ebooks_for_the_general_match_picker(client):
+    # Without exclude_audiobooks (the general needed->owned Match flow), an already-paired ebook
+    # must still be selectable - the "don't suggest re-pairing" rule is specific to the audiobook
+    # picker's mode.
+    conn = models.get_connection()
+    models.replace_library_catalog(
+        conn,
+        [
+            models.LibraryCatalogEntry(
+                title="Dune", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+                grimmory_id=1, format="EPUB",
+            ),
+        ],
+    )
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=3, ebook_grimmory_id=1)
+    conn.close()
+
+    response = client.get("/api/admin/library-search", params={"q": "dune"})
+
+    assert [r["title"] for r in response.json()["results"]] == ["Dune"]
 
 
 def test_api_admin_match_rejects_duplicate_manual_match_target(client):

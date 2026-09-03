@@ -481,6 +481,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/admin/audiobooks/{audiobook_grimmory_id}/pair": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Api Admin Pair Audiobook */
+        post: operations["api_admin_pair_audiobook_api_admin_audiobooks__audiobook_grimmory_id__pair_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/admin/settings": {
         parameters: {
             query?: never;
@@ -556,6 +573,8 @@ export interface components {
              * @default false
              */
             manually_matched: boolean;
+            /** Paired Ebook Title */
+            paired_ebook_title?: string | null;
         };
         /** AdminMatchIn */
         AdminMatchIn: {
@@ -568,12 +587,19 @@ export interface components {
             needed_entries: components["schemas"]["AdminEntryOut"][];
             /** Owned Entries */
             owned_entries: components["schemas"]["AdminEntryOut"][];
+            /** Audiobook Entries */
+            audiobook_entries: components["schemas"]["AdminEntryOut"][];
             /** Library Check Enabled */
             library_check_enabled: boolean;
             /** Last Synced At */
             last_synced_at?: string | null;
             /** Last Error */
             last_error?: string | null;
+        };
+        /** AdminPairAudiobookIn */
+        AdminPairAudiobookIn: {
+            /** Ebook Grimmory Id */
+            ebook_grimmory_id?: number | null;
         };
         /** AdminSettingsOut */
         AdminSettingsOut: {
@@ -597,6 +623,25 @@ export interface components {
             progress_percent?: number | null;
             /** Estimated Page */
             estimated_page?: number | null;
+            /**
+             * Audiobook Tiles
+             * @default []
+             */
+            audiobook_tiles: components["schemas"]["StatTileOut"][];
+            /**
+             * Audiobook Burndown
+             * @default []
+             */
+            audiobook_burndown: components["schemas"]["BurndownPointOut"][];
+            /**
+             * Audiobook Burndown Day Span
+             * @default 0
+             */
+            audiobook_burndown_day_span: number;
+            /** Audiobook Progress Percent */
+            audiobook_progress_percent?: number | null;
+            /** Audiobook Estimated Page */
+            audiobook_estimated_page?: number | null;
         };
         /** BookOut */
         BookOut: {
@@ -1043,6 +1088,8 @@ export interface components {
             book: components["schemas"]["BookOut"];
             /** Owned */
             owned?: boolean | null;
+            /** Has Paired Audiobook */
+            has_paired_audiobook?: boolean | null;
             /** Finished At */
             finished_at?: string | null;
             /** Started At */
@@ -1876,6 +1923,7 @@ export interface operations {
         parameters: {
             query?: {
                 q?: string;
+                exclude_audiobooks?: boolean;
             };
             header?: never;
             path?: never;
@@ -1915,6 +1963,39 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["AdminMatchIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    api_admin_pair_audiobook_api_admin_audiobooks__audiobook_grimmory_id__pair_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                audiobook_grimmory_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdminPairAudiobookIn"];
             };
         };
         responses: {

@@ -97,16 +97,26 @@ def _pages_per_day_fallback_tile(entry, today: Optional[date] = None) -> Optiona
     return {"label": "Pages per day", "value": str(pages_per_day)}
 
 
-def build_book_tiles(entry, sessions: list[dict], today: Optional[date] = None) -> list[dict]:
+def build_book_tiles(
+    entry, sessions: list[dict], today: Optional[date] = None, is_audiobook: Optional[bool] = None
+) -> list[dict]:
     """Session-dependent tiles for one book (GET /book/{entry_id}) - only meaningful given a
     single book's own reading-session log, not aggregatable across many books without fetching
     every one's sessions (which the collection tiles below deliberately never do). `today` should
     be the caller's own local date (see app/main.py:_resolve_client_today) - defaults to the
-    server's UTC date only for direct/test callers that don't have a client to ask."""
+    server's UTC date only for direct/test callers that don't have a client to ask. `is_audiobook`
+    picks "Listening"-labeled tiles over "Reading" ones and is normally the caller's choice, not
+    derived from the entry's own book - under the audiobook-pairing model (app.models.
+    audiobook_pairings) an entry's book is always the ebook, so `sessions` may belong to either the
+    ebook or its paired audiobook depending on which stats tab called this. Defaults to
+    entry.book.format == "AUDIOBOOK" only for backward compatibility with callers that don't pass
+    it - in practice that's never true anymore, but keeps this function's behavior unchanged for
+    any caller that still relies on it."""
     today = today or today_utc()
+    if is_audiobook is None:
+        is_audiobook = entry.book.format == "AUDIOBOOK"
     tiles: list[dict] = []
     page_count = entry.book.page_count
-    is_audiobook = entry.book.format == "AUDIOBOOK"
     reading_dates = get_reading_dates(sessions)
 
     if reading_dates:
@@ -174,7 +184,8 @@ def build_book_tiles(entry, sessions: list[dict], today: Optional[date] = None) 
                 tiles.append(
                     {"label": "Estimated Completion", "value": estimated.strftime("%b %-d, %Y")}
                 )
-    else:
+    elif not is_audiobook:
+        # "Pages per day" doesn't fit as a no-listening-data-yet stand-in on a Listening tab.
         fallback = _pages_per_day_fallback_tile(entry, today)
         if fallback:
             tiles.append(fallback)

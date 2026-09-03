@@ -210,6 +210,22 @@ def test_fetch_catalog_parses_books(conn, configured_settings, monkeypatch):
     assert fake_client.get_calls[0]["headers"] == {"Authorization": "Bearer t"}
 
 
+def test_fetch_catalog_captures_format_from_primary_file(conn, configured_settings, monkeypatch):
+    books_payload = [
+        {"id": 33, "metadata": {"title": "Dune"}, "primaryFile": {"bookType": "EPUB"}},
+        {"id": 34, "metadata": {"title": "Dune (Audiobook)"}, "primaryFile": {"bookType": "AUDIOBOOK"}},
+        {"id": 35, "metadata": {"title": "No primary file"}},
+    ]
+    fake_client = FakeClient(books_payload=books_payload)
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+
+    catalog = library_check.fetch_catalog(conn)
+
+    assert catalog[0].format == "EPUB"
+    assert catalog[1].format == "AUDIOBOOK"
+    assert catalog[2].format is None
+
+
 def test_fetch_catalog_raises_on_login_failure(conn, configured_settings, monkeypatch):
     fake_client = FakeClient(login_status=401)
     monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
@@ -638,6 +654,190 @@ def test_sync_removes_already_tracked_audiobook_entry(conn, monkeypatch):
     models.set_book_format(conn, book.id, "AUDIOBOOK")
     models.add_tbr_entry(conn, user.id, book.id)
     _fake_books_client([], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    assert models.list_tbr_entries_with_books(conn, user.id) == []
+
+
+# --- find_catalog_match: audiobooks are never a valid match target ---
+
+
+def test_find_catalog_match_skips_audiobook_entries():
+    catalog = [
+        models.LibraryCatalogEntry(
+            title="Dune", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+            grimmory_id=1, format="AUDIOBOOK",
+        ),
+    ]
+    assert library_check.find_catalog_match("Dune", None, "Frank Herbert", catalog) is None
+
+
+def test_find_catalog_match_falls_back_to_non_audiobook_match():
+    catalog = [
+        models.LibraryCatalogEntry(
+            title="Dune", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+            grimmory_id=1, format="AUDIOBOOK",
+        ),
+        models.LibraryCatalogEntry(
+            title="Dune", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+            grimmory_id=2, format="EPUB",
+        ),
+    ]
+    match = library_check.find_catalog_match("Dune", None, "Frank Herbert", catalog)
+    assert match is not None
+    assert match.grimmory_id == 2
+
+
+# --- sync_user_reading_status: paired audiobook status merges onto its ebook ---
+
+
+def test_sync_paired_audiobook_creates_ebook_entry_when_none_exists(conn, monkeypatch):
+    monkeypatch.setattr(library_check, "_maybe_download_cover", lambda *a, **k: None)
+    user = models.get_or_create_user(conn, "alice")
+    ebook = _grimmory_book(title="Dune", read_status="UNREAD")
+    ebook["id"] = 1
+    ebook["primaryFile"] = {"bookType": "EPUB"}
+    audiobook = _grimmory_book(title="Dune (Audiobook)", read_status="READING")
+    audiobook["id"] = 2
+    audiobook["primaryFile"] = {"bookType": "AUDIOBOOK"}
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=2, ebook_grimmory_id=1)
+    _fake_books_client([ebook, audiobook], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entries = models.list_tbr_entries_with_books(conn, user.id)
+    assert len(entries) == 1
+    assert entries[0].book.title == "Dune"
+    assert entries[0].status == "reading"
+
+
+def test_sync_paired_audiobook_captures_its_own_progress_percent_on_new_entry(conn, monkeypatch):
+    monkeypatch.setattr(library_check, "_maybe_download_cover", lambda *a, **k: None)
+    user = models.get_or_create_user(conn, "alice")
+    ebook = _grimmory_book(title="Dune", read_status="UNREAD")
+    ebook["id"] = 1
+    ebook["primaryFile"] = {"bookType": "EPUB"}
+    audiobook = _grimmory_book(title="Dune (Audiobook)", read_status="READING")
+    audiobook["id"] = 2
+    audiobook["primaryFile"] = {"bookType": "AUDIOBOOK"}
+    audiobook["audiobookProgress"] = {"percentage": 42.5}
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=2, ebook_grimmory_id=1)
+    _fake_books_client([ebook, audiobook], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entries = models.list_tbr_entries_with_books(conn, user.id)
+    assert entries[0].audiobook_progress_percent == 42.5
+
+
+def test_sync_paired_audiobook_updates_progress_percent_on_existing_entry(conn, monkeypatch):
+    monkeypatch.setattr(library_check, "_maybe_download_cover", lambda *a, **k: None)
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
+    models.set_book_grimmory_id(conn, book.id, 1)
+    entry = models.add_tbr_entry(conn, user.id, book.id)
+    models.set_tbr_entry_status(conn, entry.id, "reading")
+    ebook = _grimmory_book(title="Dune", read_status="UNREAD")
+    ebook["id"] = 1
+    ebook["primaryFile"] = {"bookType": "EPUB"}
+    audiobook = _grimmory_book(title="Dune (Audiobook)", read_status="READING")
+    audiobook["id"] = 2
+    audiobook["primaryFile"] = {"bookType": "AUDIOBOOK"}
+    audiobook["audiobookProgress"] = {"percentage": 77.0}
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=2, ebook_grimmory_id=1)
+    _fake_books_client([ebook, audiobook], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entries = models.list_tbr_entries_with_books(conn, user.id)
+    assert entries[0].audiobook_progress_percent == 77.0
+
+
+def test_sync_paired_audiobook_upgrades_existing_wanted_entry_to_finished(conn, monkeypatch):
+    monkeypatch.setattr(library_check, "_maybe_download_cover", lambda *a, **k: None)
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
+    models.set_book_grimmory_id(conn, book.id, 1)
+    models.add_tbr_entry(conn, user.id, book.id)  # starts "wanted"
+    ebook = _grimmory_book(title="Dune", read_status="UNREAD")
+    ebook["id"] = 1
+    ebook["primaryFile"] = {"bookType": "EPUB"}
+    audiobook = _grimmory_book(
+        title="Dune (Audiobook)", read_status="READ", date_finished="2026-03-01T00:00:00Z"
+    )
+    audiobook["id"] = 2
+    audiobook["primaryFile"] = {"bookType": "AUDIOBOOK"}
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=2, ebook_grimmory_id=1)
+    _fake_books_client([ebook, audiobook], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entry = models.list_tbr_entries_with_books(conn, user.id)[0]
+    assert entry.status == "finished"
+    assert entry.finished_at == "2026-03-01T00:00:00Z"
+
+
+def test_sync_paired_audiobook_does_not_downgrade_finished_entry(conn, monkeypatch):
+    monkeypatch.setattr(library_check, "_maybe_download_cover", lambda *a, **k: None)
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
+    models.set_book_grimmory_id(conn, book.id, 1)
+    entry = models.add_tbr_entry(conn, user.id, book.id)
+    models.set_tbr_entry_status(conn, entry.id, "finished", "2026-01-01T00:00:00Z")
+    ebook = _grimmory_book(title="Dune", read_status="UNREAD")
+    ebook["id"] = 1
+    ebook["primaryFile"] = {"bookType": "EPUB"}
+    audiobook = _grimmory_book(title="Dune (Audiobook)", read_status="READING")
+    audiobook["id"] = 2
+    audiobook["primaryFile"] = {"bookType": "AUDIOBOOK"}
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=2, ebook_grimmory_id=1)
+    _fake_books_client([ebook, audiobook], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entry_after = models.list_tbr_entries_with_books(conn, user.id)[0]
+    assert entry_after.status == "finished"
+    assert entry_after.finished_at == "2026-01-01T00:00:00Z"
+
+
+def test_sync_paired_audiobook_tie_keeps_ebooks_own_finished_at(conn, monkeypatch):
+    monkeypatch.setattr(library_check, "_maybe_download_cover", lambda *a, **k: None)
+    # Ebook and audiobook both READ, with different dateFinished values - the ebook's own data,
+    # applied first, must win; the audiobook's later call is a no-op since the entry is already
+    # "finished".
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
+    models.set_book_grimmory_id(conn, book.id, 1)
+    models.add_tbr_entry(conn, user.id, book.id)  # starts "wanted"
+    ebook = _grimmory_book(title="Dune", read_status="READ", date_finished="2026-01-01T00:00:00Z")
+    ebook["id"] = 1
+    ebook["primaryFile"] = {"bookType": "EPUB"}
+    audiobook = _grimmory_book(
+        title="Dune (Audiobook)", read_status="READ", date_finished="2026-05-01T00:00:00Z"
+    )
+    audiobook["id"] = 2
+    audiobook["primaryFile"] = {"bookType": "AUDIOBOOK"}
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=2, ebook_grimmory_id=1)
+    _fake_books_client([ebook, audiobook], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entry = models.list_tbr_entries_with_books(conn, user.id)[0]
+    assert entry.status == "finished"
+    assert entry.finished_at == "2026-01-01T00:00:00Z"
+
+
+def test_sync_unpaired_audiobook_reading_has_no_effect(conn, monkeypatch):
+    user = models.get_or_create_user(conn, "alice")
+    ebook = _grimmory_book(title="Dune", read_status="UNREAD")
+    ebook["id"] = 1
+    ebook["primaryFile"] = {"bookType": "EPUB"}
+    audiobook = _grimmory_book(title="Dune (Audiobook)", read_status="READING")
+    audiobook["id"] = 2
+    audiobook["primaryFile"] = {"bookType": "AUDIOBOOK"}
+    # No models.set_audiobook_pairing call - audiobook stays unpaired.
+    _fake_books_client([ebook, audiobook], monkeypatch)
 
     library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
 

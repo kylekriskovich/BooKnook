@@ -27,7 +27,9 @@ from app.metadata import SearchResult, search_books
 from app.models import (
     User,
     add_tbr_entry,
+    clear_audiobook_pairing,
     create_book,
+    get_audiobook_pairings,
     get_book,
     get_connection,
     get_goal,
@@ -44,6 +46,7 @@ from app.models import (
     list_tbr_entries_with_books,
     remove_tbr_entry,
     search_library_catalog,
+    set_audiobook_pairing,
     set_book_manual_match_and_grimmory_id,
     set_calendar_view_preference,
     set_grimmory_admin_settings,
@@ -235,16 +238,19 @@ def health():
 
 
 def _tbr_entries_for_user(db_connection, user_id: int):
-    """TBR entries with books, enriched with the library "owned" flag and, where the library
-    match has one, its publishedDate — when the Grimmory cross-check is configured."""
+    """TBR entries with books, enriched with the library "owned" flag, whether the matched book has
+    a paired audiobook edition, and, where the library match has one, its publishedDate — when the
+    Grimmory cross-check is configured."""
     entries = list_tbr_entries_with_books(db_connection, user_id)
     if library_check.is_configured(db_connection):
         catalog = get_library_catalog(db_connection)
+        paired_ebook_ids = set(get_audiobook_pairings(db_connection).values())
         for entry in entries:
             match = library_check.find_catalog_match(
                 entry.book.title, entry.book.isbn, entry.book.author, catalog
             )
             entry.owned = match is not None
+            entry.has_paired_audiobook = match is not None and match.grimmory_id in paired_ebook_ids
             if match and match.published_date:
                 entry.book.published_date = match.published_date
     return entries
@@ -456,6 +462,7 @@ def _to_entry_out(entry) -> schemas.TBREntryOut:
         added_at=entry.added_at,
         book=_to_book_out(entry.book),
         owned=entry.owned,
+        has_paired_audiobook=entry.has_paired_audiobook,
         finished_at=entry.finished_at,
         started_at=entry.started_at,
         started_at_manual=entry.started_at_manual,
@@ -480,6 +487,22 @@ def _find_entry_detail(db_connection, user_id: int, entry_id: int):
     return next(
         (e for e in list_tbr_entries_with_books(db_connection, user_id) if e.id == entry_id), None
     )
+
+
+def _progress_and_estimated_page(entry, sessions: list[dict], fallback_percent: "float | None"):
+    """Shared by api_book_detail's ebook and audiobook (Listening tab) branches — session-derived
+    progress when available, else `fallback_percent` while "reading", converted to an estimated
+    page via entry.book.page_count (shared across both formats, since it's a property of the book,
+    not the edition)."""
+    progress_percent = stat_tiles.latest_progress(sessions) if entry.status == "reading" else None
+    if progress_percent is None and entry.status == "reading":
+        progress_percent = fallback_percent
+    estimated_page = (
+        round(progress_percent / 100 * entry.book.page_count)
+        if progress_percent is not None and entry.book.page_count
+        else None
+    )
+    return progress_percent, estimated_page
 
 
 def _to_book_span_out(span) -> schemas.BookSpanOut:
@@ -653,14 +676,36 @@ def api_book_detail(
     if entry is None:
         raise HTTPException(status_code=404, detail="Not found")
 
+    # Whether this entry's ebook has a paired audiobook (app.models.audiobook_pairings), and its
+    # grimmory id if so - keyed off entry.book.grimmory_book_id, which is more direct than the
+    # fuzzy-match-based has_paired_audiobook computation app.main._tbr_entries_for_user uses for
+    # shelf/home listings. Setting it here too means the "Audiobook available" badge (BookHeader)
+    # now also renders on this page, not just shelf/home entries.
+    audiobook_grimmory_id = None
+    if entry.book.grimmory_book_id is not None:
+        audiobook_by_ebook_id = {v: k for k, v in get_audiobook_pairings(db_connection).items()}
+        audiobook_grimmory_id = audiobook_by_ebook_id.get(entry.book.grimmory_book_id)
+    entry.has_paired_audiobook = audiobook_grimmory_id is not None
+
     sessions = []
+    audiobook_sessions = []
+    access_token = None
     base_url = os.environ.get(grimmory_auth.GRIMMORY_BASE_URL_ENV)
-    if base_url and entry.book.grimmory_book_id:
+    if base_url and (entry.book.grimmory_book_id or audiobook_grimmory_id is not None):
         access_token = grimmory_auth.get_valid_access_token(db_connection, user)
-        if access_token is not None:
+    if access_token is not None:
+        if entry.book.grimmory_book_id:
             try:
                 sessions = library_check.fetch_reading_sessions_for_book(
                     base_url, access_token, entry.book.grimmory_book_id
+                )
+            except LibraryCheckUnavailable as exc:
+                if exc.is_auth_rejection:
+                    grimmory_auth.evict_access_token(access_token)
+        if audiobook_grimmory_id is not None:
+            try:
+                audiobook_sessions = library_check.fetch_reading_sessions_for_book(
+                    base_url, access_token, audiobook_grimmory_id
                 )
             except LibraryCheckUnavailable as exc:
                 if exc.is_auth_rejection:
@@ -672,17 +717,23 @@ def api_book_detail(
             set_tbr_entry_started_at(db_connection, entry.id, derived.isoformat(), manual=False)
             entry.started_at = derived.isoformat()
 
-    tiles = stat_tiles.build_book_tiles(entry, sessions, resolved_today)
+    tiles = stat_tiles.build_book_tiles(entry, sessions, resolved_today, is_audiobook=False)
     burndown = stat_tiles.burndown_points(sessions)
-    progress_percent = stat_tiles.latest_progress(sessions) if entry.status == "reading" else None
-    if progress_percent is None and entry.status == "reading":
-        # Audiobooks never get session-derived progress (Grimmory doesn't log it) - fall back to
-        # the independently-synced value instead.
-        progress_percent = entry.audiobook_progress_percent
-    estimated_page = (
-        round(progress_percent / 100 * entry.book.page_count)
-        if progress_percent is not None and entry.book.page_count
-        else None
+    # No audiobook-progress fallback here anymore - that's the Listening tab's job below, now that
+    # one exists. entry.audiobook_progress_percent holds the paired audiobook's own progress (see
+    # library_check.sync_user_reading_status), not this book's own, so it shouldn't leak into the
+    # ebook side's page-count math.
+    progress_percent, estimated_page = _progress_and_estimated_page(entry, sessions, None)
+
+    audiobook_tiles = stat_tiles.build_book_tiles(
+        entry, audiobook_sessions, resolved_today, is_audiobook=True
+    )
+    audiobook_burndown = stat_tiles.burndown_points(audiobook_sessions)
+    # entry.audiobook_progress_percent may be stale (a since-removed pairing's leftover value) -
+    # only trust it as a fallback while a pairing actually exists right now.
+    audiobook_fallback_percent = entry.audiobook_progress_percent if audiobook_grimmory_id is not None else None
+    audiobook_progress_percent, audiobook_estimated_page = _progress_and_estimated_page(
+        entry, audiobook_sessions, audiobook_fallback_percent
     )
 
     return schemas.BookDetailOut(
@@ -692,6 +743,13 @@ def api_book_detail(
         burndown_day_span=stat_tiles.burndown_day_span(burndown),
         progress_percent=progress_percent,
         estimated_page=estimated_page,
+        audiobook_tiles=[_to_tile_out(t) for t in audiobook_tiles],
+        audiobook_burndown=[
+            schemas.BurndownPointOut(date=d, remaining_percent=r) for d, r in audiobook_burndown
+        ],
+        audiobook_burndown_day_span=stat_tiles.burndown_day_span(audiobook_burndown),
+        audiobook_progress_percent=audiobook_progress_percent,
+        audiobook_estimated_page=audiobook_estimated_page,
     )
 
 
@@ -896,7 +954,12 @@ def api_search_library(
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
     query = q.strip()
-    catalog_matches = search_library_catalog(db_connection, query)
+    # Audiobooks are never a valid search-to-add result for a regular user - only the paired ebook
+    # (if any) is listable/searchable in BooKnook. See find_catalog_match's own audiobook guard for
+    # the parallel rule on the owned-check side.
+    catalog_matches = [
+        entry for entry in search_library_catalog(db_connection, query) if entry.format != "AUDIOBOOK"
+    ]
     results = [
         schemas.SearchResultOut(
             title=entry.title,
@@ -1086,6 +1149,7 @@ def api_admin(db_connection: sqlite3.Connection = Depends(get_db)):
     sync_state = None
     needed_entries = [_requested_row(e) for e in aggregate_entries]
     owned_entries = []
+    audiobook_entries = []
     if library_check_enabled:
         catalog = get_library_catalog(db_connection)
         sync_state = get_library_sync_state(db_connection)
@@ -1094,6 +1158,7 @@ def api_admin(db_connection: sqlite3.Connection = Depends(get_db)):
         wanted_by_for_catalog: dict[int, list[str]] = {}
         needed_entries = []
         manual_owned_rows = []
+        manual_audiobook_rows = []
         # Catalog entries already shown via a manual-match row below - skip in the plain pass.
         represented_catalog_ids: set[int] = set()
         for entry in aggregate_entries:
@@ -1105,7 +1170,10 @@ def api_admin(db_connection: sqlite3.Connection = Depends(get_db)):
                 row = _requested_row(entry)
                 row["grimmory_id"] = match.grimmory_id
                 row["manually_matched"] = True
-                manual_owned_rows.append(row)
+                if match.format == "AUDIOBOOK":
+                    manual_audiobook_rows.append(row)
+                else:
+                    manual_owned_rows.append(row)
                 represented_catalog_ids.add(id(match))
             else:
                 wanted_by_for_catalog[id(match)] = entry.wanted_by
@@ -1113,14 +1181,28 @@ def api_admin(db_connection: sqlite3.Connection = Depends(get_db)):
         catalog_rows = [
             _catalog_row(c, wanted_by_for_catalog.get(id(c), []))
             for c in catalog
-            if id(c) not in represented_catalog_ids
+            if id(c) not in represented_catalog_ids and c.format != "AUDIOBOOK"
+        ]
+        audiobook_catalog_rows = [
+            _catalog_row(c, wanted_by_for_catalog.get(id(c), []))
+            for c in catalog
+            if id(c) not in represented_catalog_ids and c.format == "AUDIOBOOK"
         ]
         owned_entries = sorted(
             manual_owned_rows + catalog_rows, key=lambda row: (row["title"] or "").casefold()
         )
+        audiobook_entries = sorted(
+            manual_audiobook_rows + audiobook_catalog_rows,
+            key=lambda row: (row["title"] or "").casefold(),
+        )
+        pairings = get_audiobook_pairings(db_connection)
+        title_by_grimmory_id = {c.grimmory_id: c.title for c in catalog if c.grimmory_id is not None}
+        for row in audiobook_entries:
+            row["paired_ebook_title"] = title_by_grimmory_id.get(pairings.get(row["grimmory_id"]))
     return schemas.AdminOut(
         needed_entries=[schemas.AdminEntryOut(**row) for row in needed_entries],
         owned_entries=[schemas.AdminEntryOut(**row) for row in owned_entries],
+        audiobook_entries=[schemas.AdminEntryOut(**row) for row in audiobook_entries],
         library_check_enabled=library_check_enabled,
         last_synced_at=sync_state.last_synced_at if sync_state else None,
         last_error=sync_state.last_error if sync_state else None,
@@ -1135,11 +1217,23 @@ async def api_admin_library_sync():
 
 
 @app.get("/api/admin/library-search", response_model=schemas.SearchOut)
-def api_admin_library_search(q: str = "", db_connection: sqlite3.Connection = Depends(get_db)):
+def api_admin_library_search(
+    q: str = "", exclude_audiobooks: bool = False, db_connection: sqlite3.Connection = Depends(get_db)
+):
     # Ungated sibling of GET /api/search/library - the match picker must work for an admin who
-    # isn't logged into the app itself.
+    # isn't logged into the app itself. exclude_audiobooks is used by the audiobook-pairing picker
+    # (see api_admin_pair_audiobook) so it only ever offers ebooks to pair against - and, in that
+    # same mode, an ebook that's already the target of a different pairing is left out too, so the
+    # picker never suggests re-pairing an ebook that already has an audiobook edition linked.
     query = q.strip()
     catalog_matches = search_library_catalog(db_connection, query)
+    if exclude_audiobooks:
+        already_paired_ebook_ids = set(get_audiobook_pairings(db_connection).values())
+        catalog_matches = [
+            entry
+            for entry in catalog_matches
+            if entry.format != "AUDIOBOOK" and entry.grimmory_id not in already_paired_ebook_ids
+        ]
     results = [
         schemas.SearchResultOut(
             title=entry.title,
@@ -1182,6 +1276,32 @@ def api_admin_match_book(
         raise HTTPException(status_code=409, detail=detail)
 
     set_book_manual_match_and_grimmory_id(db_connection, book_id, payload.grimmory_id, payload.grimmory_id)
+    return Response(status_code=204)
+
+
+@app.post("/api/admin/audiobooks/{audiobook_grimmory_id}/pair", status_code=204)
+def api_admin_pair_audiobook(
+    audiobook_grimmory_id: int,
+    payload: schemas.AdminPairAudiobookIn,
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    catalog_by_id = {c.grimmory_id: c for c in get_library_catalog(db_connection) if c.grimmory_id is not None}
+
+    audiobook_entry = catalog_by_id.get(audiobook_grimmory_id)
+    if audiobook_entry is None or audiobook_entry.format != "AUDIOBOOK":
+        raise HTTPException(status_code=404, detail="Not an audiobook in the current catalog")
+
+    if payload.ebook_grimmory_id is None:
+        clear_audiobook_pairing(db_connection, audiobook_grimmory_id)
+        return Response(status_code=204)
+
+    ebook_entry = catalog_by_id.get(payload.ebook_grimmory_id)
+    if ebook_entry is None:
+        raise HTTPException(status_code=404, detail="Ebook not found in the current catalog")
+    if ebook_entry.format == "AUDIOBOOK":
+        raise HTTPException(status_code=422, detail="Cannot pair to another audiobook")
+
+    set_audiobook_pairing(db_connection, audiobook_grimmory_id, payload.ebook_grimmory_id)
     return Response(status_code=204)
 
 

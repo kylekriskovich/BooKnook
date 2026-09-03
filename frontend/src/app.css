@@ -723,30 +723,66 @@ main > h1:first-child {
   color: var(--danger);
 }
 
-/* Admin: Need to acquire / In library segmented control — same visually-hidden-radio + CSS
-   sibling-selector pattern as the spine/cover and grid/list toggles elsewhere (see .view-radio).
-   Always resets to "Need to acquire" on load (not a persisted preference like those two — this
-   is an occasional admin-only view, not worth a settings column for). */
+/* Admin: Need to acquire / In library / Audiobooks segmented control — same visually-hidden-radio
+   + CSS sibling-selector pattern as the spine/cover and grid/list toggles elsewhere (see
+   .view-radio). Always resets to "Need to acquire" on load (not a persisted preference like those
+   two — this is an occasional admin-only view, not worth a settings column for). */
 
 .admin-view-tabs {
   margin: 1rem 0;
 }
 
-.admin-view-owned-section {
+.admin-view-owned-section,
+.admin-view-audiobooks-section {
   display: none;
 }
 
 #admin-view-needed:checked ~ .admin-view-tabs label[for="admin-view-needed"],
-#admin-view-owned:checked ~ .admin-view-tabs label[for="admin-view-owned"] {
+#admin-view-owned:checked ~ .admin-view-tabs label[for="admin-view-owned"],
+#admin-view-audiobooks:checked ~ .admin-view-tabs label[for="admin-view-audiobooks"] {
   background: var(--accent-bg);
   color: var(--accent);
 }
 
-#admin-view-owned:checked ~ .admin-view-needed-section {
+#admin-view-owned:checked ~ .admin-view-needed-section,
+#admin-view-audiobooks:checked ~ .admin-view-needed-section {
   display: none;
 }
 
 #admin-view-owned:checked ~ .admin-view-owned-section {
+  display: block;
+}
+
+#admin-view-audiobooks:checked ~ .admin-view-audiobooks-section {
+  display: block;
+}
+
+/* Book detail: Reading / Listening segmented control — same visually-hidden-radio + CSS
+   sibling-selector pattern as the admin tabs above. Only rendered at all when the entry has a
+   paired audiobook (see BookHeader's "Audiobook available" badge for the same condition); when
+   absent, .book-view-reading-section has no toggle above it and no rule hides it, so an unpaired
+   book's page looks exactly as it did before this control existed. Always resets to "Reading" on
+   load, same reasoning as the admin tabs. */
+
+.book-view-tabs {
+  margin: 1rem 0;
+}
+
+.book-view-listening-section {
+  display: none;
+}
+
+#book-view-reading:checked ~ .book-view-tabs label[for="book-view-reading"],
+#book-view-listening:checked ~ .book-view-tabs label[for="book-view-listening"] {
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+#book-view-listening:checked ~ .book-view-reading-section {
+  display: none;
+}
+
+#book-view-listening:checked ~ .book-view-listening-section {
   display: block;
 }
 
@@ -773,6 +809,11 @@ main > h1:first-child {
 .badge-needed {
   background: rgba(198, 90, 74, 0.15);
   color: var(--danger);
+}
+
+.badge-audiobook {
+  background: rgba(168, 85, 247, 0.15);
+  color: #a855f7;
 }
 
 /* Settings form (/admin/settings) */
