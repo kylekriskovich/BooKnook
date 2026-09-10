@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """One-off cleanup for GitHub issue #22: merges local `books` rows that share the same
-grimmory_book_id (created by the sync-matching bug fixed in PR #23, since deployed) back into a
-single canonical row per Grimmory book, dropping the resulting duplicate tbr_entries. For each
-user's entries in a cluster, keeps whichever one already points at the canonical book, else the
-earliest-added one (reassigned onto canonical) — status/started_at/rating all get re-derived from
-Grimmory on the next sync regardless, so no field-level merging is needed.
+grimmory_book_id back into a single canonical row per Grimmory book, dropping the resulting
+duplicate tbr_entries. For each user's entries in a cluster, keeps whichever one already points at
+the canonical book, else the earliest-added one (reassigned onto canonical) — status/started_at/
+rating are re-derived from Grimmory on the next sync, so no field-level merging is needed.
 
 Dry run by default — prints what it would do without touching the database. Pass --apply to commit.
 

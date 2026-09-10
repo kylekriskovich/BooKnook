@@ -857,12 +857,9 @@ def test_sync_leaves_audiobook_progress_percent_none_for_non_audiobooks(conn, mo
 
 
 def test_sync_matches_by_grimmory_book_id_despite_drifted_metadata(conn, monkeypatch):
-    # Regression test for GitHub issue #22: production ended up with 11 duplicate local rows for
-    # the same Grimmory book because Pass 1 used to only re-derive a fuzzy title/isbn/author match
-    # every sync, which can silently fail once Grimmory's own metadata for a book drifts even
-    # slightly (an ISBN correction, an author list edit) - Pass 2 then treated the "unmatched"
-    # entry as a brand-new book and created a duplicate. A book that already has a known
-    # grimmory_book_id must be matched by that id directly, immune to metadata drift.
+    # Regression test for GitHub issue #22: Pass 1's fuzzy title/isbn/author match could silently
+    # fail once Grimmory's metadata drifted, so Pass 2 treated an already-known book as new and
+    # duplicated it. A book with a known grimmory_book_id must be matched by that id directly.
     user = models.get_or_create_user(conn, "alice")
     # Local cover already set so Pass 1 doesn't attempt a cover download - not the point of this
     # test (see test_shelf_sync_unassigns_book_that_transitions_off_wanted_this_sync for that path).
@@ -906,12 +903,10 @@ def test_sync_matches_by_grimmory_book_id_despite_drifted_metadata(conn, monkeyp
 
 
 def test_sync_dedupes_grimmory_response_containing_the_same_book_id_twice(conn, monkeypatch):
-    # Regression test: production kept creating duplicates even after the grimmory_book_id-first
-    # match above, because Grimmory's own GET /api/v1/books response has been observed to include
-    # the same book id more than once in a single call. books_by_grimmory_id.setdefault only ever
-    # records the *first* occurrence's index, so the repeat looked "unmatched" to Pass 2 and got a
-    # brand-new duplicate local book minted for it every time. The fetched list must be deduped by
-    # grimmory id before any matching runs, independent of what's causing Grimmory to repeat it.
+    # Regression test: Grimmory's GET /api/v1/books has been observed to repeat the same book id
+    # within one response; books_by_grimmory_id.setdefault only records the first occurrence, so
+    # the repeat looked unmatched and got duplicated. The fetched list must be deduped by
+    # grimmory id before matching runs.
     user = models.get_or_create_user(conn, "alice")
     book = models.create_book(
         conn, title="Dungeon Crawler Carl", author="Matt Dinniman", cover_url="/covers/existing.jpg"
@@ -1237,11 +1232,10 @@ def test_sync_skips_cover_download_when_local_cover_already_downloaded(conn, cov
 
 
 class PaginatedFakeClient:
-    """Fakes Grimmory's actual (nested) Page response shape — {"content": [...], "page":
-    {"totalPages": N, ...}} — confirmed against a real response 2026-07-29 after the flat-shape
-    assumption this fake originally used turned out to be wrong and let a real pagination bug
-    (truncating a 118-session book to 100) pass unit tests undetected. Returns a different page of
-    content depending on the requested `page` param."""
+    """Fakes Grimmory's actual nested Page response shape ({"content": [...], "page":
+    {"totalPages": N, ...}}) - a flat-shape assumption here previously let a real pagination bug
+    (truncating a 118-session book to 100) pass undetected. Returns a different page of content
+    per requested `page` param."""
 
     def __init__(self, pages: list[list[dict]]):
         self._pages = pages
@@ -1370,11 +1364,9 @@ def test_get_or_create_shelf_by_name_returns_existing_match_without_posting(monk
 
 
 def test_get_or_create_shelf_by_name_matches_existing_shelf_case_insensitively(monkeypatch):
-    # Regression test: a shelf named "Want To Read" (differing only in case from
-    # DEFAULT_WANT_TO_READ_SHELF_NAME's "Want to Read") must still be found by the initial GET, so
-    # a differently-cased shelf a user already has doesn't get skipped and re-created. Reproduces a
-    # production case where a Python `==` name comparison and Grimmory's own case-insensitive
-    # (MariaDB collation) duplicate-name check disagreed, permanently blocking the sync.
+    # Regression test: a differently-cased shelf ("Want To Read" vs the default "Want to Read")
+    # must still be found by the initial GET - a Python `==` name comparison and Grimmory's own
+    # case-insensitive collation used to disagree here, permanently blocking the sync.
     shelves = [{"id": 1, "name": "Want To Read", "userId": 7}]
     fake_client = ShelfFakeClient(get_responses={library_check.SHELVES_PATH: shelves})
     monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
@@ -1386,11 +1378,9 @@ def test_get_or_create_shelf_by_name_matches_existing_shelf_case_insensitively(m
 
 
 def test_get_or_create_shelf_by_name_adopts_differently_cased_shelf_after_409(monkeypatch):
-    # Regression test: the initial GET sees nothing yet (e.g. a stale/incomplete list), the POST
-    # 409s because Grimmory's own case-insensitive collation considers "Want To Read" a duplicate
-    # of "Want to Read", and only the 409-retry GET actually returns the differently-cased shelf -
-    # that retry must still recognize it rather than looping forever (production bug: this left
-    # want_to_read_shelf_id permanently unresolved for a user whose shelf was "Want To Read").
+    # Regression test: the initial GET sees a stale/incomplete list, the POST 409s on Grimmory's
+    # case-insensitive collation, and only the 409-retry GET returns the differently-cased shelf -
+    # that retry must still recognize it rather than looping forever.
     class RacyCasedShelfClient:
         def __init__(self):
             self.get_call_count = 0
@@ -1461,11 +1451,9 @@ def test_get_or_create_shelf_by_name_raises_when_created_shelf_has_no_id(monkeyp
 
 
 def test_get_or_create_shelf_by_name_adopts_shelf_created_by_a_concurrent_sync(monkeypatch):
-    # Regression test: the manual /api/settings/sync trigger and the periodic background loop can
-    # both reach this function for the same user around the same time (e.g. while the library
-    # catalog cross-check isn't configured, the periodic loop runs every 60s) - whichever POSTs
-    # second gets Grimmory's 409 SHELF_ALREADY_EXISTS. That must be treated as "someone else just
-    # created it" and adopted, not surfaced as a sync failure.
+    # Regression test: the manual sync trigger and the periodic background loop can both reach
+    # this function for the same user at once - whichever POSTs second gets Grimmory's 409
+    # SHELF_ALREADY_EXISTS, which must be adopted, not surfaced as a sync failure.
     class RacyShelfClient:
         def __init__(self):
             self.get_call_count = 0

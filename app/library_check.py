@@ -98,11 +98,8 @@ def _is_audiobook(book: dict) -> bool:
 
 class LibraryCheckUnavailable(Exception):
     """Raised when the Grimmory API can't be reached, isn't configured, or rejected a request.
-
-    status_code carries the HTTP status Grimmory returned, when known. is_auth_rejection is True
-    only for a real 401/403 - callers use it to decide whether a cached access token is worth
-    evicting (a transient 5xx/connection error doesn't mean the token itself is bad).
-    """
+    status_code is the HTTP status when known; is_auth_rejection is True only for a real 401/403,
+    letting callers decide whether to evict a cached access token."""
 
     def __init__(self, message: str, status_code: Optional[int] = None):
         super().__init__(message)
@@ -389,8 +386,8 @@ def list_own_shelves(base_url: str, access_token: str, own_grimmory_user_id: int
 
 # Function Name: _shelf_name_key
 # Description: Normalizes a shelf name for matching - Grimmory's duplicate-name check is
-#   case-insensitive (MariaDB's default collation), so this must be too or get_or_create_shelf_by_name
-#   loops forever on a 409 it can never resolve (confirmed in production).
+#   case-insensitive, so this must be too, or get_or_create_shelf_by_name loops forever on a 409
+#   it can't resolve.
 # Parameters:
 # - name (str): Raw shelf name.
 # Returns: Normalized name (str)
@@ -718,10 +715,9 @@ def _ensure_sync_to_device_shelf(db_connection, user, base_url: str, access_toke
     return shelf_id
 
 # Function Name: _dedupe_by_grimmory_id
-# Description: Keeps only the first occurrence of each Grimmory book id. Grimmory's own
-#   GET /api/v1/books response has been observed to include the same book id more than once in a
-#   single call (see issue #22) - left un-deduped, only the first occurrence gets matched in Pass 1
-#   below, and every repeat reads as "unmatched" to Pass 2, minting a duplicate local book per repeat.
+# Description: Keeps only the first occurrence of each Grimmory book id - Grimmory's own book
+#   list has been observed to repeat an id within one response (issue #22), and an un-deduped
+#   repeat reads as "unmatched" to Pass 2, minting a duplicate local book.
 # Parameters:
 # - books (list[dict]): Raw Grimmory book payloads, as returned by fetch_user_books.
 # Returns: The same payloads with repeat ids removed, order preserved.

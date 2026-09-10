@@ -776,11 +776,9 @@ def test_api_book_detail_includes_tiles_and_burndown(client, monkeypatch):
 
 
 def test_api_book_detail_does_not_fall_back_to_audiobook_progress_percent_when_unpaired(client, monkeypatch):
-    # entry.audiobook_progress_percent now belongs to a *paired* audiobook (see
-    # library_check.sync_user_reading_status's Pass 2b), never this book's own - without a pairing,
-    # progress_percent must stay None rather than leaking that column's value in, and tiles must
-    # never show "Listening" labels just because the book's own format happens to be AUDIOBOOK
-    # (a legacy/unsupported state now that pairing, not format, decides the Listening tab's data).
+    # entry.audiobook_progress_percent only applies to a *paired* audiobook (Pass 2b) - without a
+    # pairing, progress_percent must stay None and tiles must never show "Listening" labels just
+    # because the book's own format happens to be AUDIOBOOK.
     user = _logged_in_client(client)
     conn = models.get_connection()
     book = models.create_book(conn, title="A Memory Called Empire")
@@ -1103,11 +1101,10 @@ def test_api_calendar_places_reading_span_on_grid(client):
 
 
 def test_api_calendar_month_defaults_to_client_today_not_server_utc(client, monkeypatch):
-    # Regression test: the server's UTC clock rolls over up to many hours later than a viewer
-    # east of UTC's actual local day (e.g. not until 8am local at UTC+8) - without a client-
-    # supplied "today", a request made right after local midnight but before the server's UTC day
-    # has advanced would silently fall back to the *previous* month's calendar. Simulate that by
-    # mocking the server's UTC "now" into a different month than the client's real local today.
+    # Regression test: the server's UTC clock can lag hours behind a viewer east of UTC - without
+    # a client-supplied "today", a request right after local midnight could fall back to the
+    # *previous* month's calendar. Mock the server's UTC "now" into a different month than the
+    # client's local today to catch that.
     _logged_in_client(client)
     monkeypatch.setattr(main.dates, "today_utc", lambda: date(2026, 7, 31))
 

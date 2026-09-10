@@ -12,9 +12,8 @@
 	let { status, label, entries: initialEntries }: { status: string; label: string; entries: TBREntry[] } =
 		$props();
 
-	// Local, draggable copy — see ShelfRow.svelte's identical comment for why this needs its own
-	// state instead of reordering the `entries` prop directly, and why it resyncs on prop change
-	// but not after this component's own persistWantedOrder() call.
+	// Local, draggable copy of `entries` — resyncs on prop change, but not after this component's
+	// own persistWantedOrder() call, so a drag reorder doesn't visually snap back mid round-trip.
 	// svelte-ignore state_referenced_locally
 	let entries = $state(initialEntries);
 	$effect(() => {
@@ -51,9 +50,7 @@
 	</div>
 
 	{#if entries.length}
-		<!-- Full shelf page has no toggle radios — view_preference picks one branch here, same as
-		     app/templates/_shelf_books.html; app.css's #shelf-list .shelf-spine/.shelf-cover rules
-		     always show whichever one renders. -->
+		<!-- Full shelf page has no toggle radios — view_preference picks one branch here directly. -->
 		{#if auth.user?.view_preference === 'cover'}
 			<div
 				class="shelf-cover"

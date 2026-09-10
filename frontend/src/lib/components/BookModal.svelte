@@ -14,9 +14,8 @@
 		removing = true;
 		try {
 			unwrap(await api.POST('/api/tbr/{entry_id}/remove', { params: { path: { entry_id: entry.id } } }));
-			// Every page's load() re-fetches from the API rather than this component reaching into
-			// a parent's local list — one mutation pattern reused everywhere (see AddSheet.svelte),
-			// simpler than threading an onRemoved callback through ShelfRow/shelf pages/home.
+			// Re-fetches via the page's load() rather than threading an onRemoved callback through
+			// ShelfRow/shelf pages/home.
 			await invalidateAll();
 		} finally {
 			removing = false;

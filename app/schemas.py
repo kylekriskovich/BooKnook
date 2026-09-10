@@ -1,11 +1,8 @@
 """Pydantic response models for the JSON API (see the /api/* routes in app/main.py).
 
-These mirror the plain dataclasses in app/models.py and the ad hoc dicts the stat_tiles/
-reading_calendar helpers already return — the API layer's job is to give those a stable, typed
-shape for the frontend, not to change what they contain. Secrets (grimmory_refresh_token, stored
-passwords/API keys) are deliberately never included — settings responses only ever expose whether
-a secret is set, matching what the Jinja2 admin_settings.html template already showed.
-"""
+Mirrors the dataclasses in app/models.py and the ad hoc dicts stat_tiles/reading_calendar return,
+giving them a stable typed shape for the frontend. Secrets (grimmory_refresh_token, stored
+passwords/API keys) are never included — settings responses only ever expose whether one is set."""
 
 from __future__ import annotations
 
@@ -127,11 +124,10 @@ class BookSpanOut(BaseModel):
 
 
 class DayCellOut(BaseModel):
-    """active/cover/bar mirror reading_calendar.DayCell's active_spans/cover_spans/bar_spans —
-    same precedence (declutter, milestone ranking, lane-gap None-padding) already computed
-    server-side, just referencing spans by entry_id instead of embedding BookSpan objects.
-    bar_entry_ids preserves interior None gaps (an unoccupied lane below a higher occupied one);
-    it is never trimmed to a shorter list than the highest occupied lane + 1."""
+    """active/cover/bar mirror reading_calendar.DayCell's active_spans/cover_spans/bar_spans,
+    computed server-side and referenced here by entry_id instead of embedding BookSpan objects.
+    bar_entry_ids preserves interior None gaps — never trimmed shorter than the highest occupied
+    lane + 1."""
 
     date: date
     in_month: bool

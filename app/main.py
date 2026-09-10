@@ -142,14 +142,10 @@ def _verify_session_cookie(value: str) -> "int | None":
 
 
 async def spa_fallback(full_path: str) -> FileResponse:
-    """Serves a real file from the SvelteKit build (the content-hashed workbox-*.js,
-    manifest.webmanifest, robots.txt, ...) when `full_path` matches one; otherwise falls back to
-    index.html so the client-side router can resolve the route itself — deep links like
-    /book/42, or a hard refresh on /calendar, have no server-side route of their own. Pairs with
-    frontend/vite.config.ts's adapter({ fallback: 'index.html' }), which assumes exactly this.
-    Registered from inside lifespan() (see below), not as a module-level decorator — see the
-    comment there for why that ordering matters.
-    """
+    """Serves a real file from the SvelteKit build when `full_path` matches one; otherwise falls
+    back to index.html so the client-side router can resolve deep links (e.g. /book/42) that have
+    no server-side route. Registered from inside lifespan(), not as a module-level decorator —
+    see the comment there for why the ordering matters."""
     if full_path.startswith("api/") or full_path.startswith("covers/"):
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -285,12 +281,9 @@ def _finished_at_sort_key(entry) -> datetime:
 
 
 def _entries_for_shelf(entries, status: str, year: int):
-    """Entries for one shelf — for "finished", also restricted to finished_at falling within
-    the given year, matching the "Finished in {year}" label (status alone isn't enough; a
-    'finished' entry from a prior year shouldn't show up here), and sorted most-recently-finished
-    first rather than the default added_at-DESC ordering. "wanted" sorts by the user's own manual
-    order instead (see models.py:set_wanted_order) — sort_order is never None for a live wanted
-    entry once init_db's backfill has run, so this doesn't need a None-safe fallback."""
+    """Entries for one shelf — "finished" is further restricted to finished_at falling within
+    `year` (matching the "Finished in {year}" label) and sorted most-recently-finished first.
+    "wanted" sorts by the user's own manual order instead (see models.py:set_wanted_order)."""
     matching = [e for e in entries if e.status == status]
     if status == "finished":
         matching = [e for e in matching if e.finished_at and e.finished_at.startswith(str(year))]
@@ -319,17 +312,9 @@ def _shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
 
 
 def _resolve_client_today(raw: str) -> date:
-    """Parses a client-supplied "YYYY-MM-DD" local date, falling back to the current UTC date if
-    missing/malformed. Every route that needs "today" for something the user actually sees
-    (calendar highlighting/month default, book-detail's Estimated Completion/Pages-per-day,
-    /api/stats' current-year default) takes this as a query param, and the frontend always sends
-    the browser's own local date (see e.g. frontend/src/lib/utils/dates.ts) rather than leaving it
-    to the server's UTC clock - for anyone whose local timezone is ahead of UTC (e.g. UTC+8),
-    "today" per the server doesn't roll over to the viewer's actual calendar day until well into
-    their morning (at UTC+8, not until 8am local), which would otherwise show yesterday's
-    calendar, a stale year-boundary stats page, and completion estimates off by a day. A bad/
-    stale/missing query param (older cached frontend build, direct API call) falls back to the
-    previous UTC-only behavior rather than erroring."""
+    """Parses a client-supplied "YYYY-MM-DD" local date, falling back to UTC today if missing/
+    malformed - the frontend sends the browser's own local date since the server's UTC clock lags
+    behind for timezones ahead of UTC, which would otherwise show stale calendar/stats/estimates."""
     if raw:
         try:
             return date.fromisoformat(raw)
@@ -504,13 +489,11 @@ def _find_entry_detail(db_connection, user_id: int, entry_id: int):
 def _unified_progress_and_estimated_page(
     entry, session_lists: list[list[dict]], fallback_percents: list["float | None"]
 ):
-    """Unified "how far into this book am I" across every linked edition — the max of each
-    edition's own latest tracked percentage (falling back to that edition's synced fallback
-    percentage when its own session log has none, e.g. Grimmory never populates progress deltas
-    for audiobook sessions), per DESIGN-multi-edition-refactor.md Decision 5. `session_lists` and
-    `fallback_percents` are parallel lists, one entry per edition (ebook first, by convention).
-    estimated_page converts the unified percentage via entry.book.page_count, a property of the
-    book shared across every edition, not any one of them."""
+    """Unified "how far into this book am I" across every linked edition (Decision 5): the max
+    of each edition's latest tracked percentage, falling back to its synced percentage when
+    session data has none (audiobooks never get progress deltas from Grimmory).
+    `session_lists`/`fallback_percents` are parallel per-edition lists; estimated_page derives
+    from the shared book page_count."""
     if entry.status != "reading":
         return None, None
     candidates = []

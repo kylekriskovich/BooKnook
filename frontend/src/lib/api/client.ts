@@ -17,18 +17,12 @@ export class ApiError extends Error {
 	}
 }
 
-// Pulls the success-case `data` type off an openapi-fetch FetchResponse<...> result — inferring
-// it this way (capture the whole result as R, then extract from R) instead of trying to infer a
-// bare `data?: T` type parameter directly is what makes TS actually resolve it; the latter fails
-// to infer through openapi-fetch's conditional response types and silently falls back to
-// `unknown`.
+// Capturing the whole result as R then extracting `data` from it is what makes TS resolve this —
+// inferring a bare `data?: T` param directly fails through openapi-fetch's conditional types.
 type UnwrappedData<R> = R extends { data?: infer D } ? NonNullable<D> : never;
 
-/**
- * Unwraps an openapi-fetch result, throwing an ApiError (with the FastAPI HTTPException's
- * `detail` message) on failure instead of making every call site check `error`/`data` — most
- * callers just want the data or a thrown error a top-level handler can catch.
- */
+/** Unwraps an openapi-fetch result, throwing an ApiError (FastAPI's `detail` message) instead of
+ * making every call site check `error`/`data`. */
 export function unwrap<R extends { data?: unknown; error?: unknown; response: Response }>(
 	result: R
 ): UnwrappedData<R> {
