@@ -58,9 +58,10 @@ than being copied over.
 ## Confirmed
 
 - [x] `started_at` is frequently a sync-time guess, not a real start date, and specifically never
-  considers a paired audiobook's own sessions when deriving/correcting it.
-  (`app/library_check.py:575-580`, `app/main.py:714-718`) — confirmed as a real bug via a worked
-  example (audiobook-first reading); fix planned as Phase 0 of `DESIGN-multi-edition-refactor.md`.
+  considered a paired audiobook's own sessions when deriving/correcting it.
+  (`app/library_check.py:575-580`) — confirmed as a real bug via a worked example (audiobook-first
+  reading). **Fixed** — Phase 0 of `DESIGN-multi-edition-refactor.md`, `app/main.py:716-730`, on
+  `feature/linked-book-refactor`.
 - [x] Audiobook support is disabled (`AUDIOBOOKS_ENABLED = False`) with the columns/branches/pairing
   logic still in place. (`app/library_check.py:99`) — not simply dead code to delete: the pairing
   feature is a real, actively-used, independent feature (Listening tab, admin pairing UI). Superseded

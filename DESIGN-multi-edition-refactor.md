@@ -53,6 +53,11 @@ touching any code.
    - Progress is permanently invisible during a physical-reading stretch and will visibly "jump"
      once a tracked medium resumes — that's an honest reflection of a real gap, not a bug to solve.
 
+6. **Time-spent-by-medium tiles stay split, even though overall progress unifies.** "Reading Days" /
+   "Listening Days" and "Time Spent Reading" / "Time Spent Listening" remain separate — that's real,
+   different information about *how* you engaged with the book, not a progress claim, so collapsing
+   it into overall progress would lose something worth keeping.
+
 ## Physical ownership (separate from `linked_editions`)
 
 Grimmory's own "physical" tag is **catalog-wide, not per-user** — confirmed empirically (marking a
@@ -75,14 +80,13 @@ This splits into two distinct features, only the first of which is being built n
 
 ## Open questions (resolve before implementing the relevant phase)
 
-- **Time-spent-by-medium tiles** ("Reading Days" / "Listening Days", "Time Spent Reading/Listening")
-  — do these stay split by medium even though progress unifies, or collapse into one figure too?
 - **Pace / "Estimated Completion"** — combine reading+listening cadence into one projection, or keep
-  it per-medium? Combining is more useful; keeping separate is more honest about conflating two
-  different units (pages/day vs. %/day).
-- **Does Grimmory's "physical" tag have its own matchable id at all**, or is it a bare flag with no
-  catalog identity? Blocks the entire physical phase and the "accepted edge case" reconsideration
-  above until answered.
+  it per-medium? Deprioritized — acceptable for this tile to be temporarily inaccurate/left as-is
+  through the Phase 2 rework; not a blocker for anything else.
+- ~~Does Grimmory's "physical" tag have its own matchable id at all?~~ Moot — resolved by testing:
+  the tag is catalog-wide, not per-user (confirmed empirically), so it's unusable for BooKnook's
+  purposes regardless of its exact shape. Physical ownership is entirely BooKnook-native instead
+  (see "Physical ownership" section above) and doesn't touch `linked_editions` or Grimmory at all.
 
 ## Schema — `linked_editions` (settled)
 
@@ -114,8 +118,10 @@ Per-edition cached progress (if still needed rather than always live-fetched) wo
 
 Large refactor — breaking it down so each phase ships and is verifiable on its own:
 
-- **Phase 0 — no schema change.** Fix `started_at` derivation to include audiobook sessions. Low
-  risk, immediately correct, unblocks nothing else but is a clean first PR.
+- **Phase 0 — no schema change. DONE.** Fixed `started_at` derivation to consider every linked
+  edition's sessions, not just the ebook's (`app/main.py:716-730`) — takes the earliest across all,
+  matching Decision 2. Regression test:
+  `test_api_book_detail_derives_started_at_from_earliest_of_any_linked_edition`.
 - **Phase 1 — schema generalization.** Add `linked_editions`, backfill from `audiobook_pairings`,
   keep both tables live in parallel for one release (mirrors the existing
   add-then-drop pattern already used for the old `koreader_*` columns in `app/models.py:312-318`).

@@ -713,8 +713,20 @@ def api_book_detail(
                 if exc.is_auth_rejection:
                     grimmory_auth.evict_access_token(access_token)
 
-    if sessions and not entry.started_at_manual:
-        derived = stat_tiles.first_meaningful_session_date(sessions)
+    if (sessions or audiobook_sessions) and not entry.started_at_manual:
+        # Earliest across every linked edition, not just the ebook - a book started via a paired
+        # audiobook (e.g. listened to before ever opening the ebook) must derive started_at from
+        # that earlier date, not the ebook's own later first session (see
+        # DESIGN-multi-edition-refactor.md, Decision 2).
+        candidates = [
+            d
+            for d in (
+                stat_tiles.first_meaningful_session_date(sessions),
+                stat_tiles.first_meaningful_session_date(audiobook_sessions),
+            )
+            if d is not None
+        ]
+        derived = min(candidates) if candidates else None
         if derived is not None and derived.isoformat() != entry.started_at:
             set_tbr_entry_started_at(db_connection, entry.id, derived.isoformat(), manual=False)
             entry.started_at = derived.isoformat()

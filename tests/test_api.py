@@ -644,6 +644,53 @@ def test_api_book_detail_includes_paired_audiobook_stats(client, monkeypatch):
     assert body["audiobook_burndown"] != body["burndown"]
 
 
+def test_api_book_detail_derives_started_at_from_earliest_of_any_linked_edition(client, monkeypatch):
+    # Regression test: a book started via a paired audiobook before the ebook was ever opened must
+    # derive started_at from the audiobook's earlier session, not just the ebook's own (see
+    # DESIGN-multi-edition-refactor.md, Decision 2 - previously only `sessions` was consulted here).
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    ebook = models.create_book(conn, title="Dungeon Crawler Carl")
+    models.set_book_grimmory_id(conn, ebook.id, 42)
+    entry = models.add_tbr_entry(conn, user.id, ebook.id, status="reading")
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=99, ebook_grimmory_id=42)
+    models.set_grimmory_refresh_token(conn, user.id, "stored-refresh")
+    conn.close()
+
+    def fake_sessions(base_url, token, book_id):
+        if book_id == 42:  # ebook: opened later
+            return [
+                {
+                    "startTime": "2026-08-24T10:00:00Z",
+                    "endProgress": 40.0,
+                    "progressDelta": 40.0,
+                    "durationSeconds": 3600,
+                }
+            ]
+        assert book_id == 99  # audiobook: started first
+        return [
+            {
+                "bookType": "AUDIOBOOK",
+                "startTime": "2026-08-21T08:00:00Z",
+                "endProgress": None,
+                "progressDelta": None,
+                "durationSeconds": 1800,
+            }
+        ]
+
+    monkeypatch.setattr(grimmory_auth, "get_valid_access_token", lambda conn, u: "access-token")
+    monkeypatch.setattr(library_check, "fetch_reading_sessions_for_book", fake_sessions)
+
+    response = client.get(f"/api/book/{entry.id}")
+
+    assert response.status_code == 200
+    assert response.json()["entry"]["started_at"] == "2026-08-21"
+
+    conn = models.get_connection()
+    assert models.get_tbr_entry(conn, entry.id).started_at == "2026-08-21"
+    conn.close()
+
+
 def test_api_book_detail_pages_per_day_uses_client_today_not_server_utc(client, monkeypatch):
     user = _logged_in_client(client)
     conn = models.get_connection()
