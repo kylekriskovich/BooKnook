@@ -95,14 +95,10 @@ class BurndownPointOut(BaseModel):
 
 class BookDetailOut(BaseModel):
     entry: TBREntryOut
-    # Time-spent-by-medium tiles stay split (DESIGN-multi-edition-refactor.md Decision 6) -
-    # `audiobook_tiles` is the paired audiobook's own session-derived tiles (see
-    # entry.has_paired_audiobook), empty whenever there's no pairing or no session data yet.
+    # Time-spent-by-medium tiles stay split (Decision 6); audiobook_tiles is empty if unpaired.
     tiles: list[StatTileOut]
     audiobook_tiles: list[StatTileOut] = []
-    # Progress and burndown are unified across every linked edition instead (Decision 5) - one
-    # "how far into this book am I" figure and one progress-over-time line, not a separate pair
-    # per medium.
+    # Progress and burndown are unified across every linked edition instead (Decision 5).
     burndown: list[BurndownPointOut]
     burndown_day_span: int
     progress_percent: Optional[float] = None
@@ -232,9 +228,7 @@ class AdminEntryOut(BaseModel):
 class AdminOut(BaseModel):
     needed_entries: list[AdminEntryOut]
     owned_entries: list[AdminEntryOut]
-    # In-library books whose primaryFile is an audiobook - split out from owned_entries so the
-    # admin page can list them separately (see library_check.AUDIOBOOKS_ENABLED for why they're
-    # excluded from everywhere else).
+    # In-library audiobooks, split out from owned_entries (see library_check.AUDIOBOOKS_ENABLED).
     audiobook_entries: list[AdminEntryOut]
     library_check_enabled: bool
     last_synced_at: Optional[str] = None

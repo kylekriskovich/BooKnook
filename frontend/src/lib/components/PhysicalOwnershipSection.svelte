@@ -9,15 +9,10 @@
 	let ownsPhysical = $state(entry.owns_physical);
 	let saving = $state(false);
 
-	// This edition's own page count (DESIGN-multi-edition-refactor.md Decision 9) - deliberately
-	// separate from books.page_count, since a physical printing can have a genuinely different
-	// total than whichever digital file Grimmory has cataloged. Only shown/settable while
-	// ownsPhysical is true - it exists purely to convert a physical session's pages into a
-	// percentage (see app/stat_tiles.py:physical_session_to_grimmory_shape), so there's nothing
-	// for it to do otherwise.
-	// A number input's bind:value is coerced to a number (or undefined when empty) by Svelte
-	// itself, regardless of how this is typed/initialized - keep the state's actual type in sync
-	// with that instead of a string, or savePageCount's read of it throws at runtime.
+	// This edition's own page count (Decision 9) - separate from books.page_count since a
+	// physical printing can differ from Grimmory's cataloged digital file.
+	// bind:value coerces this to number|undefined regardless of initial type - keep it typed
+	// that way or savePageCount's read of it throws at runtime.
 	// svelte-ignore state_referenced_locally
 	let pageCount = $state<number | undefined>(entry.physical_page_count ?? undefined);
 	let savingPageCount = $state(false);

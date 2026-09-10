@@ -8,11 +8,8 @@
 
 	let { data } = $props();
 	let entry = $derived(data.detail.entry);
-	// entry is a fresh object on every invalidateAll() reload (e.g. after saving a physical
-	// session), even when it's still the same book - depending on entry.id directly would re-run
-	// the reset effect below on *every* save, not just on navigating to a different book, since
-	// reading entry.id still reads the entry derived first. Deriving the id on its own means the
-	// effect only re-fires when the actual number changes (Svelte compares primitives by value).
+	// entry is a fresh object on every invalidateAll() reload - deriving the id separately means
+	// the reset effect below only re-fires when the number actually changes, not on every save.
 	let entryId = $derived(entry.id);
 
 	// Owned here, not inside ReadingDatesSection, because PhysicalOwnershipSection (a separate

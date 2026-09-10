@@ -6,16 +6,12 @@
 
 	type PhysicalSession = components['schemas']['PhysicalReadingSessionOut'];
 
-	// Not edit-mode gated - logging/reviewing sessions is a normal-mode feature. Renders nothing
-	// visible on the page itself: the session list and the add/edit form both live inside one
-	// popup, opened via the "+" button in the page's own header (a plain HTML popovertarget, no JS
-	// wiring needed) or a row's own edit button once the popup is already open.
+	// Not edit-mode gated - logging/reviewing sessions is a normal-mode feature. The list and
+	// add/edit form both live inside one popup, opened via the header's "+" or a row's edit button.
 	let { entry, sessions }: { entry: TBREntry; sessions: PhysicalSession[] } = $props();
 
-	// A local <input type="datetime-local"> value is interpreted in the browser's own timezone -
-	// new Date(local) and .toISOString() convert it to/from the UTC instant the backend stores
-	// (app/dates.py:parse_instant), the same local<->UTC convention the rest of the app already
-	// uses for "today" (see localDateString in $lib/utils/dates.ts).
+	// datetime-local inputs are in the browser's own timezone; convert to/from the UTC instant
+	// the backend stores (app/dates.py:parse_instant).
 	function toDatetimeLocal(iso: string): string {
 		const d = new Date(iso);
 		const pad = (n: number) => String(n).padStart(2, '0');
@@ -53,9 +49,7 @@
 	let removingId = $state<number | null>(null);
 	let popoverEl = $state<HTMLDivElement>();
 
-	// Fires on every open/close, however triggered (the header's "+" button, a row's edit button,
-	// Cancel, Escape, or a backdrop click) - the single place that keeps the form in sync with why
-	// the popup is open. Opening with no session selected means "+": start from a blank form.
+	// Fires on every open/close, however triggered. No session selected on open means "+".
 	function onToggle(event: ToggleEvent) {
 		if (event.newState === 'open') {
 			if (editingId === null) {

@@ -3,17 +3,12 @@
 	import { api, unwrap } from '$lib/api/client';
 	import type { TBREntry } from '$lib/utils/entries';
 
-	// Only ever mounted while editingDates is true (see the {#if} wrapper in book/[id]/+page.svelte)
-	// - read-only dates show as metadata rows in BookHeader instead now, so there's nothing for this
-	// component to render outside edit mode at all, just the form. Still needs editingDates back as
-	// a bindable prop so Cancel/a successful save can close it.
+	// Only mounted while editingDates is true; read-only dates render in BookHeader instead.
 	let { entry, editingDates = $bindable(false) }: { entry: TBREntry; editingDates?: boolean } =
 		$props();
 
-	// The parent wraps this component in {#key entry.id} (see book/[id]/+page.svelte), so a new
-	// instance — and a fresh read of `entry` — is created on every book navigation; capturing only
-	// the initial value here is intentional, not the stale-on-navigation bug this warning usually
-	// flags.
+	// {#key entry.id} in the parent remounts this on every book navigation, so capturing only
+	// the initial value here isn't the stale-on-navigation bug this warning usually flags.
 	// svelte-ignore state_referenced_locally
 	let startedAt = $state(entry.started_at ?? '');
 	// svelte-ignore state_referenced_locally

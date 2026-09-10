@@ -4,9 +4,8 @@
 
 	type BurndownPoint = components['schemas']['BurndownPointOut'];
 
-	// Unified across every linked edition (DESIGN-multi-edition-refactor.md Decision 5) — one
-	// "how far into this book am I" figure and one progress-over-time line, not a separate pair
-	// per medium the way Reading/Listening tiles below still are.
+	// Unified across every linked edition (Decision 5) - one figure and one line, not a pair
+	// per medium like the Reading/Listening tiles below.
 	let {
 		progressPercent,
 		estimatedPage,

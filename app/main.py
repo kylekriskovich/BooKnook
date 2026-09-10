@@ -697,15 +697,9 @@ def api_book_detail(
     if entry is None:
         raise HTTPException(status_code=404, detail="Not found")
 
-    # Whether this entry's ebook has a paired audiobook, and its grimmory id if so - keyed off
-    # entry.book.grimmory_book_id, which is more direct than the fuzzy-match-based
-    # has_paired_audiobook computation app.main._tbr_entries_for_user uses for shelf/home listings.
-    # Setting it here too means the "Audiobook available" badge (BookHeader) now also renders on
-    # this page, not just shelf/home entries. Reads from linked_editions (DESIGN-multi-edition-
-    # refactor.md Phase 1/2) rather than get_audiobook_pairings's reverse dict - the dict approach
-    # silently collapsed if two audiobooks were ever paired to the same ebook (see
-    # ISSUES-TO-REVIEW.md); linked_editions' UNIQUE(ebook_grimmory_id, format) constraint makes that
-    # impossible instead of just unlikely.
+    # Paired audiobook id, keyed off grimmory_book_id. Reads linked_editions rather than
+    # get_audiobook_pairings's reverse dict, whose UNIQUE constraint rules out two audiobooks
+    # ever colliding on the same ebook.
     audiobook_grimmory_id = None
     if entry.book.grimmory_book_id is not None:
         linked = get_linked_editions_for_ebook(db_connection, entry.book.grimmory_book_id)
@@ -773,12 +767,9 @@ def api_book_detail(
         entry, audiobook_sessions, resolved_today, is_audiobook=True
     )
 
-    # Progress unifies as a per-source high-water mark, not a merged session list (Decision 5) - a
-    # physical stretch that reached further than the ebook's own last session must still win, the
-    # same reasoning that already applies to the audiobook fallback below. Burndown/started_at
-    # *do* flatten every source, since a day-by-day timeline is inherently cross-source.
-    # entry.audiobook_progress_percent may be stale (a since-removed pairing's leftover value) -
-    # only trust it as a fallback while a pairing actually exists right now.
+    # Progress is a per-source high-water mark, not merged (Decision 5) - a physical stretch
+    # that read further than the ebook's last session must still win. Burndown/started_at do
+    # flatten sources. audiobook_progress_percent may be stale, so trust it only if paired now.
     audiobook_fallback_percent = entry.audiobook_progress_percent if audiobook_grimmory_id is not None else None
     progress_percent, estimated_page = _unified_progress_and_estimated_page(
         entry,
@@ -1390,11 +1381,8 @@ async def api_admin_library_sync():
 def api_admin_library_search(
     q: str = "", exclude_audiobooks: bool = False, db_connection: sqlite3.Connection = Depends(get_db)
 ):
-    # Ungated sibling of GET /api/search/library - the match picker must work for an admin who
-    # isn't logged into the app itself. exclude_audiobooks is used by the audiobook-pairing picker
-    # (see api_admin_pair_audiobook) so it only ever offers ebooks to pair against - and, in that
-    # same mode, an ebook that's already the target of a different pairing is left out too, so the
-    # picker never suggests re-pairing an ebook that already has an audiobook edition linked.
+    # Ungated sibling of GET /api/search/library, for an admin not logged into the app itself.
+    # exclude_audiobooks (used by the pairing picker) also excludes ebooks already paired.
     query = q.strip()
     catalog_matches = search_library_catalog(db_connection, query)
     if exclude_audiobooks:

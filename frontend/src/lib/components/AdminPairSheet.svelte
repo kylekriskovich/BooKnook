@@ -15,20 +15,14 @@
 
 	let searchTimer: ReturnType<typeof setTimeout> | undefined = undefined;
 
-	// Grimmory audiobook editions are typically the ebook's own title plus a trailing parenthetical
-	// ("(10th Anniversary Recording)", "(Unabridged)", ...) - stripping it before pre-filling the
-	// search gives a query that's actually a substring of the ebook's title (see
-	// search_library_catalog's LIKE %query%, which needs that to match at all).
+	// Strip a trailing "(Unabridged)"-style parenthetical so the prefill is a substring of the
+	// ebook's title, matching search_library_catalog's LIKE %query%.
 	function baseTitle(title: string): string {
 		return title.replace(/\s*\([^)]*\)\s*$/, '').trim();
 	}
 
-	// Reset search state each time a different audiobook is targeted, so stale results from a
-	// previous pairing attempt never show for the newly-opened row - then pre-fill and run a search
-	// from the audiobook's own (cleaned) title as a starting point. Computes the prefill into a
-	// local instead of reading `query` back after writing it - reading query here too would make
-	// this effect depend on its own output, so every edit (including backspacing) would immediately
-	// re-trigger it and reset the input right back to the prefilled title.
+	// Computes the prefill into a local rather than reading `query` back after writing it, so
+	// this effect doesn't depend on its own output and re-trigger on every edit.
 	$effect(() => {
 		void adminPairTarget.audiobookGrimmoryId;
 		const prefill = baseTitle(adminPairTarget.title);

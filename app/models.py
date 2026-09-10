@@ -483,10 +483,8 @@ class TBREntryDetail:
     added_at: str
     book: Book
     owned: Optional[bool] = None
-    # Whether the owned-check's matched catalog entry has an admin-paired audiobook edition (see
-    # app.models.audiobook_pairings) - drives the "Audiobook available" badge, computed alongside
-    # `owned` in app.main._tbr_entries_for_user. None whenever `owned` is also None (library-check
-    # unconfigured).
+    # Drives the "Audiobook available" badge (app.models.audiobook_pairings). None when `owned`
+    # is also None (library-check unconfigured).
     has_paired_audiobook: Optional[bool] = None
     finished_at: Optional[str] = None
     started_at: Optional[str] = None

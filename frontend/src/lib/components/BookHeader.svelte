@@ -4,14 +4,8 @@
 
 	let { entry }: { entry: TBREntry } = $props();
 
-	// Flexbox align-self:stretch + aspect-ratio doesn't reliably size the cover to match this
-	// column's own content height - browsers resolve the item's main-axis (width) size from
-	// max-width before the cross-axis stretch pass even runs, so aspect-ratio ends up computing
-	// height *from* that locked width instead of the other way around (confirmed empirically: the
-	// cover always rendered at max-width's own aspect-ratio height, regardless of actual content).
-	// Measuring the real column height and applying it as an explicit height sidesteps that
-	// resolution-order issue entirely - explicit height + auto width + aspect-ratio is the
-	// well-defined, unambiguous case.
+	// align-self:stretch + aspect-ratio won't size the cover from this column's content height
+	// (width resolves before the stretch pass runs), so measure the column and set height explicitly.
 	let infoHeight = $state(0);
 </script>
 
