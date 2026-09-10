@@ -125,17 +125,26 @@ This splits into two distinct features, only the first of which is being built n
    can be marked physical before it's ever matched to an ebook. Opens the door to future stats like
    "% of owned books unread" — not built yet, just noted as a reason this is worth having beyond a
    cosmetic badge.
-2. **"I read some of this physically just now" — backend DONE, frontend entry-form UI not started.**
+2. **"I read some of this physically just now" — DONE, backend and frontend.**
    `physical_reading_sessions` (`app/models.py`), `tbr_entries.physical_page_count`, the
    `stat_tiles.physical_session_to_grimmory_shape` adapter, and endpoints (`GET`/`POST
    /api/tbr/{id}/physical-sessions`, `.../physical-sessions/{id}`, `.../physical-sessions/{id}/
    remove`, `POST .../physical-page-count`) are all shipped and wired into `api_book_detail`'s
-   started_at/progress/burndown/tiles pipeline exactly per Decisions 7-9. Verified against real
-   production data (the same cloned Docker volume used for Phase 2) — a logged session correctly
-   added its duration to "Time Spent Reading," stayed deduplicated on "Days to Complete," and its
-   page range converted to a percentage that then re-expressed correctly in *the ebook's own* page
-   count for the "Best Session" tile. No frontend form exists yet for actually logging a session —
-   only the API.
+   started_at/progress/burndown/tiles pipeline exactly per Decisions 7-9. Frontend:
+   `PhysicalReadingSessionsSection.svelte` (list + inline add/edit form) lives in the same
+   edit-mode block as `PhysicalOwnershipSection`/`ReadingDatesSection`, only rendered when
+   `entry.owns_physical`; its own page-count field lives inside `PhysicalOwnershipSection`,
+   auto-saving on blur. The "log a session" trigger is a "+" button in the page's top header, next
+   to the edit pencil, gated on `editingDates && entry.owns_physical` - `adding` is a bindable prop
+   so that external button can open the form. Verified end-to-end via real browser interaction
+   (not just API calls) against real production data: create, edit, delete, and list-display all
+   confirmed, plus the full effect on tiles/burndown ("Time Spent Reading" gained exactly the
+   logged session's duration, "Best Session" correctly re-expressed the physical page range as a
+   percentage of the *ebook's* page count). Caught and fixed a real bug along the way: the page's
+   `editingDates` reset effect depended on `entry.id` directly, but `entry` is a fresh object on
+   every `invalidateAll()` reload (even for the same book), so it was resetting edit mode after
+   every single save - fixed by isolating `entryId = $derived(entry.id)` as its own primitive
+   dependency.
 
 ## Open questions (resolve before implementing the relevant phase)
 
@@ -148,11 +157,7 @@ This splits into two distinct features, only the first of which is being built n
   (see "Physical ownership" section above) and doesn't touch `linked_editions` or Grimmory at all.
 - ~~Manual physical session table shape~~ Settled and built: `physical_reading_sessions(id,
   entry_id, start_time, end_time, start_page, end_page)`, entry-id-keyed (per-user), as sketched.
-- **Entry/edit form UI** — the API fully supports create/list/update/remove and setting
-  `physical_page_count`, but no frontend form exists yet. Still open: what the actual logging UI
-  looks like (a modal? inline on the book detail page alongside `PhysicalOwnershipSection`?), and
-  whether/how `physical_page_count` gets prompted when `owns_physical` is switched on versus edited
-  later as its own thing.
+- ~~Entry/edit form UI~~ Built - see the "I read some of this physically just now" entry above.
 
 ## Schema — `linked_editions` (settled)
 

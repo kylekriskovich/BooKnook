@@ -1,18 +1,25 @@
 <script lang="ts">
 	import BookHeader from '$lib/components/BookHeader.svelte';
 	import PhysicalOwnershipSection from '$lib/components/PhysicalOwnershipSection.svelte';
+	import PhysicalReadingSessionsSection from '$lib/components/PhysicalReadingSessionsSection.svelte';
 	import ProgressSection from '$lib/components/ProgressSection.svelte';
 	import ReadingDatesSection from '$lib/components/ReadingDatesSection.svelte';
 	import StatTileGrid from '$lib/components/StatTileGrid.svelte';
 
 	let { data } = $props();
 	let entry = $derived(data.detail.entry);
+	// entry is a fresh object on every invalidateAll() reload (e.g. after saving a physical
+	// session), even when it's still the same book - depending on entry.id directly would re-run
+	// the reset effect below on *every* save, not just on navigating to a different book, since
+	// reading entry.id still reads the entry derived first. Deriving the id on its own means the
+	// effect only re-fires when the actual number changes (Svelte compares primitives by value).
+	let entryId = $derived(entry.id);
 
 	// Owned here, not inside ReadingDatesSection, because PhysicalOwnershipSection (a separate
 	// component, rendered above it) needs to show/hide in lockstep with the same edit mode.
 	let editingDates = $state(false);
 	$effect(() => {
-		entry.id; // dependency only - reset edit mode whenever the viewed book changes
+		entryId; // dependency only - reset edit mode whenever the viewed book actually changes
 		editingDates = false;
 	});
 </script>
@@ -29,6 +36,18 @@
 	</a>
 	<!-- Title already shown by BookHeader below, right next to the cover - not repeated here. -->
 	<div class="list-header-spacer"></div>
+	{#if entry.owns_physical}
+		<button
+			type="button"
+			class="iconbtn"
+			aria-label="Log a physical reading session"
+			popovertarget="physical-session-form-{entry.id}"
+		>
+			<svg viewBox="0 -960 960 960" fill="currentColor" aria-hidden="true">
+				<path d="M440-440H240v-80h200v-200h80v200h200v80H520v200h-80v-200Z" />
+			</svg>
+		</button>
+	{/if}
 	<button
 		type="button"
 		class="iconbtn"
@@ -49,6 +68,9 @@
 	{#if editingDates}
 		<PhysicalOwnershipSection {entry} />
 		<ReadingDatesSection {entry} bind:editingDates />
+	{/if}
+	{#if entry.owns_physical}
+		<PhysicalReadingSessionsSection {entry} sessions={data.physicalSessions} />
 	{/if}
 {/key}
 

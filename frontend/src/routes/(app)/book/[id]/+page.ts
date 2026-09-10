@@ -13,7 +13,15 @@ export const load = async ({ params, fetch }) => {
 				fetch
 			})
 		);
-		return { detail };
+		// Fetched regardless of entry.owns_physical - cheap, and keeps this page's data-loading in
+		// one place rather than a client-side fetch inside the sessions component itself.
+		const physicalSessions = unwrap(
+			await api.GET('/api/tbr/{entry_id}/physical-sessions', {
+				params: { path: { entry_id: entryId } },
+				fetch
+			})
+		);
+		return { detail, physicalSessions };
 	} catch (err) {
 		if (err instanceof ApiError && err.status === 404) error(404, 'Not found');
 		throw err;

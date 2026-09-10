@@ -1018,6 +1018,25 @@ main > h1:first-child {
   font-size: 0.9rem;
 }
 
+.physical-session-row > div:first-child {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.physical-session-sub {
+  font-size: 0.8rem;
+  color: var(--text-muted2);
+}
+
+.physical-session-actions {
+  display: flex;
+  gap: 0.4rem;
+  flex: none;
+}
+
 .settings-row-chevron {
   flex: none;
   width: 8px;
