@@ -1,8 +1,9 @@
 <script lang="ts">
 	import BookHeader from '$lib/components/BookHeader.svelte';
-	import BookStatsPanel from '$lib/components/BookStatsPanel.svelte';
 	import PhysicalOwnershipSection from '$lib/components/PhysicalOwnershipSection.svelte';
+	import ProgressSection from '$lib/components/ProgressSection.svelte';
 	import ReadingDatesSection from '$lib/components/ReadingDatesSection.svelte';
+	import StatTileGrid from '$lib/components/StatTileGrid.svelte';
 
 	let { data } = $props();
 	let entry = $derived(data.detail.entry);
@@ -28,6 +29,14 @@
 	<PhysicalOwnershipSection {entry} />
 {/key}
 
+<ProgressSection
+	progressPercent={data.detail.progress_percent}
+	estimatedPage={data.detail.estimated_page}
+	pageCount={entry.book.page_count}
+	burndown={data.detail.burndown}
+	burndownDaySpan={data.detail.burndown_day_span}
+/>
+
 {#if entry.has_paired_audiobook}
 	<input type="radio" name="book-view" id="book-view-reading" class="view-radio" checked />
 	<input type="radio" name="book-view" id="book-view-listening" class="view-radio" />
@@ -39,31 +48,25 @@
 {/if}
 
 <div class="book-view-reading-section">
-	<BookStatsPanel
-		progressPercent={data.detail.progress_percent}
-		estimatedPage={data.detail.estimated_page}
-		pageCount={entry.book.page_count}
-		tiles={data.detail.tiles}
-		burndown={data.detail.burndown}
-		burndownDaySpan={data.detail.burndown_day_span}
-		statsTitle="Reading stats"
-		burndownTitle="Reading progress"
-		emptyStateText="No reading-session data yet for this book."
-	/>
+	{#if data.detail.tiles.length}
+		<div class="settings-section">
+			<div class="settings-section-title">Reading stats</div>
+			<StatTileGrid tiles={data.detail.tiles} />
+		</div>
+	{:else}
+		<p class="empty-state">No reading-session data yet for this book.</p>
+	{/if}
 </div>
 
 {#if entry.has_paired_audiobook}
 	<div class="book-view-listening-section">
-		<BookStatsPanel
-			progressPercent={data.detail.audiobook_progress_percent}
-			estimatedPage={data.detail.audiobook_estimated_page}
-			pageCount={entry.book.page_count}
-			tiles={data.detail.audiobook_tiles}
-			burndown={data.detail.audiobook_burndown}
-			burndownDaySpan={data.detail.audiobook_burndown_day_span}
-			statsTitle="Listening stats"
-			burndownTitle="Listening progress"
-			emptyStateText="No listening-session data yet for this book."
-		/>
+		{#if data.detail.audiobook_tiles.length}
+			<div class="settings-section">
+				<div class="settings-section-title">Listening stats</div>
+				<StatTileGrid tiles={data.detail.audiobook_tiles} />
+			</div>
+		{:else}
+			<p class="empty-state">No listening-session data yet for this book.</p>
+		{/if}
 	</div>
 {/if}

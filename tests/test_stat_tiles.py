@@ -1,7 +1,7 @@
 import datetime as dt
 
 from app import stat_tiles
-from app.models import Book, TBREntryDetail
+from app.models import Book, PhysicalReadingSession, TBREntryDetail
 
 
 def _entry(
@@ -81,6 +81,17 @@ def test_no_sessions_finished_with_finished_before_started_is_guarded():
     entry = _entry(status="finished", started_at="2026-01-11", finished_at="2026-01-01T00:00:00Z")
     tiles = stat_tiles.build_book_tiles(entry, [])
     assert not any(t["label"] == "Days to Complete" for t in tiles)
+
+
+def test_days_to_complete_is_not_duplicated_onto_the_listening_tab():
+    # DESIGN-multi-edition-refactor.md Decision 6/Phase 2: Days to Complete is a book-level fact
+    # (started_at/finished_at), not medium-specific — it must appear once, on the Reading tiles,
+    # never duplicated onto the paired audiobook's Listening tiles.
+    entry = _entry(status="finished", started_at="2026-01-01", finished_at="2026-01-11T00:00:00Z")
+    reading_tiles = stat_tiles.build_book_tiles(entry, [], is_audiobook=False)
+    listening_tiles = stat_tiles.build_book_tiles(entry, [], is_audiobook=True)
+    assert {"label": "Days to Complete", "value": "11d"} in reading_tiles
+    assert not any(t["label"] == "Days to Complete" for t in listening_tiles)
 
 
 def test_no_sessions_reading_with_page_count_falls_back_to_pages_per_day():
@@ -366,6 +377,67 @@ def test_latest_progress_ignores_sessions_missing_end_progress():
         _session("2026-01-01", 0, 10),
     ]
     assert stat_tiles.latest_progress(sessions) == 10
+
+
+# --- unified_latest_progress ---
+
+
+def test_unified_latest_progress_all_none():
+    assert stat_tiles.unified_latest_progress([None, None]) is None
+
+
+def test_unified_latest_progress_takes_the_max_not_a_specific_edition():
+    # DESIGN-multi-edition-refactor.md Decision 5: a high-water mark across editions, not whichever
+    # one happens to be listed/used most recently — an audiobook further along than the ebook must
+    # win even though it's passed second here.
+    assert stat_tiles.unified_latest_progress([40.0, 55.0]) == 55.0
+
+
+# --- physical_session_to_grimmory_shape ---
+
+
+def _physical_session(start_time, end_time, start_page, end_page, session_id=1, entry_id=1):
+    return PhysicalReadingSession(
+        id=session_id, entry_id=entry_id, start_time=start_time, end_time=end_time,
+        start_page=start_page, end_page=end_page,
+    )
+
+
+def test_physical_session_to_grimmory_shape_computes_progress_from_physical_page_count():
+    # DESIGN-multi-edition-refactor.md Decision 9: percentages come from the physical edition's own
+    # page count, not books.page_count — a different printing can have a different total.
+    session = _physical_session("2026-08-21T10:00:00Z", "2026-08-21T11:00:00Z", 0, 140)
+    shape = stat_tiles.physical_session_to_grimmory_shape(session, physical_page_count=400)
+    assert shape["startProgress"] == 0.0
+    assert shape["endProgress"] == 35.0
+    assert shape["progressDelta"] == 35.0
+    assert shape["durationSeconds"] == 3600
+
+
+def test_physical_session_to_grimmory_shape_no_page_count_yields_no_progress():
+    # Falls through the same no-meaningful-progress path as a session missing endProgress —
+    # duration is still computed, since that alone is known regardless of page count.
+    session = _physical_session("2026-08-21T10:00:00Z", "2026-08-21T11:00:00Z", 0, 140)
+    shape = stat_tiles.physical_session_to_grimmory_shape(session, physical_page_count=None)
+    assert shape["startProgress"] is None
+    assert shape["endProgress"] is None
+    assert shape["progressDelta"] is None
+    assert shape["durationSeconds"] == 3600
+    assert stat_tiles._has_meaningful_progress(shape) is False
+
+
+def test_physical_session_to_grimmory_shape_feeds_existing_pipeline_unchanged():
+    # The whole point of Decision 7: once converted, it's indistinguishable from a real Grimmory
+    # session to every other function in this module.
+    session = _physical_session("2026-08-21T10:00:00Z", "2026-08-21T11:00:00Z", 0, 140)
+    shape = stat_tiles.physical_session_to_grimmory_shape(session, physical_page_count=400)
+    assert stat_tiles._has_meaningful_progress(shape) is True
+    assert stat_tiles.get_reading_dates([shape]) == [dt.date(2026, 8, 21)]
+    assert stat_tiles.latest_progress([shape]) == 35.0
+
+
+def test_unified_latest_progress_skips_missing_editions():
+    assert stat_tiles.unified_latest_progress([None, 63.2]) == 63.2
 
 
 # --- first_meaningful_session_date ---

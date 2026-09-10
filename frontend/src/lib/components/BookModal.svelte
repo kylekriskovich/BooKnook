@@ -3,6 +3,7 @@
 	import { api, unwrap } from '$lib/api/client';
 	import type { TBREntry } from '$lib/utils/entries';
 	import BookHeader from './BookHeader.svelte';
+	import PhysicalOwnershipSection from './PhysicalOwnershipSection.svelte';
 
 	let { entry }: { entry: TBREntry } = $props();
 
@@ -24,6 +25,7 @@
 
 <div id="confirm-{entry.id}" popover class="book-modal">
 	<BookHeader {entry} />
+	<PhysicalOwnershipSection {entry} />
 	<div class="confirm-actions">
 		<button type="button" popovertarget="confirm-{entry.id}" popovertargetaction="hide" class="btn btn-ghost">Keep</button>
 		<button type="button" class="btn btn-danger" disabled={removing} onclick={remove}>Remove from Shelf</button>

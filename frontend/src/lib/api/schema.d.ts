@@ -396,6 +396,75 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/tbr/{entry_id}/physical-page-count": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Api Set Tbr Physical Page Count */
+        post: operations["api_set_tbr_physical_page_count_api_tbr__entry_id__physical_page_count_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tbr/{entry_id}/physical-sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Api List Physical Reading Sessions */
+        get: operations["api_list_physical_reading_sessions_api_tbr__entry_id__physical_sessions_get"];
+        put?: never;
+        /** Api Add Physical Reading Session */
+        post: operations["api_add_physical_reading_session_api_tbr__entry_id__physical_sessions_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tbr/{entry_id}/physical-sessions/{session_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Api Update Physical Reading Session */
+        post: operations["api_update_physical_reading_session_api_tbr__entry_id__physical_sessions__session_id__post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tbr/{entry_id}/physical-sessions/{session_id}/remove": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Api Remove Physical Reading Session */
+        post: operations["api_remove_physical_reading_session_api_tbr__entry_id__physical_sessions__session_id__remove_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/preferences/view": {
         parameters: {
             query?: never;
@@ -632,6 +701,11 @@ export interface components {
             entry: components["schemas"]["TBREntryOut"];
             /** Tiles */
             tiles: components["schemas"]["StatTileOut"][];
+            /**
+             * Audiobook Tiles
+             * @default []
+             */
+            audiobook_tiles: components["schemas"]["StatTileOut"][];
             /** Burndown */
             burndown: components["schemas"]["BurndownPointOut"][];
             /** Burndown Day Span */
@@ -640,25 +714,6 @@ export interface components {
             progress_percent?: number | null;
             /** Estimated Page */
             estimated_page?: number | null;
-            /**
-             * Audiobook Tiles
-             * @default []
-             */
-            audiobook_tiles: components["schemas"]["StatTileOut"][];
-            /**
-             * Audiobook Burndown
-             * @default []
-             */
-            audiobook_burndown: components["schemas"]["BurndownPointOut"][];
-            /**
-             * Audiobook Burndown Day Span
-             * @default 0
-             */
-            audiobook_burndown_day_span: number;
-            /** Audiobook Progress Percent */
-            audiobook_progress_percent?: number | null;
-            /** Audiobook Estimated Page */
-            audiobook_estimated_page?: number | null;
         };
         /** BookOut */
         BookOut: {
@@ -894,6 +949,30 @@ export interface components {
             /** Target Count */
             target_count?: number | null;
         };
+        /** PhysicalReadingSessionIn */
+        PhysicalReadingSessionIn: {
+            /** Start Time */
+            start_time: string;
+            /** End Time */
+            end_time: string;
+            /** Start Page */
+            start_page: number;
+            /** End Page */
+            end_page: number;
+        };
+        /** PhysicalReadingSessionOut */
+        PhysicalReadingSessionOut: {
+            /** Id */
+            id: number;
+            /** Start Time */
+            start_time: string;
+            /** End Time */
+            end_time: string;
+            /** Start Page */
+            start_page: number;
+            /** End Page */
+            end_page: number;
+        };
         /**
          * ReorderIn
          * @description Entry ids for the "wanted" shelf in the desired order (first = top of the shelf) — see
@@ -1123,11 +1202,18 @@ export interface components {
              * @default false
              */
             owns_physical: boolean;
+            /** Physical Page Count */
+            physical_page_count?: number | null;
         };
         /** TBRPhysicalIn */
         TBRPhysicalIn: {
             /** Owns Physical */
             owns_physical: boolean;
+        };
+        /** TBRPhysicalPageCountIn */
+        TBRPhysicalPageCountIn: {
+            /** Physical Page Count */
+            physical_page_count?: number | null;
         };
         /** ValidationError */
         ValidationError: {
@@ -1869,6 +1955,173 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["TBREntryOut"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    api_set_tbr_physical_page_count_api_tbr__entry_id__physical_page_count_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                entry_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TBRPhysicalPageCountIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TBREntryOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    api_list_physical_reading_sessions_api_tbr__entry_id__physical_sessions_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                entry_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PhysicalReadingSessionOut"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    api_add_physical_reading_session_api_tbr__entry_id__physical_sessions_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                entry_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PhysicalReadingSessionIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PhysicalReadingSessionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    api_update_physical_reading_session_api_tbr__entry_id__physical_sessions__session_id__post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                entry_id: number;
+                session_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PhysicalReadingSessionIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PhysicalReadingSessionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    api_remove_physical_reading_session_api_tbr__entry_id__physical_sessions__session_id__remove_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                entry_id: number;
+                session_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

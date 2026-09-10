@@ -26,9 +26,12 @@ from app.library_check import LibraryCheckUnavailable
 from app.metadata import SearchResult, search_books
 from app.models import (
     User,
+    add_physical_reading_session,
     add_tbr_entry,
     clear_audiobook_pairing,
+    clear_linked_edition,
     create_book,
+    delete_physical_reading_session,
     get_audiobook_pairings,
     get_book,
     get_connection,
@@ -37,12 +40,15 @@ from app.models import (
     get_library_catalog,
     get_library_settings,
     get_library_sync_state,
+    get_linked_editions_for_ebook,
     get_or_create_user,
+    get_physical_reading_session,
     get_search_settings,
     get_tbr_entry,
     get_user,
     init_db,
     list_aggregate_tbr,
+    list_physical_reading_sessions,
     list_tbr_entries_with_books,
     remove_tbr_entry,
     search_library_catalog,
@@ -52,6 +58,7 @@ from app.models import (
     set_grimmory_admin_settings,
     set_grimmory_refresh_token,
     set_library_settings,
+    set_linked_edition,
     set_onboarded,
     set_search_settings,
     set_spice_level,
@@ -59,10 +66,12 @@ from app.models import (
     set_sync_to_device_shelf_id,
     set_tbr_entry_finished_at,
     set_tbr_entry_owns_physical,
+    set_tbr_entry_physical_page_count,
     set_tbr_entry_started_at,
     set_view_preference,
     set_wanted_order,
     set_want_to_read_shelf_id,
+    update_physical_reading_session,
     upsert_goal,
 )
 
@@ -469,6 +478,7 @@ def _to_entry_out(entry) -> schemas.TBREntryOut:
         started_at_manual=entry.started_at_manual,
         rating=entry.rating,
         owns_physical=entry.owns_physical,
+        physical_page_count=entry.physical_page_count,
     )
 
 
@@ -491,14 +501,23 @@ def _find_entry_detail(db_connection, user_id: int, entry_id: int):
     )
 
 
-def _progress_and_estimated_page(entry, sessions: list[dict], fallback_percent: "float | None"):
-    """Shared by api_book_detail's ebook and audiobook (Listening tab) branches — session-derived
-    progress when available, else `fallback_percent` while "reading", converted to an estimated
-    page via entry.book.page_count (shared across both formats, since it's a property of the book,
-    not the edition)."""
-    progress_percent = stat_tiles.latest_progress(sessions) if entry.status == "reading" else None
-    if progress_percent is None and entry.status == "reading":
-        progress_percent = fallback_percent
+def _unified_progress_and_estimated_page(
+    entry, session_lists: list[list[dict]], fallback_percents: list["float | None"]
+):
+    """Unified "how far into this book am I" across every linked edition — the max of each
+    edition's own latest tracked percentage (falling back to that edition's synced fallback
+    percentage when its own session log has none, e.g. Grimmory never populates progress deltas
+    for audiobook sessions), per DESIGN-multi-edition-refactor.md Decision 5. `session_lists` and
+    `fallback_percents` are parallel lists, one entry per edition (ebook first, by convention).
+    estimated_page converts the unified percentage via entry.book.page_count, a property of the
+    book shared across every edition, not any one of them."""
+    if entry.status != "reading":
+        return None, None
+    candidates = []
+    for sessions, fallback in zip(session_lists, fallback_percents):
+        progress = stat_tiles.latest_progress(sessions)
+        candidates.append(progress if progress is not None else fallback)
+    progress_percent = stat_tiles.unified_latest_progress(candidates)
     estimated_page = (
         round(progress_percent / 100 * entry.book.page_count)
         if progress_percent is not None and entry.book.page_count
@@ -678,15 +697,20 @@ def api_book_detail(
     if entry is None:
         raise HTTPException(status_code=404, detail="Not found")
 
-    # Whether this entry's ebook has a paired audiobook (app.models.audiobook_pairings), and its
-    # grimmory id if so - keyed off entry.book.grimmory_book_id, which is more direct than the
-    # fuzzy-match-based has_paired_audiobook computation app.main._tbr_entries_for_user uses for
-    # shelf/home listings. Setting it here too means the "Audiobook available" badge (BookHeader)
-    # now also renders on this page, not just shelf/home entries.
+    # Whether this entry's ebook has a paired audiobook, and its grimmory id if so - keyed off
+    # entry.book.grimmory_book_id, which is more direct than the fuzzy-match-based
+    # has_paired_audiobook computation app.main._tbr_entries_for_user uses for shelf/home listings.
+    # Setting it here too means the "Audiobook available" badge (BookHeader) now also renders on
+    # this page, not just shelf/home entries. Reads from linked_editions (DESIGN-multi-edition-
+    # refactor.md Phase 1/2) rather than get_audiobook_pairings's reverse dict - the dict approach
+    # silently collapsed if two audiobooks were ever paired to the same ebook (see
+    # ISSUES-TO-REVIEW.md); linked_editions' UNIQUE(ebook_grimmory_id, format) constraint makes that
+    # impossible instead of just unlikely.
     audiobook_grimmory_id = None
     if entry.book.grimmory_book_id is not None:
-        audiobook_by_ebook_id = {v: k for k, v in get_audiobook_pairings(db_connection).items()}
-        audiobook_grimmory_id = audiobook_by_ebook_id.get(entry.book.grimmory_book_id)
+        linked = get_linked_editions_for_ebook(db_connection, entry.book.grimmory_book_id)
+        audiobook_edition = next((le for le in linked if le.format == "AUDIOBOOK"), None)
+        audiobook_grimmory_id = audiobook_edition.edition_grimmory_id if audiobook_edition else None
     entry.has_paired_audiobook = audiobook_grimmory_id is not None
 
     sessions = []
@@ -713,16 +737,24 @@ def api_book_detail(
                 if exc.is_auth_rejection:
                     grimmory_auth.evict_access_token(access_token)
 
-    if (sessions or audiobook_sessions) and not entry.started_at_manual:
+    # Manually-logged physical sessions (DESIGN-multi-edition-refactor.md Decisions 7-9) - converted
+    # to the same Grimmory-shaped dict every other session already is, so nothing downstream needs
+    # to know it didn't come from Grimmory at all.
+    physical_sessions = [
+        stat_tiles.physical_session_to_grimmory_shape(s, entry.physical_page_count)
+        for s in list_physical_reading_sessions(db_connection, entry.id)
+    ]
+
+    if (sessions or audiobook_sessions or physical_sessions) and not entry.started_at_manual:
         # Earliest across every linked edition, not just the ebook - a book started via a paired
-        # audiobook (e.g. listened to before ever opening the ebook) must derive started_at from
-        # that earlier date, not the ebook's own later first session (see
-        # DESIGN-multi-edition-refactor.md, Decision 2).
+        # audiobook or a physical stretch before the ebook was ever opened must derive started_at
+        # from that earlier date (Decision 2).
         candidates = [
             d
             for d in (
                 stat_tiles.first_meaningful_session_date(sessions),
                 stat_tiles.first_meaningful_session_date(audiobook_sessions),
+                stat_tiles.first_meaningful_session_date(physical_sessions),
             )
             if d is not None
         ]
@@ -731,39 +763,38 @@ def api_book_detail(
             set_tbr_entry_started_at(db_connection, entry.id, derived.isoformat(), manual=False)
             entry.started_at = derived.isoformat()
 
-    tiles = stat_tiles.build_book_tiles(entry, sessions, resolved_today, is_audiobook=False)
-    burndown = stat_tiles.burndown_points(sessions)
-    # No audiobook-progress fallback here anymore - that's the Listening tab's job below, now that
-    # one exists. entry.audiobook_progress_percent holds the paired audiobook's own progress (see
-    # library_check.sync_user_reading_status), not this book's own, so it shouldn't leak into the
-    # ebook side's page-count math.
-    progress_percent, estimated_page = _progress_and_estimated_page(entry, sessions, None)
-
+    # Time-spent-by-medium tiles stay split (Decision 6), but physical merges into the Reading
+    # bucket rather than getting a third tab (Decision 8) - page-turning is the same activity as
+    # ebook reading, just untracked by Grimmory, unlike listening which is genuinely different.
+    tiles = stat_tiles.build_book_tiles(
+        entry, sessions + physical_sessions, resolved_today, is_audiobook=False
+    )
     audiobook_tiles = stat_tiles.build_book_tiles(
         entry, audiobook_sessions, resolved_today, is_audiobook=True
     )
-    audiobook_burndown = stat_tiles.burndown_points(audiobook_sessions)
+
+    # Progress unifies as a per-source high-water mark, not a merged session list (Decision 5) - a
+    # physical stretch that reached further than the ebook's own last session must still win, the
+    # same reasoning that already applies to the audiobook fallback below. Burndown/started_at
+    # *do* flatten every source, since a day-by-day timeline is inherently cross-source.
     # entry.audiobook_progress_percent may be stale (a since-removed pairing's leftover value) -
     # only trust it as a fallback while a pairing actually exists right now.
     audiobook_fallback_percent = entry.audiobook_progress_percent if audiobook_grimmory_id is not None else None
-    audiobook_progress_percent, audiobook_estimated_page = _progress_and_estimated_page(
-        entry, audiobook_sessions, audiobook_fallback_percent
+    progress_percent, estimated_page = _unified_progress_and_estimated_page(
+        entry,
+        [sessions, physical_sessions, audiobook_sessions],
+        [None, None, audiobook_fallback_percent],
     )
+    burndown = stat_tiles.burndown_points(sessions + physical_sessions + audiobook_sessions)
 
     return schemas.BookDetailOut(
         entry=_to_entry_out(entry),
         tiles=[_to_tile_out(t) for t in tiles],
+        audiobook_tiles=[_to_tile_out(t) for t in audiobook_tiles],
         burndown=[schemas.BurndownPointOut(date=d, remaining_percent=r) for d, r in burndown],
         burndown_day_span=stat_tiles.burndown_day_span(burndown),
         progress_percent=progress_percent,
         estimated_page=estimated_page,
-        audiobook_tiles=[_to_tile_out(t) for t in audiobook_tiles],
-        audiobook_burndown=[
-            schemas.BurndownPointOut(date=d, remaining_percent=r) for d, r in audiobook_burndown
-        ],
-        audiobook_burndown_day_span=stat_tiles.burndown_day_span(audiobook_burndown),
-        audiobook_progress_percent=audiobook_progress_percent,
-        audiobook_estimated_page=audiobook_estimated_page,
     )
 
 
@@ -1140,6 +1171,117 @@ def api_set_tbr_physical(
     return _to_entry_out(_find_entry_detail(db_connection, user.id, entry_id))
 
 
+@app.post("/api/tbr/{entry_id}/physical-page-count", response_model=schemas.TBREntryOut)
+def api_set_tbr_physical_page_count(
+    entry_id: int,
+    payload: schemas.TBRPhysicalPageCountIn,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    entry = get_tbr_entry(db_connection, entry_id)
+    if entry is None or entry.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Not found")
+    set_tbr_entry_physical_page_count(db_connection, entry_id, payload.physical_page_count)
+    return _to_entry_out(_find_entry_detail(db_connection, user.id, entry_id))
+
+
+def _to_physical_session_out(session) -> schemas.PhysicalReadingSessionOut:
+    return schemas.PhysicalReadingSessionOut(
+        id=session.id,
+        start_time=session.start_time,
+        end_time=session.end_time,
+        start_page=session.start_page,
+        end_page=session.end_page,
+    )
+
+
+def _validate_physical_session(payload: schemas.PhysicalReadingSessionIn) -> None:
+    start = dates.parse_instant(payload.start_time)
+    end = dates.parse_instant(payload.end_time)
+    if start is None or end is None:
+        raise HTTPException(status_code=422, detail="start_time/end_time must be valid timestamps")
+    if end <= start:
+        raise HTTPException(status_code=422, detail="end_time must be after start_time")
+    if payload.start_page < 0 or payload.end_page < payload.start_page:
+        raise HTTPException(status_code=422, detail="end_page must be >= start_page >= 0")
+
+
+@app.get(
+    "/api/tbr/{entry_id}/physical-sessions",
+    response_model=list[schemas.PhysicalReadingSessionOut],
+)
+def api_list_physical_reading_sessions(
+    entry_id: int,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    entry = get_tbr_entry(db_connection, entry_id)
+    if entry is None or entry.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Not found")
+    return [_to_physical_session_out(s) for s in list_physical_reading_sessions(db_connection, entry_id)]
+
+
+@app.post(
+    "/api/tbr/{entry_id}/physical-sessions",
+    response_model=schemas.PhysicalReadingSessionOut,
+    status_code=201,
+)
+def api_add_physical_reading_session(
+    entry_id: int,
+    payload: schemas.PhysicalReadingSessionIn,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    entry = get_tbr_entry(db_connection, entry_id)
+    if entry is None or entry.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Not found")
+    _validate_physical_session(payload)
+    session = add_physical_reading_session(
+        db_connection, entry_id, payload.start_time, payload.end_time, payload.start_page, payload.end_page
+    )
+    return _to_physical_session_out(session)
+
+
+@app.post(
+    "/api/tbr/{entry_id}/physical-sessions/{session_id}",
+    response_model=schemas.PhysicalReadingSessionOut,
+)
+def api_update_physical_reading_session(
+    entry_id: int,
+    session_id: int,
+    payload: schemas.PhysicalReadingSessionIn,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    entry = get_tbr_entry(db_connection, entry_id)
+    if entry is None or entry.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Not found")
+    session = get_physical_reading_session(db_connection, session_id)
+    if session is None or session.entry_id != entry_id:
+        raise HTTPException(status_code=404, detail="Not found")
+    _validate_physical_session(payload)
+    update_physical_reading_session(
+        db_connection, session_id, payload.start_time, payload.end_time, payload.start_page, payload.end_page
+    )
+    return _to_physical_session_out(get_physical_reading_session(db_connection, session_id))
+
+
+@app.post("/api/tbr/{entry_id}/physical-sessions/{session_id}/remove", status_code=204)
+def api_remove_physical_reading_session(
+    entry_id: int,
+    session_id: int,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    entry = get_tbr_entry(db_connection, entry_id)
+    if entry is None or entry.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Not found")
+    session = get_physical_reading_session(db_connection, session_id)
+    if session is not None and session.entry_id == entry_id:
+        delete_physical_reading_session(db_connection, session_id)
+    return Response(status_code=204)
+
+
 # --- preferences ---
 
 
@@ -1321,6 +1463,9 @@ def api_admin_pair_audiobook(
 
     if payload.ebook_grimmory_id is None:
         clear_audiobook_pairing(db_connection, audiobook_grimmory_id)
+        # Dual-write during the DESIGN-multi-edition-refactor.md Phase 1-3 transition - see
+        # linked_editions in app/models.py. Remove once Phase 3 retires audiobook_pairings.
+        clear_linked_edition(db_connection, audiobook_grimmory_id)
         return Response(status_code=204)
 
     ebook_entry = catalog_by_id.get(payload.ebook_grimmory_id)
@@ -1330,6 +1475,8 @@ def api_admin_pair_audiobook(
         raise HTTPException(status_code=422, detail="Cannot pair to another audiobook")
 
     set_audiobook_pairing(db_connection, audiobook_grimmory_id, payload.ebook_grimmory_id)
+    # Dual-write - see comment above.
+    set_linked_edition(db_connection, audiobook_grimmory_id, payload.ebook_grimmory_id, "AUDIOBOOK")
     return Response(status_code=204)
 
 

@@ -445,6 +445,197 @@ def test_api_set_tbr_physical_requires_ownership(client):
     assert response.status_code == 404
 
 
+def test_api_set_tbr_physical_page_count(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id)
+    conn.close()
+
+    response = client.post(f"/api/tbr/{entry.id}/physical-page-count", json={"physical_page_count": 450})
+
+    assert response.status_code == 200
+    assert response.json()["physical_page_count"] == 450
+
+    conn = models.get_connection()
+    assert models.get_tbr_entry(conn, entry.id).physical_page_count == 450
+    conn.close()
+
+
+def test_api_set_tbr_physical_page_count_requires_ownership(client):
+    owner = _make_user("Owner")
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, owner.id, book.id)
+    conn.close()
+
+    _logged_in_client(client)
+    response = client.post(f"/api/tbr/{entry.id}/physical-page-count", json={"physical_page_count": 450})
+
+    assert response.status_code == 404
+
+
+def test_api_add_physical_reading_session(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="reading")
+    conn.close()
+
+    response = client.post(
+        f"/api/tbr/{entry.id}/physical-sessions",
+        json={
+            "start_time": "2026-08-21T10:00:00Z",
+            "end_time": "2026-08-21T11:00:00Z",
+            "start_page": 0,
+            "end_page": 140,
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["start_page"] == 0
+    assert body["end_page"] == 140
+
+    list_response = client.get(f"/api/tbr/{entry.id}/physical-sessions")
+    assert list_response.status_code == 200
+    assert len(list_response.json()) == 1
+
+
+def test_api_add_physical_reading_session_requires_ownership(client):
+    owner = _make_user("Owner")
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, owner.id, book.id, status="reading")
+    conn.close()
+
+    _logged_in_client(client)
+    response = client.post(
+        f"/api/tbr/{entry.id}/physical-sessions",
+        json={"start_time": "2026-08-21T10:00:00Z", "end_time": "2026-08-21T11:00:00Z", "start_page": 0, "end_page": 140},
+    )
+
+    assert response.status_code == 404
+
+
+def test_api_add_physical_reading_session_rejects_end_before_start(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="reading")
+    conn.close()
+
+    response = client.post(
+        f"/api/tbr/{entry.id}/physical-sessions",
+        json={"start_time": "2026-08-21T11:00:00Z", "end_time": "2026-08-21T10:00:00Z", "start_page": 0, "end_page": 140},
+    )
+
+    assert response.status_code == 422
+
+
+def test_api_add_physical_reading_session_rejects_end_page_before_start_page(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="reading")
+    conn.close()
+
+    response = client.post(
+        f"/api/tbr/{entry.id}/physical-sessions",
+        json={"start_time": "2026-08-21T10:00:00Z", "end_time": "2026-08-21T11:00:00Z", "start_page": 140, "end_page": 0},
+    )
+
+    assert response.status_code == 422
+
+
+def test_api_update_physical_reading_session(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="reading")
+    session = models.add_physical_reading_session(
+        conn, entry.id, "2026-08-21T10:00:00Z", "2026-08-21T11:00:00Z", 0, 140
+    )
+    conn.close()
+
+    response = client.post(
+        f"/api/tbr/{entry.id}/physical-sessions/{session.id}",
+        json={"start_time": "2026-08-21T10:00:00Z", "end_time": "2026-08-21T11:30:00Z", "start_page": 0, "end_page": 150},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["end_page"] == 150
+
+    conn = models.get_connection()
+    assert models.get_physical_reading_session(conn, session.id).end_page == 150
+    conn.close()
+
+
+def test_api_update_physical_reading_session_wrong_entry_404s(client):
+    # A session for entry A must not be editable via entry B's path, even for the same user.
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book_a = models.create_book(conn, title="Dune")
+    book_b = models.create_book(conn, title="Dune Messiah")
+    entry_a = models.add_tbr_entry(conn, user.id, book_a.id, status="reading")
+    entry_b = models.add_tbr_entry(conn, user.id, book_b.id, status="reading")
+    session = models.add_physical_reading_session(
+        conn, entry_a.id, "2026-08-21T10:00:00Z", "2026-08-21T11:00:00Z", 0, 140
+    )
+    conn.close()
+
+    response = client.post(
+        f"/api/tbr/{entry_b.id}/physical-sessions/{session.id}",
+        json={"start_time": "2026-08-21T10:00:00Z", "end_time": "2026-08-21T11:00:00Z", "start_page": 0, "end_page": 140},
+    )
+
+    assert response.status_code == 404
+
+
+def test_api_remove_physical_reading_session(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="reading")
+    session = models.add_physical_reading_session(
+        conn, entry.id, "2026-08-21T10:00:00Z", "2026-08-21T11:00:00Z", 0, 140
+    )
+    conn.close()
+
+    response = client.post(f"/api/tbr/{entry.id}/physical-sessions/{session.id}/remove")
+
+    assert response.status_code == 204
+    conn = models.get_connection()
+    assert models.get_physical_reading_session(conn, session.id) is None
+    conn.close()
+
+
+def test_api_book_detail_includes_physical_sessions_merged_into_reading_bucket(client):
+    # DESIGN-multi-edition-refactor.md Decisions 7-9: a manually-logged physical session is
+    # converted to a Grimmory-shaped dict and merges into the Reading tile bucket (not a third
+    # tab), contributes to the unified progress figure, and derives started_at like any other
+    # linked edition's earliest session.
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="reading")
+    models.set_tbr_entry_physical_page_count(conn, entry.id, 400)
+    models.add_physical_reading_session(
+        conn, entry.id, "2026-08-21T10:00:00Z", "2026-08-21T11:00:00Z", 0, 140
+    )
+    conn.close()
+
+    response = client.get(f"/api/book/{entry.id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["entry"]["started_at"] == "2026-08-21"
+    assert body["progress_percent"] == 35.0
+    assert any(t["label"] == "Reading Days" for t in body["tiles"])
+    assert body["audiobook_tiles"] == []
+    assert len(body["burndown"]) >= 2
+
+
 def test_api_reorder_wanted_shelf(client):
     user = _logged_in_client(client)
     conn = models.get_connection()
@@ -589,7 +780,6 @@ def test_api_book_detail_does_not_fall_back_to_audiobook_progress_percent_when_u
     assert any(t["label"] == "Reading Days" for t in body["tiles"])
     assert body["entry"]["has_paired_audiobook"] is False
     assert body["audiobook_tiles"] == []
-    assert body["audiobook_progress_percent"] is None
 
 
 def test_api_book_detail_includes_paired_audiobook_stats(client, monkeypatch):
@@ -601,6 +791,10 @@ def test_api_book_detail_includes_paired_audiobook_stats(client, monkeypatch):
     models.set_tbr_entry_started_at(conn, entry.id, "2026-01-01", manual=True)
     models.set_tbr_entry_audiobook_progress_percent(conn, entry.id, 63.2)
     models.set_audiobook_pairing(conn, audiobook_grimmory_id=99, ebook_grimmory_id=42)
+    # api_book_detail now reads linked_editions (DESIGN-multi-edition-refactor.md Phase 2 fix),
+    # not audiobook_pairings directly - populate both, matching what the real dual-write endpoint
+    # (api_admin_pair_audiobook) would actually produce.
+    models.set_linked_edition(conn, edition_grimmory_id=99, ebook_grimmory_id=42, format="AUDIOBOOK")
     models.set_grimmory_refresh_token(conn, user.id, "stored-refresh")
     conn.close()
 
@@ -633,15 +827,55 @@ def test_api_book_detail_includes_paired_audiobook_stats(client, monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["entry"]["has_paired_audiobook"] is True
-    # Ebook side: real session-derived progress, "Reading" labels.
-    assert body["progress_percent"] == 10.0
+    # Unified progress (DESIGN-multi-edition-refactor.md Decision 5): the audiobook has no
+    # session-level progress (Grimmory never populates it) so it falls back to its synced 63.2%
+    # — further along than the ebook's own session-derived 10%, so the unified figure is the
+    # audiobook's, not the ebook's. A high-water mark across editions, not "the ebook always wins".
+    assert body["progress_percent"] == 63.2
     assert any(t["label"] == "Reading Days" for t in body["tiles"])
-    # Audiobook side: no session-level progress, falls back to the synced percentage; "Listening"
-    # labels, and a burndown distinct from the ebook's own.
-    assert body["audiobook_progress_percent"] == 63.2
+    # Time-spent-by-medium tiles stay split (Decision 6).
     assert any(t["label"] == "Listening Days" for t in body["audiobook_tiles"])
     assert any(t["label"] == "Time Spent Listening" for t in body["audiobook_tiles"])
-    assert body["audiobook_burndown"] != body["burndown"]
+
+
+def test_api_book_detail_burndown_merges_sessions_across_linked_editions(client, monkeypatch):
+    # DESIGN-multi-edition-refactor.md Decision 5: one progress-over-time line built from every
+    # linked edition's sessions, not two separate charts. Grimmory never actually populates
+    # endProgress for real audiobook sessions (so this can't happen with today's Grimmory data),
+    # but the merge itself must work generically rather than being hardcoded ebook-only.
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    ebook = models.create_book(conn, title="A Memory Called Empire")
+    models.set_book_grimmory_id(conn, ebook.id, 42)
+    entry = models.add_tbr_entry(conn, user.id, ebook.id, status="reading")
+    models.set_tbr_entry_started_at(conn, entry.id, "2026-01-01", manual=True)
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=99, ebook_grimmory_id=42)
+    # api_book_detail now reads linked_editions (DESIGN-multi-edition-refactor.md Phase 2 fix),
+    # not audiobook_pairings directly - populate both, matching what the real dual-write endpoint
+    # (api_admin_pair_audiobook) would actually produce.
+    models.set_linked_edition(conn, edition_grimmory_id=99, ebook_grimmory_id=42, format="AUDIOBOOK")
+    models.set_grimmory_refresh_token(conn, user.id, "stored-refresh")
+    conn.close()
+
+    def fake_sessions(base_url, token, book_id):
+        if book_id == 42:
+            return [{"startTime": "2026-01-01T10:00:00Z", "endProgress": 10.0, "progressDelta": 10.0, "durationSeconds": 600}]
+        assert book_id == 99
+        return [{"startTime": "2026-01-02T10:00:00Z", "endProgress": 25.0, "progressDelta": 25.0, "durationSeconds": 600}]
+
+    monkeypatch.setattr(grimmory_auth, "get_valid_access_token", lambda conn, u: "access-token")
+    monkeypatch.setattr(library_check, "fetch_reading_sessions_for_book", fake_sessions)
+
+    response = client.get(f"/api/book/{entry.id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["burndown"] == [
+        {"date": "2025-12-31", "remaining_percent": 100},
+        {"date": "2026-01-01", "remaining_percent": 90},
+        {"date": "2026-01-02", "remaining_percent": 75},
+    ]
+    assert body["progress_percent"] == 25.0
 
 
 def test_api_book_detail_derives_started_at_from_earliest_of_any_linked_edition(client, monkeypatch):
@@ -654,6 +888,10 @@ def test_api_book_detail_derives_started_at_from_earliest_of_any_linked_edition(
     models.set_book_grimmory_id(conn, ebook.id, 42)
     entry = models.add_tbr_entry(conn, user.id, ebook.id, status="reading")
     models.set_audiobook_pairing(conn, audiobook_grimmory_id=99, ebook_grimmory_id=42)
+    # api_book_detail now reads linked_editions (DESIGN-multi-edition-refactor.md Phase 2 fix),
+    # not audiobook_pairings directly - populate both, matching what the real dual-write endpoint
+    # (api_admin_pair_audiobook) would actually produce.
+    models.set_linked_edition(conn, edition_grimmory_id=99, ebook_grimmory_id=42, format="AUDIOBOOK")
     models.set_grimmory_refresh_token(conn, user.id, "stored-refresh")
     conn.close()
 
@@ -1344,6 +1582,61 @@ def test_api_admin_pair_audiobook_unpair_clears_it(client):
 
     body = client.get("/api/admin").json()
     assert body["audiobook_entries"][0]["paired_ebook_title"] is None
+
+
+def test_api_admin_pair_audiobook_dual_writes_linked_editions(client):
+    # DESIGN-multi-edition-refactor.md Phase 1: linked_editions must be kept in sync with
+    # audiobook_pairings for the whole transition window, not just backfilled once at migration
+    # time - see the dual-write in api_admin_pair_audiobook.
+    _configure_library_check()
+    conn = models.get_connection()
+    models.replace_library_catalog(
+        conn,
+        [
+            models.LibraryCatalogEntry(
+                title="Dune", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+                grimmory_id=1, format="EPUB",
+            ),
+            models.LibraryCatalogEntry(
+                title="Dune (Audiobook)", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+                grimmory_id=2, format="AUDIOBOOK",
+            ),
+        ],
+    )
+    conn.close()
+
+    assert client.post("/api/admin/audiobooks/2/pair", json={"ebook_grimmory_id": 1}).status_code == 204
+
+    conn = models.get_connection()
+    assert models.get_audiobook_pairings(conn) == {2: 1}
+    assert models.get_linked_editions(conn) == [
+        models.LinkedEdition(edition_grimmory_id=2, ebook_grimmory_id=1, format="AUDIOBOOK")
+    ]
+    conn.close()
+
+    assert client.post("/api/admin/audiobooks/2/pair", json={"ebook_grimmory_id": None}).status_code == 204
+
+    conn = models.get_connection()
+    assert models.get_audiobook_pairings(conn) == {}
+    assert models.get_linked_editions(conn) == []
+    conn.close()
+
+
+def test_init_db_backfills_linked_editions_from_audiobook_pairings(tmp_path):
+    # DESIGN-multi-edition-refactor.md Phase 1: a pre-existing audiobook_pairings row (from before
+    # linked_editions existed) must be backfilled the next time init_db runs, and re-running init_db
+    # again must not duplicate it.
+    conn = models.get_connection(str(tmp_path / "backfill.db"))
+    models.init_db(conn)
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=2, ebook_grimmory_id=1)
+
+    models.init_db(conn)
+    models.init_db(conn)  # idempotency check
+
+    assert models.get_linked_editions(conn) == [
+        models.LinkedEdition(edition_grimmory_id=2, ebook_grimmory_id=1, format="AUDIOBOOK")
+    ]
+    conn.close()
 
 
 def test_api_admin_pair_audiobook_404s_for_non_audiobook_id(client):

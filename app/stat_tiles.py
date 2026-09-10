@@ -4,10 +4,40 @@ from datetime import date, datetime, timedelta
 from typing import Optional
 
 from app.dates import longest_consecutive_run, parse_date, parse_instant, today_utc
+from app.models import PhysicalReadingSession
 
 
 def session_date(session: dict) -> Optional[date]:
     return parse_date(session.get("startTime"))
+
+
+def physical_session_to_grimmory_shape(
+    session: PhysicalReadingSession, physical_page_count: Optional[int]
+) -> dict:
+    """Converts a manually-logged physical reading session into a Grimmory-shaped session dict
+    (DESIGN-multi-edition-refactor.md Decisions 7/9), so it flows through every other function in
+    this module with no special-casing. Percentages are computed here, from the *physical* edition's
+    own page count (never books.page_count - a physical printing can have a genuinely different
+    page count than whichever digital file Grimmory has cataloged) - not stored, so editing either
+    the session's own pages or physical_page_count later is reflected immediately, no separate
+    recompute step. None percentages (physical_page_count not set yet) fall through the same
+    no-meaningful-progress path a session with a missing endProgress already takes."""
+    start = parse_instant(session.start_time)
+    end = parse_instant(session.end_time)
+    duration_seconds = round((end - start).total_seconds()) if start and end else None
+    start_progress = end_progress = progress_delta = None
+    if physical_page_count:
+        start_progress = session.start_page / physical_page_count * 100
+        end_progress = session.end_page / physical_page_count * 100
+        progress_delta = end_progress - start_progress
+    return {
+        "startTime": session.start_time,
+        "endTime": session.end_time,
+        "durationSeconds": duration_seconds,
+        "startProgress": start_progress,
+        "endProgress": end_progress,
+        "progressDelta": progress_delta,
+    }
 
 
 def _has_meaningful_progress(session: dict) -> bool:
@@ -38,6 +68,15 @@ def latest_progress(sessions: list[dict]) -> Optional[float]:
     if not dated:
         return None
     return max(dated, key=lambda t: t[0])[1]
+
+
+def unified_latest_progress(candidates: list[Optional[float]]) -> Optional[float]:
+    """Highest of several linked editions' own latest tracked progress - "how far into this book
+    am I, across any medium" (DESIGN-multi-edition-refactor.md Decision 5). A high-water mark
+    rather than "whichever edition was used most recently", so resuming a medium that hasn't
+    caught up yet doesn't read as regression. None if none of the candidates have a value."""
+    known = [c for c in candidates if c is not None]
+    return max(known) if known else None
 
 
 def first_meaningful_session_date(sessions: list[dict]) -> Optional[date]:
@@ -190,9 +229,12 @@ def build_book_tiles(
         if fallback:
             tiles.append(fallback)
 
-    days_to_complete = _days_to_complete_tile(entry)
-    if days_to_complete:
-        tiles.append(days_to_complete)
+    # Book-level (started_at/finished_at), not medium-specific - included only once, on the
+    # primary/Reading tile list, rather than duplicated onto the Listening tab too.
+    if not is_audiobook:
+        days_to_complete = _days_to_complete_tile(entry)
+        if days_to_complete:
+            tiles.append(days_to_complete)
 
     return tiles
 

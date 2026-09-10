@@ -1,31 +1,24 @@
 <script lang="ts">
 	import type { components } from '$lib/api/schema';
 	import BurndownChart from './BurndownChart.svelte';
-	import StatTileGrid from './StatTileGrid.svelte';
 
-	type StatTile = components['schemas']['StatTileOut'];
 	type BurndownPoint = components['schemas']['BurndownPointOut'];
 
+	// Unified across every linked edition (DESIGN-multi-edition-refactor.md Decision 5) — one
+	// "how far into this book am I" figure and one progress-over-time line, not a separate pair
+	// per medium the way Reading/Listening tiles below still are.
 	let {
 		progressPercent,
 		estimatedPage,
 		pageCount,
-		tiles,
 		burndown,
-		burndownDaySpan,
-		statsTitle,
-		burndownTitle,
-		emptyStateText
+		burndownDaySpan
 	}: {
 		progressPercent: number | null | undefined;
 		estimatedPage: number | null | undefined;
 		pageCount: number | null | undefined;
-		tiles: StatTile[];
 		burndown: BurndownPoint[];
 		burndownDaySpan: number;
-		statsTitle: string;
-		burndownTitle: string;
-		emptyStateText: string;
 	} = $props();
 </script>
 
@@ -47,20 +40,9 @@
 	</div>
 {/if}
 
-{#if tiles.length}
-	<div class="settings-section">
-		<div class="settings-section-title">{statsTitle}</div>
-		<StatTileGrid {tiles} />
-	</div>
-{/if}
-
 {#if burndown.length > 1}
 	<div class="settings-section">
-		<div class="settings-section-title">{burndownTitle}</div>
+		<div class="settings-section-title">Reading progress</div>
 		<BurndownChart points={burndown} daySpan={burndownDaySpan} />
 	</div>
-{/if}
-
-{#if !tiles.length && !burndown.length}
-	<p class="empty-state">{emptyStateText}</p>
 {/if}

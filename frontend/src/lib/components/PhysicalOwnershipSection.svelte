@@ -31,11 +31,11 @@
 </script>
 
 <div class="settings-section">
-	<div class="settings-section-header">
-		<div class="settings-section-title">Physical copy</div>
-	</div>
-	<label class="settings-checkbox-row">
-		<input type="checkbox" checked={ownsPhysical} disabled={saving} onchange={toggle} />
-		I own a physical copy of this book
+	<label class="switch-row">
+		<span class="switch-row-label">Own Physical</span>
+		<span class="switch">
+			<input type="checkbox" checked={ownsPhysical} disabled={saving} onchange={toggle} />
+			<span class="switch-track"><span class="switch-thumb"></span></span>
+		</span>
 	</label>
 </div>

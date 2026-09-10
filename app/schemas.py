@@ -48,6 +48,15 @@ class TBREntryOut(BaseModel):
     started_at_manual: bool = False
     rating: Optional[int] = None
     owns_physical: bool = False
+    physical_page_count: Optional[int] = None
+
+
+class PhysicalReadingSessionOut(BaseModel):
+    id: int
+    start_time: str
+    end_time: str
+    start_page: int
+    end_page: int
 
 
 class ShelfOut(BaseModel):
@@ -86,18 +95,18 @@ class BurndownPointOut(BaseModel):
 
 class BookDetailOut(BaseModel):
     entry: TBREntryOut
+    # Time-spent-by-medium tiles stay split (DESIGN-multi-edition-refactor.md Decision 6) -
+    # `audiobook_tiles` is the paired audiobook's own session-derived tiles (see
+    # entry.has_paired_audiobook), empty whenever there's no pairing or no session data yet.
     tiles: list[StatTileOut]
+    audiobook_tiles: list[StatTileOut] = []
+    # Progress and burndown are unified across every linked edition instead (Decision 5) - one
+    # "how far into this book am I" figure and one progress-over-time line, not a separate pair
+    # per medium.
     burndown: list[BurndownPointOut]
     burndown_day_span: int
     progress_percent: Optional[float] = None
     estimated_page: Optional[int] = None
-    # Same shape as the fields above, but for the paired audiobook's own sessions (see
-    # entry.has_paired_audiobook) - empty/None whenever there's no pairing or no session data yet.
-    audiobook_tiles: list[StatTileOut] = []
-    audiobook_burndown: list[BurndownPointOut] = []
-    audiobook_burndown_day_span: int = 0
-    audiobook_progress_percent: Optional[float] = None
-    audiobook_estimated_page: Optional[int] = None
 
 
 class CalendarBookOut(BaseModel):
@@ -308,6 +317,20 @@ class TBRDatesIn(BaseModel):
 
 class TBRPhysicalIn(BaseModel):
     owns_physical: bool
+
+
+class TBRPhysicalPageCountIn(BaseModel):
+    # None clears it - unlike the secret-settings "blank means unchanged" convention elsewhere,
+    # this field has no other way to signal "I know it and it's actually unset" vs "leave it alone",
+    # so this endpoint always overwrites with whatever's sent, no leave-unchanged semantics.
+    physical_page_count: Optional[int] = None
+
+
+class PhysicalReadingSessionIn(BaseModel):
+    start_time: str
+    end_time: str
+    start_page: int
+    end_page: int
 
 
 class ReorderIn(BaseModel):
