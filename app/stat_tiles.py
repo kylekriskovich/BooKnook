@@ -32,6 +32,9 @@ def physical_session_to_grimmory_shape(
         "startProgress": start_progress,
         "endProgress": end_progress,
         "progressDelta": progress_delta,
+        # Raw page delta, known regardless of physical_page_count - lets build_book_tiles convert
+        # to pages using this edition's own count instead of guessing via the ebook's page_count.
+        "pageDelta": session.end_page - session.start_page,
     }
 
 
@@ -40,7 +43,20 @@ def _has_meaningful_progress(session: dict) -> bool:
     # real listening time still counts.
     if (session.get("progressDelta") or 0) > 0:
         return True
+    if (session.get("pageDelta") or 0) > 0:
+        return True
     return session.get("bookType") == "AUDIOBOOK" and (session.get("durationSeconds") or 0) > 0
+
+
+def _session_page_delta(session: dict, fallback_page_count: Optional[int]) -> Optional[float]:
+    """A session's own known page delta (physical sessions) if present, else an estimate from its
+    percentage progressDelta against the ebook's page_count (Grimmory sessions have no raw pages)."""
+    if session.get("pageDelta") is not None:
+        return session["pageDelta"]
+    delta = session.get("progressDelta")
+    if delta and fallback_page_count:
+        return delta / 100 * fallback_page_count
+    return None
 
 
 def format_duration(total_seconds: int) -> str:
@@ -164,11 +180,19 @@ def build_book_tiles(
             best_session = max(sessions, key=lambda s: s.get("progressDelta") or 0)
             best_delta = best_session.get("progressDelta") or 0
             best_date = session_date(best_session)
-            if page_count:
-                avg_pages = round((sum(deltas) / len(deltas)) / 100 * page_count)
+            # Each session's own page delta when known (physical editions), falling back to an
+            # estimate via the ebook's page_count only for sessions with no raw pages of their own.
+            page_deltas = [
+                pd
+                for s in sessions
+                if s.get("progressDelta") and (pd := _session_page_delta(s, page_count)) is not None
+            ]
+            if page_deltas:
+                avg_pages = round(sum(page_deltas) / len(page_deltas))
                 if avg_pages > 0:
                     tiles.append({"label": "Pages per session", "value": str(avg_pages)})
-                best_pages = round(best_delta / 100 * page_count)
+                best_page_delta = _session_page_delta(best_session, page_count)
+                best_pages = round(best_page_delta) if best_page_delta else 0
                 if best_pages > 0:
                     tiles.append(
                         {

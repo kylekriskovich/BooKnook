@@ -70,7 +70,6 @@
 			endPage: String(session.end_page)
 		};
 		editingId = session.id;
-		popoverEl?.showPopover();
 	}
 
 	async function save(event: SubmitEvent) {

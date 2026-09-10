@@ -148,6 +148,20 @@ def test_remove_tbr_entry(conn):
     assert models.list_tbr_entries_for_user(conn, user.id) == []
 
 
+def test_remove_tbr_entry_with_logged_physical_session_does_not_violate_foreign_key(conn):
+    # physical_reading_sessions.entry_id must cascade - PRAGMA foreign_keys is on (get_connection)
+    # and remove_tbr_entry does a bare DELETE, so a missing ON DELETE CASCADE raises IntegrityError.
+    user = models.create_user(conn, "Alice")
+    book = models.create_book(conn, "Dune", isbn="9780441172719")
+    entry = models.add_tbr_entry(conn, user.id, book.id)
+    models.add_physical_reading_session(conn, entry.id, "2026-08-21T10:00:00Z", "2026-08-21T11:00:00Z", 0, 140)
+
+    models.remove_tbr_entry(conn, entry.id)
+
+    assert models.list_tbr_entries_for_user(conn, user.id) == []
+    assert models.list_physical_reading_sessions(conn, entry.id) == []
+
+
 # --- wanted-shelf manual ordering ---
 
 

@@ -40,7 +40,11 @@
 			return;
 		}
 		try {
-			const data = unwrap(await api.GET('/api/admin/library-search', { params: { query: { q } } }));
+			const data = unwrap(
+				await api.GET('/api/admin/library-search', {
+					params: { query: { q, exclude_audiobooks: true } }
+				})
+			);
 			results = data.results;
 			searchError = null;
 		} catch (err) {

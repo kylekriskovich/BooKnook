@@ -285,6 +285,19 @@ def test_best_session_falls_back_to_percent_without_page_count():
     assert by_label["Best Session"]["value"] == "25%"
 
 
+def test_pages_per_session_uses_physical_edition_own_page_count_not_ebook_page_count():
+    # A physical session's pageDelta is exact (from its own raw page numbers) and must win over
+    # estimating pages from the ebook's page_count, which can be a genuinely different edition.
+    entry = _entry(status="reading", page_count=300)  # ebook's own page_count
+    physical = _physical_session("2026-01-01T10:00:00Z", "2026-01-01T11:00:00Z", 0, 140, session_id=1)
+    shape = stat_tiles.physical_session_to_grimmory_shape(physical, physical_page_count=400)
+    tiles = stat_tiles.build_book_tiles(entry, [shape])
+    by_label = {t["label"]: t for t in tiles}
+    # 140 raw pages (physical), not 35% of 300 = 105 (what the old ebook-page_count math gave).
+    assert by_label["Pages per session"]["value"] == "140"
+    assert by_label["Best Session"]["value"] == "140 pages"
+
+
 def test_estimated_completion_requires_two_reading_days():
     entry = _entry(status="reading")
     tiles = stat_tiles.build_book_tiles(entry, [_session("2026-01-01", 0, 10)])
@@ -414,16 +427,17 @@ def test_physical_session_to_grimmory_shape_computes_progress_from_physical_page
     assert shape["durationSeconds"] == 3600
 
 
-def test_physical_session_to_grimmory_shape_no_page_count_yields_no_progress():
-    # Falls through the same no-meaningful-progress path as a session missing endProgress —
-    # duration is still computed, since that alone is known regardless of page count.
+def test_physical_session_to_grimmory_shape_no_page_count_still_counts_as_meaningful():
+    # No percentage without a page count, but pageDelta is known from the raw page numbers alone -
+    # a session logged before physical_page_count is set must still count as real reading.
     session = _physical_session("2026-08-21T10:00:00Z", "2026-08-21T11:00:00Z", 0, 140)
     shape = stat_tiles.physical_session_to_grimmory_shape(session, physical_page_count=None)
     assert shape["startProgress"] is None
     assert shape["endProgress"] is None
     assert shape["progressDelta"] is None
     assert shape["durationSeconds"] == 3600
-    assert stat_tiles._has_meaningful_progress(shape) is False
+    assert shape["pageDelta"] == 140
+    assert stat_tiles._has_meaningful_progress(shape) is True
 
 
 def test_physical_session_to_grimmory_shape_feeds_existing_pipeline_unchanged():

@@ -175,7 +175,7 @@ CREATE TABLE IF NOT EXISTS tbr_entries (
 -- "booknook-physical-per-user" memory note for why).
 CREATE TABLE IF NOT EXISTS physical_reading_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    entry_id INTEGER NOT NULL REFERENCES tbr_entries(id),
+    entry_id INTEGER NOT NULL REFERENCES tbr_entries(id) ON DELETE CASCADE,
     start_time TEXT NOT NULL,
     end_time TEXT NOT NULL,
     start_page INTEGER NOT NULL,
@@ -278,7 +278,8 @@ CREATE TABLE IF NOT EXISTS goals (
 def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     if db_path is None:
         db_path = os.environ.get("TBR_DB_PATH", DEFAULT_DB_PATH)
-    # check_same_thread=False: FastAPI resolves each sync dependency
+    # check_same_thread=False: FastAPI's generator dependencies (see get_db below) can run their
+    # setup and teardown on different threadpool worker threads for the same request.
     db_connection = sqlite3.connect(db_path, check_same_thread=False)
     db_connection.row_factory = sqlite3.Row
     db_connection.execute("PRAGMA foreign_keys = ON")
@@ -411,6 +412,17 @@ def init_db(db_connection: sqlite3.Connection) -> None:
         """
         INSERT OR IGNORE INTO linked_editions (edition_grimmory_id, ebook_grimmory_id, format)
         SELECT audiobook_grimmory_id, ebook_grimmory_id, 'AUDIOBOOK' FROM audiobook_pairings
+        """
+    )
+    # A legacy row that collided with the UNIQUE(ebook_grimmory_id, format) constraint above (an
+    # ebook with two audiobooks already paired to it) got silently dropped from linked_editions -
+    # remove it here too so both tables agree on the one pairing that survived.
+    db_connection.execute(
+        """
+        DELETE FROM audiobook_pairings
+        WHERE audiobook_grimmory_id NOT IN (
+            SELECT edition_grimmory_id FROM linked_editions WHERE format = 'AUDIOBOOK'
+        )
         """
     )
     # One-time backfill for wanted entries that predate sort_order, preserving today's added_at
@@ -770,7 +782,7 @@ def list_tbr_entries_with_books(db_connection: sqlite3.Connection, user_id: int)
                tbr_entries.owns_physical, tbr_entries.physical_page_count,
                books.id AS book_id, books.title, books.author, books.isbn, books.cover_url,
                books.published_date, books.page_count, books.grimmory_book_id, books.cover_color,
-               books.format
+               books.manual_match_grimmory_id, books.format
         FROM tbr_entries
         JOIN books ON books.id = tbr_entries.book_id
         WHERE tbr_entries.user_id = ?
@@ -801,6 +813,7 @@ def list_tbr_entries_with_books(db_connection: sqlite3.Connection, user_id: int)
                 page_count=row["page_count"],
                 grimmory_book_id=row["grimmory_book_id"],
                 cover_color=row["cover_color"],
+                manual_match_grimmory_id=row["manual_match_grimmory_id"],
                 format=row["format"],
             ),
         )

@@ -40,6 +40,7 @@ from app.models import (
     get_library_catalog,
     get_library_settings,
     get_library_sync_state,
+    get_linked_editions,
     get_linked_editions_for_ebook,
     get_or_create_user,
     get_physical_reading_session,
@@ -250,11 +251,13 @@ def _tbr_entries_for_user(db_connection, user_id: int):
     entries = list_tbr_entries_with_books(db_connection, user_id)
     if library_check.is_configured(db_connection):
         catalog = get_library_catalog(db_connection)
-        paired_ebook_ids = set(get_audiobook_pairings(db_connection).values())
+        paired_ebook_ids = {
+            le.ebook_grimmory_id for le in get_linked_editions(db_connection) if le.format == "AUDIOBOOK"
+        }
         for entry in entries:
-            match = library_check.find_catalog_match(
-                entry.book.title, entry.book.isbn, entry.book.author, catalog
-            )
+            # resolve_catalog_match, not find_catalog_match - must honor an admin's manual match
+            # (POST /api/admin/books/{id}/match), same as the admin "In Library" view does.
+            match = library_check.resolve_catalog_match(entry.book, catalog)
             entry.owned = match is not None
             entry.has_paired_audiobook = match is not None and match.grimmory_id in paired_ebook_ids
             if match and match.published_date:
@@ -1182,8 +1185,8 @@ def _validate_physical_session(payload: schemas.PhysicalReadingSessionIn) -> Non
         raise HTTPException(status_code=422, detail="start_time/end_time must be valid timestamps")
     if end <= start:
         raise HTTPException(status_code=422, detail="end_time must be after start_time")
-    if payload.start_page < 0 or payload.end_page < payload.start_page:
-        raise HTTPException(status_code=422, detail="end_page must be >= start_page >= 0")
+    if payload.start_page < 0 or payload.end_page <= payload.start_page:
+        raise HTTPException(status_code=422, detail="end_page must be > start_page >= 0")
 
 
 @app.get(
@@ -1413,6 +1416,14 @@ def api_admin_match_book(
             db_connection, book_id, None, fallback.grimmory_id if fallback else None
         )
         return Response(status_code=204)
+
+    catalog_by_id = {c.grimmory_id: c for c in get_library_catalog(db_connection) if c.grimmory_id is not None}
+    target = catalog_by_id.get(payload.grimmory_id)
+    if target is not None and target.format == "AUDIOBOOK":
+        raise HTTPException(
+            status_code=422,
+            detail="Cannot match to an audiobook edition - use the audiobook pairing screen instead",
+        )
 
     owner_id = library_check.find_owning_book_id(
         db_connection, payload.grimmory_id, exclude_book_id=book_id

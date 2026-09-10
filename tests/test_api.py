@@ -193,7 +193,9 @@ def test_api_home_entry_flags_paired_audiobook_availability(client):
             ),
         ],
     )
-    models.set_audiobook_pairing(conn, audiobook_grimmory_id=99, ebook_grimmory_id=1)
+    # has_paired_audiobook reads linked_editions (not the legacy audiobook_pairings table) -
+    # see app/main.py:_tbr_entries_for_user.
+    models.set_linked_edition(conn, edition_grimmory_id=99, ebook_grimmory_id=1, format="AUDIOBOOK")
     conn.close()
 
     response = client.get("/api/home")
@@ -204,6 +206,31 @@ def test_api_home_entry_flags_paired_audiobook_availability(client):
     }
     assert entries["Dune"] is True
     assert entries["Project Hail Mary"] is False
+
+
+def test_api_home_reflects_manual_match_even_when_fuzzy_match_would_fail(client):
+    # _tbr_entries_for_user must use resolve_catalog_match (honors manual_match_grimmory_id), not
+    # find_catalog_match alone - otherwise a book only owned via manual match never shows as owned
+    # on the user's own Home/Shelf pages even though the admin "In Library" view already does.
+    _configure_library_check()
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="My Local Title", author="Some Author")
+    models.add_tbr_entry(conn, user.id, book.id)
+    models.replace_library_catalog(
+        conn,
+        [models.LibraryCatalogEntry(
+            title="Completely Different Catalog Title", isbn13=None, isbn10=None,
+            authors=["Someone Else"], grimmory_id=42,
+        )],
+    )
+    conn.close()
+
+    assert client.post(f"/api/admin/books/{book.id}/match", json={"grimmory_id": 42}).status_code == 204
+
+    response = client.get("/api/home")
+    entries = [e for shelf in response.json()["shelves"] for e in shelf["entries"]]
+    assert entries[0]["owned"] is True
 
 
 def test_api_home_finished_shelf_uses_client_today_not_server_utc(client, monkeypatch):
@@ -557,6 +584,23 @@ def test_api_add_physical_reading_session_rejects_end_page_before_start_page(cli
     response = client.post(
         f"/api/tbr/{entry.id}/physical-sessions",
         json={"start_time": "2026-08-21T10:00:00Z", "end_time": "2026-08-21T11:00:00Z", "start_page": 140, "end_page": 0},
+    )
+
+    assert response.status_code == 422
+
+
+def test_api_add_physical_reading_session_rejects_zero_page_delta(client):
+    # Same start/end page is accepted-but-invisible otherwise - never appears in any stat despite
+    # having a real logged duration, so reject it outright instead.
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="reading")
+    conn.close()
+
+    response = client.post(
+        f"/api/tbr/{entry.id}/physical-sessions",
+        json={"start_time": "2026-08-21T10:00:00Z", "end_time": "2026-08-21T11:00:00Z", "start_page": 40, "end_page": 40},
     )
 
     assert response.status_code == 422
@@ -1709,6 +1753,25 @@ def test_init_db_backfills_linked_editions_from_audiobook_pairings(tmp_path):
     conn.close()
 
 
+def test_init_db_backfill_reconciles_legacy_duplicate_audiobook_pairings(tmp_path):
+    # Two legacy audiobook_pairings rows sharing an ebook (only possible pre-migration, before
+    # linked_editions' UNIQUE(ebook_grimmory_id, format) existed) collide on the INSERT OR IGNORE
+    # backfill - the losing row must be cleaned out of audiobook_pairings too, not left dangling.
+    conn = models.get_connection(str(tmp_path / "backfill_dup.db"))
+    models.init_db(conn)
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=2, ebook_grimmory_id=1)
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=3, ebook_grimmory_id=1)
+
+    models.init_db(conn)
+
+    linked = models.get_linked_editions(conn)
+    assert len(linked) == 1
+    surviving_audiobook_id = linked[0].edition_grimmory_id
+    assert surviving_audiobook_id in (2, 3)
+    assert models.get_audiobook_pairings(conn) == {surviving_audiobook_id: 1}
+    conn.close()
+
+
 def test_api_admin_pair_audiobook_404s_for_non_audiobook_id(client):
     _configure_library_check()
     conn = models.get_connection()
@@ -1854,6 +1917,30 @@ def test_api_admin_match_rejects_duplicate_manual_match_target(client):
     assert "Book A" in second.json()["detail"]
     conn = models.get_connection()
     assert models.get_book(conn, book_b.id).manual_match_grimmory_id is None
+    conn.close()
+
+
+def test_api_admin_match_rejects_audiobook_target(client):
+    # Manually matching an ebook entry to an audiobook catalog row would make api_book_detail
+    # surface the audiobook's Grimmory sessions as the book's own reading sessions - use the
+    # dedicated audiobook pairing screen instead.
+    _configure_library_check()
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    models.replace_library_catalog(
+        conn,
+        [models.LibraryCatalogEntry(
+            title="Dune (Audiobook)", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+            grimmory_id=2, format="AUDIOBOOK",
+        )],
+    )
+    conn.close()
+
+    response = client.post(f"/api/admin/books/{book.id}/match", json={"grimmory_id": 2})
+
+    assert response.status_code == 422
+    conn = models.get_connection()
+    assert models.get_book(conn, book.id).manual_match_grimmory_id is None
     conn.close()
 
 
