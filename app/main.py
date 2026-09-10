@@ -734,10 +734,14 @@ def api_book_detail(
     # Manually-logged physical sessions (DESIGN-multi-edition-refactor.md Decisions 7-9) - converted
     # to the same Grimmory-shaped dict every other session already is, so nothing downstream needs
     # to know it didn't come from Grimmory at all.
-    physical_sessions = [
-        stat_tiles.physical_session_to_grimmory_shape(s, entry.physical_page_count)
-        for s in list_physical_reading_sessions(db_connection, entry.id)
-    ]
+    physical_sessions = (
+        [
+            stat_tiles.physical_session_to_grimmory_shape(s, entry.physical_page_count)
+            for s in list_physical_reading_sessions(db_connection, entry.id)
+        ]
+        if entry.owns_physical
+        else []
+    )
 
     if (sessions or audiobook_sessions or physical_sessions) and not entry.started_at_manual:
         # Earliest across every linked edition, not just the ebook - a book started via a paired
@@ -1172,6 +1176,8 @@ def api_set_tbr_physical_page_count(
     entry = get_tbr_entry(db_connection, entry_id)
     if entry is None or entry.user_id != user.id:
         raise HTTPException(status_code=404, detail="Not found")
+    if payload.physical_page_count is not None and payload.physical_page_count <= 0:
+        raise HTTPException(status_code=422, detail="physical_page_count must be a positive integer")
     set_tbr_entry_physical_page_count(db_connection, entry_id, payload.physical_page_count)
     return _to_entry_out(_find_entry_detail(db_connection, user.id, entry_id))
 
@@ -1462,9 +1468,14 @@ def api_admin_pair_audiobook(
     if ebook_entry.format == "AUDIOBOOK":
         raise HTTPException(status_code=422, detail="Cannot pair to another audiobook")
 
+    # linked_editions first - its UNIQUE(ebook_grimmory_id, format) can reject this pairing
+    # (ebook already has a different audiobook linked), and audiobook_pairings has no such
+    # constraint to catch it.
+    try:
+        set_linked_edition(db_connection, audiobook_grimmory_id, payload.ebook_grimmory_id, "AUDIOBOOK")
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=422, detail="This ebook already has a different audiobook linked")
     set_audiobook_pairing(db_connection, audiobook_grimmory_id, payload.ebook_grimmory_id)
-    # Dual-write - see comment above.
-    set_linked_edition(db_connection, audiobook_grimmory_id, payload.ebook_grimmory_id, "AUDIOBOOK")
     return Response(status_code=204)
 
 

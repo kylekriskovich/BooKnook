@@ -462,6 +462,20 @@ def test_api_set_tbr_physical_page_count(client):
     conn.close()
 
 
+def test_api_set_tbr_physical_page_count_rejects_non_positive(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id)
+    conn.close()
+
+    for bad_value in (0, -5):
+        response = client.post(
+            f"/api/tbr/{entry.id}/physical-page-count", json={"physical_page_count": bad_value}
+        )
+        assert response.status_code == 422
+
+
 def test_api_set_tbr_physical_page_count_requires_ownership(client):
     owner = _make_user("Owner")
     conn = models.get_connection()
@@ -619,6 +633,7 @@ def test_api_book_detail_includes_physical_sessions_merged_into_reading_bucket(c
     conn = models.get_connection()
     book = models.create_book(conn, title="Dune")
     entry = models.add_tbr_entry(conn, user.id, book.id, status="reading")
+    models.set_tbr_entry_owns_physical(conn, entry.id, True)
     models.set_tbr_entry_physical_page_count(conn, entry.id, 400)
     models.add_physical_reading_session(
         conn, entry.id, "2026-08-21T10:00:00Z", "2026-08-21T11:00:00Z", 0, 140
@@ -634,6 +649,27 @@ def test_api_book_detail_includes_physical_sessions_merged_into_reading_bucket(c
     assert any(t["label"] == "Reading Days" for t in body["tiles"])
     assert body["audiobook_tiles"] == []
     assert len(body["burndown"]) >= 2
+
+
+def test_api_book_detail_ignores_physical_sessions_when_not_owned(client):
+    # A physical session logged before owns_physical was turned off (or never turned on) must
+    # not affect stats/started_at the UI hides it from - see api_book_detail's owns_physical gate.
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="reading")
+    models.set_tbr_entry_physical_page_count(conn, entry.id, 400)
+    models.add_physical_reading_session(
+        conn, entry.id, "2026-08-21T10:00:00Z", "2026-08-21T11:00:00Z", 0, 140
+    )
+    conn.close()
+
+    response = client.get(f"/api/book/{entry.id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["entry"]["started_at"] is None
+    assert body["progress_percent"] is None
 
 
 def test_api_reorder_wanted_shelf(client):
@@ -1619,6 +1655,43 @@ def test_api_admin_pair_audiobook_dual_writes_linked_editions(client):
     conn = models.get_connection()
     assert models.get_audiobook_pairings(conn) == {}
     assert models.get_linked_editions(conn) == []
+    conn.close()
+
+
+def test_api_admin_pair_audiobook_422s_and_leaves_no_partial_write_on_conflict(client):
+    # linked_editions' UNIQUE(ebook_grimmory_id, format) rejects a second audiobook paired to an
+    # ebook that already has one - api_admin_pair_audiobook must surface that as a 422 and must
+    # not have already written audiobook_pairings by the time it does (see the dual-write order).
+    _configure_library_check()
+    conn = models.get_connection()
+    models.replace_library_catalog(
+        conn,
+        [
+            models.LibraryCatalogEntry(
+                title="Dune", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+                grimmory_id=1, format="EPUB",
+            ),
+            models.LibraryCatalogEntry(
+                title="Dune (Audiobook)", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+                grimmory_id=2, format="AUDIOBOOK",
+            ),
+            models.LibraryCatalogEntry(
+                title="Dune (Unabridged Audiobook)", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+                grimmory_id=3, format="AUDIOBOOK",
+            ),
+        ],
+    )
+    conn.close()
+
+    assert client.post("/api/admin/audiobooks/2/pair", json={"ebook_grimmory_id": 1}).status_code == 204
+    response = client.post("/api/admin/audiobooks/3/pair", json={"ebook_grimmory_id": 1})
+    assert response.status_code == 422
+
+    conn = models.get_connection()
+    assert models.get_audiobook_pairings(conn) == {2: 1}
+    assert models.get_linked_editions(conn) == [
+        models.LinkedEdition(edition_grimmory_id=2, ebook_grimmory_id=1, format="AUDIOBOOK")
+    ]
     conn.close()
 
 

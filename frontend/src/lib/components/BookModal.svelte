@@ -58,9 +58,16 @@
 	<BookHeader {entry} />
 	{#if editing}
 		<PhysicalOwnershipSection {entry} />
-		<div class="confirm-actions">
-			<button type="button" class="btn btn-ghost" onclick={() => (editing = false)}>Keep</button>
-			<button type="button" class="btn btn-danger" disabled={removing} onclick={remove}>Remove from Shelf</button>
-		</div>
 	{/if}
+	<div class="confirm-actions">
+		<button
+			type="button"
+			popovertarget="confirm-{entry.id}"
+			popovertargetaction="hide"
+			class="btn btn-ghost"
+		>
+			Keep
+		</button>
+		<button type="button" class="btn btn-danger" disabled={removing} onclick={remove}>Remove from Shelf</button>
+	</div>
 </div>
