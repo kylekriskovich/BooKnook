@@ -34,9 +34,6 @@
 				<span>~page {estimatedPage} of {pageCount}</span>
 			{/if}
 		</div>
-		{#if estimatedPage}
-			<p class="empty-state">Estimated page number based on completion percentage.</p>
-		{/if}
 	</div>
 {/if}
 
