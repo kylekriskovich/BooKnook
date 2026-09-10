@@ -379,6 +379,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/tbr/{entry_id}/physical": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Api Set Tbr Physical */
+        post: operations["api_set_tbr_physical_api_tbr__entry_id__physical_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/preferences/view": {
         parameters: {
             query?: never;
@@ -1101,6 +1118,16 @@ export interface components {
             started_at_manual: boolean;
             /** Rating */
             rating?: number | null;
+            /**
+             * Owns Physical
+             * @default false
+             */
+            owns_physical: boolean;
+        };
+        /** TBRPhysicalIn */
+        TBRPhysicalIn: {
+            /** Owns Physical */
+            owns_physical: boolean;
         };
         /** ValidationError */
         ValidationError: {
@@ -1796,6 +1823,41 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["TBRDatesIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TBREntryOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    api_set_tbr_physical_api_tbr__entry_id__physical_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                entry_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TBRPhysicalIn"];
             };
         };
         responses: {

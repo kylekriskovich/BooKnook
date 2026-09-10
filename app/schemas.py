@@ -47,6 +47,7 @@ class TBREntryOut(BaseModel):
     started_at: Optional[str] = None
     started_at_manual: bool = False
     rating: Optional[int] = None
+    owns_physical: bool = False
 
 
 class ShelfOut(BaseModel):
@@ -303,6 +304,10 @@ class TBRCreateIn(BaseModel):
 class TBRDatesIn(BaseModel):
     started_at: str = ""
     finished_at: str = ""
+
+
+class TBRPhysicalIn(BaseModel):
+    owns_physical: bool
 
 
 class ReorderIn(BaseModel):

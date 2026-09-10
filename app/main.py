@@ -58,6 +58,7 @@ from app.models import (
     set_sync_to_device_enabled,
     set_sync_to_device_shelf_id,
     set_tbr_entry_finished_at,
+    set_tbr_entry_owns_physical,
     set_tbr_entry_started_at,
     set_view_preference,
     set_wanted_order,
@@ -467,6 +468,7 @@ def _to_entry_out(entry) -> schemas.TBREntryOut:
         started_at=entry.started_at,
         started_at_manual=entry.started_at_manual,
         rating=entry.rating,
+        owns_physical=entry.owns_physical,
     )
 
 
@@ -1109,6 +1111,20 @@ def api_set_tbr_dates(
     elif entry.status == "finished":
         set_tbr_entry_finished_at(db_connection, entry_id, None)
 
+    return _to_entry_out(_find_entry_detail(db_connection, user.id, entry_id))
+
+
+@app.post("/api/tbr/{entry_id}/physical", response_model=schemas.TBREntryOut)
+def api_set_tbr_physical(
+    entry_id: int,
+    payload: schemas.TBRPhysicalIn,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    entry = get_tbr_entry(db_connection, entry_id)
+    if entry is None or entry.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Not found")
+    set_tbr_entry_owns_physical(db_connection, entry_id, payload.owns_physical)
     return _to_entry_out(_find_entry_detail(db_connection, user.id, entry_id))
 
 

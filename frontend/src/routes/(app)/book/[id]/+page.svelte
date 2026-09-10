@@ -1,6 +1,7 @@
 <script lang="ts">
 	import BookHeader from '$lib/components/BookHeader.svelte';
 	import BookStatsPanel from '$lib/components/BookStatsPanel.svelte';
+	import PhysicalOwnershipSection from '$lib/components/PhysicalOwnershipSection.svelte';
 	import ReadingDatesSection from '$lib/components/ReadingDatesSection.svelte';
 
 	let { data } = $props();
@@ -24,6 +25,7 @@
 
 {#key entry.id}
 	<ReadingDatesSection {entry} />
+	<PhysicalOwnershipSection {entry} />
 {/key}
 
 {#if entry.has_paired_audiobook}

@@ -129,6 +129,14 @@ CREATE TABLE IF NOT EXISTS books (
 -- Grimmory's normal progress-update endpoint keeps it current even though the session log can't —
 -- used as a fallback wherever session data comes back empty for an audiobook (see
 -- app/main.py:api_book_detail).
+-- owns_physical (0/1) is a purely local, per-user fact: whether this specific person owns a
+-- physical copy of this book. Deliberately never sourced from Grimmory's own physical tag - that
+-- tag is catalog-wide (one flag per book, shared by every account on the instance, confirmed
+-- empirically: marking a book physical under one login showed it as physical under a different
+-- login too), which is the wrong shape once BooKnook's users don't all share one household
+-- bookshelf. Set directly by the user via POST /tbr/{id}/physical, independent of status/dates -
+-- owning a physical copy doesn't imply having read from it (see
+-- DESIGN-multi-edition-refactor.md's deferred "manual reading event" idea for that distinction).
 CREATE TABLE IF NOT EXISTS tbr_entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id),
@@ -141,6 +149,7 @@ CREATE TABLE IF NOT EXISTS tbr_entries (
     rating INTEGER,
     sort_order INTEGER,
     audiobook_progress_percent REAL,
+    owns_physical INTEGER NOT NULL DEFAULT 0,
     UNIQUE(user_id, book_id)
 );
 
@@ -336,6 +345,12 @@ def init_db(db_connection: sqlite3.Connection) -> None:
         db_connection.execute("ALTER TABLE library_catalog ADD COLUMN format TEXT")
     except sqlite3.OperationalError:
         pass  # column already exists
+    try:
+        db_connection.execute(
+            "ALTER TABLE tbr_entries ADD COLUMN owns_physical INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        pass  # column already exists
     # One-time backfill for wanted entries that predate sort_order, preserving today's added_at
     # order. Only touches NULL rows, so it's a no-op after the first init_db() call.
     db_connection.execute(
@@ -395,6 +410,7 @@ class TBREntry:
     rating: Optional[int] = None
     sort_order: Optional[int] = None
     audiobook_progress_percent: Optional[float] = None
+    owns_physical: bool = False
 
 
 @dataclass
@@ -415,6 +431,7 @@ class TBREntryDetail:
     rating: Optional[int] = None
     sort_order: Optional[int] = None
     audiobook_progress_percent: Optional[float] = None
+    owns_physical: bool = False
 
 
 @dataclass
@@ -513,6 +530,7 @@ def _row_to_tbr_entry(row: sqlite3.Row) -> TBREntry:
         rating=row["rating"],
         sort_order=row["sort_order"],
         audiobook_progress_percent=row["audiobook_progress_percent"],
+        owns_physical=bool(row["owns_physical"]),
     )
 
 
@@ -669,6 +687,7 @@ def list_tbr_entries_with_books(db_connection: sqlite3.Connection, user_id: int)
         SELECT tbr_entries.id AS entry_id, tbr_entries.status, tbr_entries.added_at,
                tbr_entries.finished_at, tbr_entries.started_at, tbr_entries.started_at_manual,
                tbr_entries.rating, tbr_entries.sort_order, tbr_entries.audiobook_progress_percent,
+               tbr_entries.owns_physical,
                books.id AS book_id, books.title, books.author, books.isbn, books.cover_url,
                books.published_date, books.page_count, books.grimmory_book_id, books.cover_color,
                books.format
@@ -690,6 +709,7 @@ def list_tbr_entries_with_books(db_connection: sqlite3.Connection, user_id: int)
             rating=row["rating"],
             sort_order=row["sort_order"],
             audiobook_progress_percent=row["audiobook_progress_percent"],
+            owns_physical=bool(row["owns_physical"]),
             book=Book(
                 id=row["book_id"],
                 title=row["title"],
@@ -880,6 +900,13 @@ def set_tbr_entry_audiobook_progress_percent(
 ) -> None:
     db_connection.execute(
         "UPDATE tbr_entries SET audiobook_progress_percent = ? WHERE id = ?", (percent, entry_id)
+    )
+    db_connection.commit()
+
+
+def set_tbr_entry_owns_physical(db_connection: sqlite3.Connection, entry_id: int, owns_physical: bool) -> None:
+    db_connection.execute(
+        "UPDATE tbr_entries SET owns_physical = ? WHERE id = ?", (int(owns_physical), entry_id)
     )
     db_connection.commit()
 

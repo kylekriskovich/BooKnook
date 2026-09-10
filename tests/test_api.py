@@ -411,6 +411,40 @@ def test_api_set_tbr_dates_marks_started_at_manual(client):
     assert body["started_at_manual"] is True
 
 
+def test_api_set_tbr_physical_toggles_flag(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id)
+    conn.close()
+
+    response = client.post(f"/api/tbr/{entry.id}/physical", json={"owns_physical": True})
+
+    assert response.status_code == 200
+    assert response.json()["owns_physical"] is True
+
+    conn = models.get_connection()
+    assert models.get_tbr_entry(conn, entry.id).owns_physical is True
+    conn.close()
+
+    response = client.post(f"/api/tbr/{entry.id}/physical", json={"owns_physical": False})
+    assert response.status_code == 200
+    assert response.json()["owns_physical"] is False
+
+
+def test_api_set_tbr_physical_requires_ownership(client):
+    owner = _make_user("Owner")
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, owner.id, book.id)
+    conn.close()
+
+    _logged_in_client(client)
+    response = client.post(f"/api/tbr/{entry.id}/physical", json={"owns_physical": True})
+
+    assert response.status_code == 404
+
+
 def test_api_reorder_wanted_shelf(client):
     user = _logged_in_client(client)
     conn = models.get_connection()
