@@ -142,6 +142,18 @@ so shelves and covers never go stale or leak between users sharing a device. `in
 served with `Cache-Control: no-cache` by `spa_fallback` in `main.py`, since it's the one URL that
 never changes across deploys yet must always reference the current content-hashed bundle.
 
+## Comment conventions
+
+Keep comments short. A one-line `#`/`//` "why" comment is fine when something is genuinely
+non-obvious (a hidden constraint, a workaround, a cross-file dependency); multi-line paragraphs
+stacking several justifications are not — trim to the one sentence that actually matters and trust
+the PR description for the rest. This applies to docstrings (`"""..."""`) just as much as line
+comments — a docstring ballooning into a justification essay is the same problem, not an exception.
+The structured function-header blocks already used in `app/*.py` (`# Function Name: ... /
+# Description: ... / # Parameters: ... / # Returns: ...`) keep their exact format — never collapse
+them into prose or drop a field — but each field's content should still be as concise as the
+format allows; trim a bloated `# Description:` the same way you would any other comment.
+
 ## Testing conventions
 
 Backend tests use FastAPI's `TestClient` against the real `app` object with a per-test SQLite DB

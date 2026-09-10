@@ -159,6 +159,12 @@ main > h1:first-child {
   font: 700 1.1rem system-ui;
 }
 
+/* Fills the same role as .list-title's flex:1 on pages with no header title - e.g. book detail,
+   whose title already sits next to the cover in BookHeader instead. */
+.list-header-spacer {
+  flex: 1;
+}
+
 .list-count {
   font: 600 13px var(--mono);
   color: var(--text-muted2);
@@ -413,6 +419,13 @@ main > h1:first-child {
 
 /* Book detail / remove modal (popover) */
 
+.book-modal-header {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.75rem;
+}
+
 .book-modal[popover] {
   position: fixed;
   inset: 0;
@@ -461,13 +474,22 @@ main > h1:first-child {
   display: flex;
   gap: 14px;
   text-align: left;
+  margin-top: 0.6rem;
   margin-bottom: 18px;
 }
 
 .book-modal-cover {
+  /* Height is set inline from BookHeader.svelte (a measured bind:clientHeight of
+     .book-modal-info), not CSS stretch - see that component for why. Width follows from that
+     height via aspect-ratio. Both capped: a book with every optional metadata row present
+     (started+finished dates, page count, both badges) measures tall enough that matching it
+     exactly reads as oversized - beyond max-height the cover stops growing with the info column
+     rather than dominating the page. */
   flex: none;
-  width: 92px;
-  height: 138px;
+  width: auto;
+  aspect-ratio: 2 / 3;
+  max-width: 160px;
+  max-height: 185px;
   border-radius: 8px;
   object-fit: cover;
   background: var(--bg);
@@ -792,6 +814,12 @@ main > h1:first-child {
   font-size: 0.85rem;
 }
 
+.badge-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
 .badge {
   flex: none;
   align-self: flex-start;
@@ -812,6 +840,11 @@ main > h1:first-child {
 }
 
 .badge-audiobook {
+  background: rgba(209, 154, 58, 0.15);
+  color: #d19a3a;
+}
+
+.badge-physical {
   background: rgba(168, 85, 247, 0.15);
   color: #a855f7;
 }
@@ -857,6 +890,73 @@ main > h1:first-child {
 .settings-checkbox-row input[type='checkbox'] {
   width: 1.1rem;
   height: 1.1rem;
+}
+
+/* iOS/Android-style toggle switch — used where a single boolean reads better as a switch than a
+   checkbox (see PhysicalOwnershipSection.svelte). The real <input type="checkbox"> stays present
+   and clickable (opacity: 0, stretched over the track) for accessibility/keyboard support; the
+   track + thumb are purely visual, driven off :checked via a sibling selector, no JS needed for
+   the animation itself. */
+.switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  cursor: pointer;
+}
+
+.switch-row-label {
+  color: var(--text);
+}
+
+.switch {
+  position: relative;
+  flex: none;
+  display: inline-flex;
+  width: 44px;
+  height: 26px;
+}
+
+.switch input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.switch-track {
+  width: 100%;
+  height: 100%;
+  background: var(--border-soft);
+  border-radius: 999px;
+  box-sizing: border-box;
+  padding: 2px;
+  display: flex;
+  align-items: center;
+  transition: background-color 0.15s ease;
+}
+
+.switch-thumb {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--text);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  transition: transform 0.15s ease;
+}
+
+.switch input:checked ~ .switch-track {
+  background: var(--accent);
+}
+
+.switch input:checked ~ .switch-track .switch-thumb {
+  background: var(--bg);
+  transform: translateX(18px);
+}
+
+.switch input:disabled ~ .switch-track {
+  opacity: 0.5;
 }
 
 /* Settings page (/settings) — account list */
@@ -916,6 +1016,25 @@ main > h1:first-child {
 .settings-row-value {
   color: var(--text-muted2);
   font-size: 0.9rem;
+}
+
+.physical-session-row > div:first-child {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.physical-session-sub {
+  font-size: 0.8rem;
+  color: var(--text-muted2);
+}
+
+.physical-session-actions {
+  display: flex;
+  gap: 0.4rem;
+  flex: none;
 }
 
 .settings-row-chevron {
@@ -985,16 +1104,26 @@ main > h1:first-child {
   white-space: nowrap;
 }
 
-.burndown-wrap {
-  display: flex;
-  gap: 0.5rem;
+/* Grid, not flex, so .burndown-x-axis (row 2) lands in the same column as .burndown-chart (row 1)
+   only - not the full row width including the y-axis labels - which is what lets each tick's
+   left:N% align exactly with the SVG's own day-proportional x-position. */
+.burndown-grid {
+  display: grid;
+  /* minmax(0, 1fr), not bare 1fr - a bare 1fr track has an implicit auto minimum width, which lets
+     the chart's own content floor the track (and the whole page) wider than intended instead of
+     shrinking to fit - the actual cause of the chart overflowing past the page's own render width
+     every previous width/max-width tweak here was only working around, not fixing. */
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 0.5rem;
+  row-gap: 0.4rem;
 }
 
 .burndown-y-axis {
+  grid-column: 1;
+  grid-row: 1;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  flex: none;
   padding: 0.2rem 0;
   font-size: 0.7rem;
   color: var(--text-muted2);
@@ -1002,12 +1131,22 @@ main > h1:first-child {
 }
 
 .burndown-chart {
+  grid-column: 2;
+  grid-row: 1;
   display: block;
-  flex: 1;
+  /* Explicit width, not left to grid stretch - the <svg> has no width/height attributes (only
+     viewBox), and while grid items stretch to fill their column by default, that inference has
+     been unreliable for replaced elements like <svg> specifically on mobile Safari, which falls
+     back to an intrinsic size instead of the grid cell's actual width - causing real horizontal
+     overflow on phones that never showed up testing in Chrome. */
+  width: 100%;
   min-width: 0;
   height: 120px;
   border: 1px solid var(--border);
-  border-radius: 0.75rem;
+  /* Kept small deliberately - the polyline's first/last points sit exactly at the box's corners
+     (day 0 and the final day both touch 0%/100% on their axis by construction), and a bigger
+     radius here visibly clips the line's own endpoint inside the rounded corner. */
+  border-radius: 0.25rem;
   background: var(--panel);
 }
 
@@ -1017,11 +1156,19 @@ main > h1:first-child {
 }
 
 .burndown-x-axis {
-  display: flex;
-  justify-content: space-between;
-  margin-top: 0.4rem;
+  grid-column: 2;
+  grid-row: 2;
+  position: relative;
+  width: 100%;
+  height: 1em;
   font-size: 0.8rem;
   color: var(--text-muted2);
+}
+
+.burndown-tick {
+  position: absolute;
+  top: 0;
+  white-space: nowrap;
 }
 
 .progress-bar-track {
@@ -1046,18 +1193,6 @@ main > h1:first-child {
   color: var(--text-muted2);
 }
 
-/* View/edit toggle for a settings-section — same visually-hidden-checkbox + CSS sibling-selector
-   pattern already used for the spine/cover view switch (see .view-radio / #view-spine:checked).
-   Only ever one per page (book_detail.html), so a single shared id/class is safe — no per-entry
-   uniqueness needed here unlike the shelf templates' per-book popovers. */
-.edit-toggle {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  opacity: 0;
-  pointer-events: none;
-}
-
 .settings-section-header {
   display: flex;
   align-items: center;
@@ -1066,18 +1201,6 @@ main > h1:first-child {
 
 .settings-section-header .settings-section-title {
   padding-bottom: 0;
-}
-
-.dates-edit-form {
-  display: none;
-}
-
-.edit-toggle:checked ~ .dates-readonly {
-  display: none;
-}
-
-.edit-toggle:checked ~ .dates-edit-form {
-  display: grid;
 }
 
 .dates-edit-actions {

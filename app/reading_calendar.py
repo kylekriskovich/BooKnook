@@ -56,9 +56,8 @@ def _all_spans(entries: list[TBREntryDetail], today: Optional[date] = None) -> l
 
 # Function Name: _assign_lanes
 # Description: Assigns each span a stable vertical bar lane via greedy interval scheduling
-#   ("minimum platforms"): reuse the lowest-numbered lane whose occupant has ended, else open a
-#   new one. Keeps a span in the same lane for its whole duration so its bar doesn't jump vertical
-#   position mid-run. Mutates spans in place.
+#   ("minimum platforms") so a span's bar doesn't jump position mid-run: reuse the
+#   lowest-numbered lane whose occupant has ended, else open a new one. Mutates spans in place.
 # Parameters:
 # - spans (list[BookSpan]): spans to assign lanes to.
 # Returns: None.
@@ -205,10 +204,9 @@ class DayCell:
         ]
 
     # Function Name: cover_spans
-    # Description: Spans with a milestone on this date, display order - index 0 is the "winner"
-    #   (rendered centered/prominent), rest fan out behind it. Same-day start+finish ranks
-    #   highest, then a finish outranks a mere start, ties by book id. Uncapped here (the template
-    #   caps at 3) except for _decluttered_spans.
+    # Description: Spans with a milestone on this date, in display order - index 0 is the
+    #   "winner" (centered/prominent), rest fan out behind it, ranked by same-day start+finish,
+    #   then finish-over-start, then book id. Uncapped here except for _decluttered_spans.
     # Returns: BookSpans with a milestone on this date, highest display priority first.
     @property
     def cover_spans(self) -> list[BookSpan]:
@@ -222,8 +220,7 @@ class DayCell:
 
     # Function Name: bar_spans
     # Description: active_spans minus _decluttered_spans, one slot per lane up to the display cap
-    #   of 3 (index == lane). None-trimmed at both ends - only an interior gap (a lower lane empty
-    #   while a higher one is occupied) becomes None, so a lane doesn't visually shift position
+    #   of 3 (index == lane). Only an interior gap becomes None - a lane doesn't shift position
     #   depending on which lanes above/below it happen to be occupied that day.
     # Returns: Up to 3 slots, index == lane, real BookSpans or None for an occupied-above gap.
     @property

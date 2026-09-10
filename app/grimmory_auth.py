@@ -43,8 +43,7 @@ _refresh_locks: "defaultdict[int, threading.Lock]" = defaultdict(threading.Lock)
 
 # Function Name: refresh_lock
 # Description: The same per-user lock get_valid_access_token uses internally, exposed so callers
-#   writing a refresh token/cached access token directly (see app/main.py) can hold it too and
-#   avoid clobbering a concurrent login. Not reentrant - don't nest inside get_valid_access_token.
+#   writing a refresh/access token directly (see app/main.py) can hold it too. Not reentrant.
 # Parameters:
 # - user_id (int): Local user id to lock.
 # Returns: threading.Lock
@@ -84,9 +83,9 @@ def cache_access_token(user_id: int, access_token: str, expires_in: Optional[int
 
 
 # Function Name: evict_access_token
-# Description: Evicts a cached access token if Grimmory has rejected it early (before our own
-#   cached deadline). Matches by token value since callers several layers down only see the token
-#   string, not which user it belongs to.
+# Description: Evicts a cached access token if Grimmory rejected it early (before our cached
+#   deadline). Matches by token value since callers several layers down don't know which user it
+#   belongs to.
 # Parameters:
 # - access_token (str): The access token that was rejected.
 # Returns: None

@@ -1,11 +1,8 @@
 """Pydantic response models for the JSON API (see the /api/* routes in app/main.py).
 
-These mirror the plain dataclasses in app/models.py and the ad hoc dicts the stat_tiles/
-reading_calendar helpers already return — the API layer's job is to give those a stable, typed
-shape for the frontend, not to change what they contain. Secrets (grimmory_refresh_token, stored
-passwords/API keys) are deliberately never included — settings responses only ever expose whether
-a secret is set, matching what the Jinja2 admin_settings.html template already showed.
-"""
+Mirrors the dataclasses in app/models.py and the ad hoc dicts stat_tiles/reading_calendar return,
+giving them a stable typed shape for the frontend. Secrets (grimmory_refresh_token, stored
+passwords/API keys) are never included — settings responses only ever expose whether one is set."""
 
 from __future__ import annotations
 
@@ -47,6 +44,16 @@ class TBREntryOut(BaseModel):
     started_at: Optional[str] = None
     started_at_manual: bool = False
     rating: Optional[int] = None
+    owns_physical: bool = False
+    physical_page_count: Optional[int] = None
+
+
+class PhysicalReadingSessionOut(BaseModel):
+    id: int
+    start_time: str
+    end_time: str
+    start_page: int
+    end_page: int
 
 
 class ShelfOut(BaseModel):
@@ -85,18 +92,14 @@ class BurndownPointOut(BaseModel):
 
 class BookDetailOut(BaseModel):
     entry: TBREntryOut
+    # Time-spent-by-medium tiles stay split (Decision 6); audiobook_tiles is empty if unpaired.
     tiles: list[StatTileOut]
+    audiobook_tiles: list[StatTileOut] = []
+    # Progress and burndown are unified across every linked edition instead (Decision 5).
     burndown: list[BurndownPointOut]
     burndown_day_span: int
     progress_percent: Optional[float] = None
     estimated_page: Optional[int] = None
-    # Same shape as the fields above, but for the paired audiobook's own sessions (see
-    # entry.has_paired_audiobook) - empty/None whenever there's no pairing or no session data yet.
-    audiobook_tiles: list[StatTileOut] = []
-    audiobook_burndown: list[BurndownPointOut] = []
-    audiobook_burndown_day_span: int = 0
-    audiobook_progress_percent: Optional[float] = None
-    audiobook_estimated_page: Optional[int] = None
 
 
 class CalendarBookOut(BaseModel):
@@ -121,11 +124,10 @@ class BookSpanOut(BaseModel):
 
 
 class DayCellOut(BaseModel):
-    """active/cover/bar mirror reading_calendar.DayCell's active_spans/cover_spans/bar_spans —
-    same precedence (declutter, milestone ranking, lane-gap None-padding) already computed
-    server-side, just referencing spans by entry_id instead of embedding BookSpan objects.
-    bar_entry_ids preserves interior None gaps (an unoccupied lane below a higher occupied one);
-    it is never trimmed to a shorter list than the highest occupied lane + 1."""
+    """active/cover/bar mirror reading_calendar.DayCell's active_spans/cover_spans/bar_spans,
+    computed server-side and referenced here by entry_id instead of embedding BookSpan objects.
+    bar_entry_ids preserves interior None gaps — never trimmed shorter than the highest occupied
+    lane + 1."""
 
     date: date
     in_month: bool
@@ -222,9 +224,7 @@ class AdminEntryOut(BaseModel):
 class AdminOut(BaseModel):
     needed_entries: list[AdminEntryOut]
     owned_entries: list[AdminEntryOut]
-    # In-library books whose primaryFile is an audiobook - split out from owned_entries so the
-    # admin page can list them separately (see library_check.AUDIOBOOKS_ENABLED for why they're
-    # excluded from everywhere else).
+    # In-library audiobooks, split out from owned_entries (see library_check.AUDIOBOOKS_ENABLED).
     audiobook_entries: list[AdminEntryOut]
     library_check_enabled: bool
     last_synced_at: Optional[str] = None
@@ -303,6 +303,24 @@ class TBRCreateIn(BaseModel):
 class TBRDatesIn(BaseModel):
     started_at: str = ""
     finished_at: str = ""
+
+
+class TBRPhysicalIn(BaseModel):
+    owns_physical: bool
+
+
+class TBRPhysicalPageCountIn(BaseModel):
+    # None clears it - unlike the secret-settings "blank means unchanged" convention elsewhere,
+    # this field has no other way to signal "I know it and it's actually unset" vs "leave it alone",
+    # so this endpoint always overwrites with whatever's sent, no leave-unchanged semantics.
+    physical_page_count: Optional[int] = None
+
+
+class PhysicalReadingSessionIn(BaseModel):
+    start_time: str
+    end_time: str
+    start_page: int
+    end_page: int
 
 
 class ReorderIn(BaseModel):

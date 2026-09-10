@@ -5,9 +5,20 @@
 	type BurndownPoint = components['schemas']['BurndownPointOut'];
 
 	let { points, daySpan }: { points: BurndownPoint[]; daySpan: number } = $props();
+
+	// Up to 5 evenly-spaced day labels (matching the y-axis's own 5 gridlines), always including
+	// day 0 and daySpan - for a short span (e.g. daySpan=2) this lands on every day; for a long one
+	// it thins out rather than cramming a label per day.
+	let ticks = $derived.by(() => {
+		if (daySpan <= 0) return [0];
+		const steps = Math.min(daySpan, 4);
+		const days = new Set<number>();
+		for (let i = 0; i <= steps; i++) days.add(Math.round((daySpan * i) / steps));
+		return [...days].sort((a, b) => a - b);
+	});
 </script>
 
-<div class="burndown-wrap">
+<div class="burndown-grid">
 	<div class="burndown-y-axis">
 		<span>100%</span>
 		<span>75%</span>
@@ -23,8 +34,18 @@
 		<line class="burndown-gridline" x1="0" y1="100" x2="300" y2="100" />
 		<polyline points={burndownSvgPoints(points)} fill="none" stroke="var(--accent)" stroke-width="2" />
 	</svg>
-</div>
-<div class="burndown-x-axis">
-	<span>Day 0</span>
-	<span>Day {daySpan}</span>
+	<div class="burndown-x-axis">
+		{#each ticks as tick, i (tick)}
+			<span
+				class="burndown-tick"
+				style="left: {daySpan > 0 ? (tick / daySpan) * 100 : 0}%; transform: translateX({i === 0
+					? '0'
+					: i === ticks.length - 1
+						? '-100%'
+						: '-50%'})"
+			>
+				Day {tick}
+			</span>
+		{/each}
+	</div>
 </div>

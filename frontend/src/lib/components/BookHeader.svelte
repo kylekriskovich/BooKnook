@@ -3,23 +3,42 @@
 	import type { TBREntry } from '$lib/utils/entries';
 
 	let { entry }: { entry: TBREntry } = $props();
+
+	// align-self:stretch + aspect-ratio won't size the cover from this column's content height
+	// (width resolves before the stretch pass runs), so measure the column and set height explicitly.
+	let infoHeight = $state(0);
 </script>
 
 <div class="book-modal-body">
 	{#if entry.book.cover_url}
-		<img src={entry.book.cover_url} alt="" class="book-modal-cover" />
+		<img
+			src={entry.book.cover_url}
+			alt=""
+			class="book-modal-cover"
+			style={infoHeight ? `height: ${infoHeight}px` : ''}
+		/>
 	{:else}
-		<div class="book-modal-cover book-modal-cover-placeholder" style="background:{paletteFor(entry.book.id)}"></div>
+		<div
+			class="book-modal-cover book-modal-cover-placeholder"
+			style="background:{paletteFor(entry.book.id)}{infoHeight ? `; height: ${infoHeight}px` : ''}"
+		></div>
 	{/if}
-	<div class="book-modal-info">
+	<div class="book-modal-info" bind:clientHeight={infoHeight}>
 		<div class="book-modal-title">{entry.book.title}</div>
-		{#if entry.owned !== null && entry.owned !== undefined}
-			<span class="badge {entry.owned ? 'badge-owned' : 'badge-needed'}">
-				{entry.owned ? 'In Library' : 'Requested'}
-			</span>
-		{/if}
-		{#if entry.has_paired_audiobook}
-			<span class="badge badge-audiobook">Audiobook available</span>
+		{#if (entry.owned !== null && entry.owned !== undefined) || entry.has_paired_audiobook || entry.owns_physical}
+			<div class="badge-row">
+				{#if entry.owned !== null && entry.owned !== undefined}
+					<span class="badge {entry.owned ? 'badge-owned' : 'badge-needed'}">
+						{entry.owned ? 'In Library' : 'Requested'}
+					</span>
+				{/if}
+				{#if entry.has_paired_audiobook}
+					<span class="badge badge-audiobook">Audiobook</span>
+				{/if}
+				{#if entry.owns_physical}
+					<span class="badge badge-physical">Physical</span>
+				{/if}
+			</div>
 		{/if}
 		{#if entry.book.author}
 			<div class="book-modal-meta">
@@ -49,6 +68,36 @@
 					/>
 				</svg>
 				<span>{entry.book.published_date}</span>
+			</div>
+		{/if}
+		{#if entry.book.page_count}
+			<div class="book-modal-meta">
+				<svg viewBox="0 -960 960 960" fill="currentColor" aria-hidden="true">
+					<path
+						d="M320-240h320v-80H320v80Zm0-160h320v-80H320v80ZM240-80q-33 0-56.5-23.5T160-160v-640q0-33 23.5-56.5T240-880h320l240 240v480q0 33-23.5 56.5T720-80H240Zm280-520v-200H240v640h480v-440H520ZM240-800v200-200 640-640Z"
+					/>
+				</svg>
+				<span>{entry.book.page_count} pages</span>
+			</div>
+		{/if}
+		{#if entry.started_at}
+			<div class="book-modal-meta">
+				<svg viewBox="0 -960 960 960" fill="currentColor" aria-hidden="true">
+					<path
+						d="M200-80q-33 0-56.5-23.5T120-160v-560q0-33 23.5-56.5T200-800h40v-80h80v80h320v-80h80v80h40q33 0 56.5 23.5T840-720v560q0 33-23.5 56.5T760-80H200Zm0-80h560v-400H200v400Zm0-480h560v-80H200v80Zm0 0v-80 80Zm280 240q-17 0-28.5-11.5T440-440q0-17 11.5-28.5T480-480q17 0 28.5 11.5T520-440q0 17-11.5 28.5T480-400Zm-188.5-11.5Q280-423 280-440t11.5-28.5Q303-480 320-480t28.5 11.5Q360-457 360-440t-11.5 28.5Q337-400 320-400t-28.5-11.5ZM640-400q-17 0-28.5-11.5T600-440q0-17 11.5-28.5T640-480q17 0 28.5 11.5T680-440q0 17-11.5 28.5T640-400ZM480-240q-17 0-28.5-11.5T440-280q0-17 11.5-28.5T480-320q17 0 28.5 11.5T520-280q0 17-11.5 28.5T480-240Zm-188.5-11.5Q280-263 280-280t11.5-28.5Q303-320 320-320t28.5 11.5Q360-297 360-280t-11.5 28.5Q337-240 320-240t-28.5-11.5ZM640-240q-17 0-28.5-11.5T600-280q0-17 11.5-28.5T640-320q17 0 28.5 11.5T680-280q0 17-11.5 28.5T640-240Z"
+					/>
+				</svg>
+				<span>Started {entry.started_at}</span>
+			</div>
+		{/if}
+		{#if entry.status === 'finished' && entry.finished_at}
+			<div class="book-modal-meta">
+				<svg viewBox="0 -960 960 960" fill="currentColor" aria-hidden="true">
+					<path
+						d="M200-80q-33 0-56.5-23.5T120-160v-560q0-33 23.5-56.5T200-800h40v-80h80v80h320v-80h80v80h40q33 0 56.5 23.5T840-720v560q0 33-23.5 56.5T760-80H200Zm0-80h560v-400H200v400Zm0-480h560v-80H200v80Zm0 0v-80 80Zm280 240q-17 0-28.5-11.5T440-440q0-17 11.5-28.5T480-480q17 0 28.5 11.5T520-440q0 17-11.5 28.5T480-400Zm-188.5-11.5Q280-423 280-440t11.5-28.5Q303-480 320-480t28.5 11.5Q360-457 360-440t-11.5 28.5Q337-400 320-400t-28.5-11.5ZM640-400q-17 0-28.5-11.5T600-440q0-17 11.5-28.5T640-480q17 0 28.5 11.5T680-440q0 17-11.5 28.5T640-400ZM480-240q-17 0-28.5-11.5T440-280q0-17 11.5-28.5T480-320q17 0 28.5 11.5T520-280q0 17-11.5 28.5T480-240Zm-188.5-11.5Q280-263 280-280t11.5-28.5Q303-320 320-320t28.5 11.5Q360-297 360-280t-11.5 28.5Q337-240 320-240t-28.5-11.5ZM640-240q-17 0-28.5-11.5T600-280q0-17 11.5-28.5T640-320q17 0 28.5 11.5T680-280q0 17-11.5 28.5T640-240Z"
+					/>
+				</svg>
+				<span>Finished {entry.finished_at.slice(0, 10)}</span>
 			</div>
 		{/if}
 	</div>

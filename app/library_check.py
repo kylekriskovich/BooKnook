@@ -86,16 +86,9 @@ FINISHED_READ_STATUSES = {"READ"}
 READING_READ_STATUSES = {"READING", "RE_READING", "PARTIALLY_READ"}
 ABANDONED_READ_STATUSES = {"WONT_READ", "ABANDONED"}
 
-# Audiobook support (format sync, the audiobook_progress_percent fallback, "Listening" tile labels
-# in app/stat_tiles.py and app/main.py:api_book_detail) is switched off for now - Grimmory's own
-# gaps in audiobook session/progress data were producing duplicate shelf entries and broken stats
-# in practice. Flip this back to True to re-enable; nothing else needs to change, since every
-# audiobook-specific branch elsewhere only ever triggers for a book whose format is "AUDIOBOOK",
-# and no book gets tagged that way while this is False.
-#
-# The paired-audiobook status pass in sync_user_reading_status (search for get_audiobook_pairings)
-# is independent of this flag - it never treats an audiobook as its own trackable book, only as a
-# secondary status signal for its paired ebook, so it doesn't re-enable anything this flag gates.
+# Off for now - Grimmory's audiobook session/progress gaps caused duplicate entries and broken
+# stats. Every audiobook branch gates on format=="AUDIOBOOK", so flipping this back is safe.
+# get_audiobook_pairings' paired-status pass is independent of this flag.
 AUDIOBOOKS_ENABLED = False
 
 
@@ -105,11 +98,8 @@ def _is_audiobook(book: dict) -> bool:
 
 class LibraryCheckUnavailable(Exception):
     """Raised when the Grimmory API can't be reached, isn't configured, or rejected a request.
-
-    status_code carries the HTTP status Grimmory returned, when known. is_auth_rejection is True
-    only for a real 401/403 - callers use it to decide whether a cached access token is worth
-    evicting (a transient 5xx/connection error doesn't mean the token itself is bad).
-    """
+    status_code is the HTTP status when known; is_auth_rejection is True only for a real 401/403,
+    letting callers decide whether to evict a cached access token."""
 
     def __init__(self, message: str, status_code: Optional[int] = None):
         super().__init__(message)
@@ -249,13 +239,9 @@ def _normalize_isbn(isbn: str) -> str:
 def find_catalog_match(
     title: str, isbn: Optional[str], author: Optional[str], catalog: list[LibraryCatalogEntry]
 ) -> Optional[LibraryCatalogEntry]:
-    # Audiobooks are never a valid match target for a plain title/ISBN/author lookup - an ebook and
-    # its audiobook counterpart can share identical metadata in Grimmory, and without this a book
-    # only available as an audiobook could get badged "In Library" (see app/main.py's
-    # _tbr_entries_for_user) or auto-matched as owned via an edition that isn't actually readable.
-    # The only sanctioned way to associate the two is an explicit admin pairing (see
-    # app.models.audiobook_pairings) - resolve_catalog_match's manual_match_grimmory_id branch
-    # bypasses this function entirely, so an admin can still explicitly pin to an audiobook id.
+    # Audiobooks share metadata with their ebook counterpart, so exclude them here to avoid
+    # auto-matching a book as owned via an edition that isn't actually readable. Explicit admin
+    # pairings (app.models.audiobook_pairings) bypass this via resolve_catalog_match instead.
     catalog = [entry for entry in catalog if entry.format != "AUDIOBOOK"]
     if isbn:
         normalized = _normalize_isbn(isbn)
@@ -400,8 +386,8 @@ def list_own_shelves(base_url: str, access_token: str, own_grimmory_user_id: int
 
 # Function Name: _shelf_name_key
 # Description: Normalizes a shelf name for matching - Grimmory's duplicate-name check is
-#   case-insensitive (MariaDB's default collation), so this must be too or get_or_create_shelf_by_name
-#   loops forever on a 409 it can never resolve (confirmed in production).
+#   case-insensitive, so this must be too, or get_or_create_shelf_by_name loops forever on a 409
+#   it can't resolve.
 # Parameters:
 # - name (str): Raw shelf name.
 # Returns: Normalized name (str)
@@ -729,10 +715,9 @@ def _ensure_sync_to_device_shelf(db_connection, user, base_url: str, access_toke
     return shelf_id
 
 # Function Name: _dedupe_by_grimmory_id
-# Description: Keeps only the first occurrence of each Grimmory book id. Grimmory's own
-#   GET /api/v1/books response has been observed to include the same book id more than once in a
-#   single call (see issue #22) - left un-deduped, only the first occurrence gets matched in Pass 1
-#   below, and every repeat reads as "unmatched" to Pass 2, minting a duplicate local book per repeat.
+# Description: Keeps only the first occurrence of each Grimmory book id - Grimmory's own book
+#   list has been observed to repeat an id within one response (issue #22), and an un-deduped
+#   repeat reads as "unmatched" to Pass 2, minting a duplicate local book.
 # Parameters:
 # - books (list[dict]): Raw Grimmory book payloads, as returned by fetch_user_books.
 # Returns: The same payloads with repeat ids removed, order preserved.
@@ -780,11 +765,9 @@ def sync_user_reading_status(
 
     matched_indices: set[int] = set()
 
-    # Pass 1: match Grimmory books against existing tbr_entries, by grimmory_book_id when already
-    # known, else fuzzy ISBN/title/author (matching by id first prevents re-adding an already
-    # tracked book as a duplicate when its metadata drifts slightly - see issue #22). Updates
-    # status/finished_at, removes a "reading" entry if now WONT_READ/ABANDONED, and downloads a
-    # missing cover.
+    # Pass 1: match Grimmory books against existing tbr_entries, by grimmory_book_id when known
+    # (avoids re-adding a tracked book as a duplicate if its metadata drifts - see issue #22),
+    # else fuzzy ISBN/title/author. Updates status/finished_at and downloads a missing cover.
     for entry in list_tbr_entries_with_books(db_connection, user_id):
         if not AUDIOBOOKS_ENABLED and entry.book.format == "AUDIOBOOK":
             # Was tracked from an earlier sync, before audiobook support was switched off - drop it
@@ -840,13 +823,9 @@ def sync_user_reading_status(
         _sync_book_metadata(db_connection, new_book.id, new_entry.id, book)
         _maybe_download_cover(db_connection, base_url, access_token, new_book.id, book.get("id"))
 
-    # Pass 2b: paired audiobooks (see app.models.audiobook_pairings) contribute their own
-    # reading/finished status onto their paired ebook's entry - never as a separate trackable book
-    # (unpaired audiobooks are excluded from `books`/`catalog` above and never reach here). Runs
-    # after the ebook-only passes above so the ebook's own status/dates are always established
-    # first; _apply_status never downgrades, so a tie always favors what Pass 1/2 just set, and an
-    # audiobook only ever pushes the entry further (wanted->reading->finished), using its own
-    # dateFinished when it's the one supplying the upgrade.
+    # Pass 2b: paired audiobooks (app.models.audiobook_pairings) push status onto their paired
+    # ebook's entry, never as their own trackable book. Runs after Pass 1/2 so the ebook's status
+    # wins ties; _apply_status never downgrades, so audiobooks only ever advance the entry.
     pairings = get_audiobook_pairings(db_connection)
     paired_audiobooks = [b for b in raw_books if _is_audiobook(b) and b.get("id") in pairings]
     if paired_audiobooks:
@@ -887,10 +866,8 @@ def sync_user_reading_status(
             _apply_status(
                 db_connection, new_entry.id, new_entry.status, new_entry.started_at, target, audiobook_book
             )
-            # Always the ebook's own data - never the audiobook's. _sync_book_metadata also writes
-            # audiobook_progress_percent (from whichever book dict it's given), always None for a
-            # plain ebook dict - the real audiobook-derived value below must be written after this
-            # call, not before, or this would clobber it straight back to None.
+            # _sync_book_metadata writes audiobook_progress_percent=None for a plain ebook dict, so
+            # the real value below must be set after this call or it gets clobbered back to None.
             _sync_book_metadata(db_connection, new_book.id, new_entry.id, books[ebook_idx])
             audiobook_progress = audiobook_book.get("audiobookProgress") or {}
             set_tbr_entry_audiobook_progress_percent(

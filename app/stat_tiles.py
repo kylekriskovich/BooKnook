@@ -4,10 +4,38 @@ from datetime import date, datetime, timedelta
 from typing import Optional
 
 from app.dates import longest_consecutive_run, parse_date, parse_instant, today_utc
+from app.models import PhysicalReadingSession
 
 
 def session_date(session: dict) -> Optional[date]:
     return parse_date(session.get("startTime"))
+
+
+def physical_session_to_grimmory_shape(
+    session: PhysicalReadingSession, physical_page_count: Optional[int]
+) -> dict:
+    """Converts a manually-logged physical session into a Grimmory-shaped dict so it flows
+    through this module unmodified (Decisions 7/9). Percentages use the *physical* edition's own
+    page count (not books.page_count, which can differ) and are computed live here, not stored."""
+    start = parse_instant(session.start_time)
+    end = parse_instant(session.end_time)
+    duration_seconds = round((end - start).total_seconds()) if start and end else None
+    start_progress = end_progress = progress_delta = None
+    if physical_page_count:
+        start_progress = session.start_page / physical_page_count * 100
+        end_progress = session.end_page / physical_page_count * 100
+        progress_delta = end_progress - start_progress
+    return {
+        "startTime": session.start_time,
+        "endTime": session.end_time,
+        "durationSeconds": duration_seconds,
+        "startProgress": start_progress,
+        "endProgress": end_progress,
+        "progressDelta": progress_delta,
+        # Raw page delta, known regardless of physical_page_count - lets build_book_tiles convert
+        # to pages using this edition's own count instead of guessing via the ebook's page_count.
+        "pageDelta": session.end_page - session.start_page,
+    }
 
 
 def _has_meaningful_progress(session: dict) -> bool:
@@ -15,7 +43,20 @@ def _has_meaningful_progress(session: dict) -> bool:
     # real listening time still counts.
     if (session.get("progressDelta") or 0) > 0:
         return True
+    if (session.get("pageDelta") or 0) > 0:
+        return True
     return session.get("bookType") == "AUDIOBOOK" and (session.get("durationSeconds") or 0) > 0
+
+
+def _session_page_delta(session: dict, fallback_page_count: Optional[int]) -> Optional[float]:
+    """A session's own known page delta (physical sessions) if present, else an estimate from its
+    percentage progressDelta against the ebook's page_count (Grimmory sessions have no raw pages)."""
+    if session.get("pageDelta") is not None:
+        return session["pageDelta"]
+    delta = session.get("progressDelta")
+    if delta and fallback_page_count:
+        return delta / 100 * fallback_page_count
+    return None
 
 
 def format_duration(total_seconds: int) -> str:
@@ -38,6 +79,15 @@ def latest_progress(sessions: list[dict]) -> Optional[float]:
     if not dated:
         return None
     return max(dated, key=lambda t: t[0])[1]
+
+
+def unified_latest_progress(candidates: list[Optional[float]]) -> Optional[float]:
+    """Highest of several linked editions' own latest tracked progress - "how far into this book
+    am I, across any medium" (DESIGN-multi-edition-refactor.md Decision 5). A high-water mark
+    rather than "whichever edition was used most recently", so resuming a medium that hasn't
+    caught up yet doesn't read as regression. None if none of the candidates have a value."""
+    known = [c for c in candidates if c is not None]
+    return max(known) if known else None
 
 
 def first_meaningful_session_date(sessions: list[dict]) -> Optional[date]:
@@ -101,17 +151,10 @@ def build_book_tiles(
     entry, sessions: list[dict], today: Optional[date] = None, is_audiobook: Optional[bool] = None
 ) -> list[dict]:
     """Session-dependent tiles for one book (GET /book/{entry_id}) - only meaningful given a
-    single book's own reading-session log, not aggregatable across many books without fetching
-    every one's sessions (which the collection tiles below deliberately never do). `today` should
-    be the caller's own local date (see app/main.py:_resolve_client_today) - defaults to the
-    server's UTC date only for direct/test callers that don't have a client to ask. `is_audiobook`
-    picks "Listening"-labeled tiles over "Reading" ones and is normally the caller's choice, not
-    derived from the entry's own book - under the audiobook-pairing model (app.models.
-    audiobook_pairings) an entry's book is always the ebook, so `sessions` may belong to either the
-    ebook or its paired audiobook depending on which stats tab called this. Defaults to
-    entry.book.format == "AUDIOBOOK" only for backward compatibility with callers that don't pass
-    it - in practice that's never true anymore, but keeps this function's behavior unchanged for
-    any caller that still relies on it."""
+    single book's own reading-session log, not aggregatable across many books. `today` defaults to
+    UTC for callers with no client-local date to pass (see app/main.py:_resolve_client_today).
+    `is_audiobook` picks "Listening" vs "Reading" labels and must be passed explicitly - an entry's
+    book is always the ebook, so `sessions` may belong to either it or a paired audiobook."""
     today = today or today_utc()
     if is_audiobook is None:
         is_audiobook = entry.book.format == "AUDIOBOOK"
@@ -137,11 +180,19 @@ def build_book_tiles(
             best_session = max(sessions, key=lambda s: s.get("progressDelta") or 0)
             best_delta = best_session.get("progressDelta") or 0
             best_date = session_date(best_session)
-            if page_count:
-                avg_pages = round((sum(deltas) / len(deltas)) / 100 * page_count)
+            # Each session's own page delta when known (physical editions), falling back to an
+            # estimate via the ebook's page_count only for sessions with no raw pages of their own.
+            page_deltas = [
+                pd
+                for s in sessions
+                if s.get("progressDelta") and (pd := _session_page_delta(s, page_count)) is not None
+            ]
+            if page_deltas:
+                avg_pages = round(sum(page_deltas) / len(page_deltas))
                 if avg_pages > 0:
                     tiles.append({"label": "Pages per session", "value": str(avg_pages)})
-                best_pages = round(best_delta / 100 * page_count)
+                best_page_delta = _session_page_delta(best_session, page_count)
+                best_pages = round(best_page_delta) if best_page_delta else 0
                 if best_pages > 0:
                     tiles.append(
                         {
@@ -190,9 +241,12 @@ def build_book_tiles(
         if fallback:
             tiles.append(fallback)
 
-    days_to_complete = _days_to_complete_tile(entry)
-    if days_to_complete:
-        tiles.append(days_to_complete)
+    # Book-level (started_at/finished_at), not medium-specific - included only once, on the
+    # primary/Reading tile list, rather than duplicated onto the Listening tab too.
+    if not is_audiobook:
+        days_to_complete = _days_to_complete_tile(entry)
+        if days_to_complete:
+            tiles.append(days_to_complete)
 
     return tiles
 
@@ -219,13 +273,10 @@ def finish_time_tiles_for_collection(entries: list) -> list[dict]:
 
 def _prorated_pages(entry, window_start: date, window_end: date) -> Optional[float]:
     """Fraction of entry.book.page_count attributable to the days of its started_at->finished_at
-    span that actually fall within [window_start, window_end] - same overlap-proration principle
-    as reading_calendar.estimated_pages, applied here to the exact finished-in-window entries
-    build_collection_tiles already selects. A book started 9 days before the window and finished
-    on the window's first day only contributes 1/10 of its pages, not the full count - previously
-    every book finished inside the window counted in full regardless of how much of its reading
-    happened outside it. None if page_count/started_at/finished_at is missing, or the span/overlap
-    can't be computed (bad-data guards, same posture as _entry_duration_days)."""
+    span that fall within [window_start, window_end] - same overlap-proration as
+    reading_calendar.estimated_pages, so a book finished on the window's first day but started 9
+    days earlier only contributes 1/10 of its pages. None if page_count/started_at/finished_at is
+    missing or there's no valid overlap."""
     page_count = entry.book.page_count
     if not page_count or not entry.started_at or not entry.finished_at:
         return None
@@ -245,20 +296,12 @@ def _prorated_pages(entry, window_start: date, window_end: date) -> Optional[flo
 
 
 def build_collection_tiles(entries: list, window_start: date, window_end: date) -> list[dict]:
-    """Session-independent aggregate tiles over an arbitrary set of finished entries - e.g. all
-    books finished in a year (GET /stats) or a month (GET /calendar) or any other
-    timeframe/selection a caller filters down to; this function doesn't know or care how the set
-    was chosen, which is what lets a month/goal-window timeframe reuse it with no new tile logic.
-    `window_start`/`window_end` bound that same timeframe (e.g. Jan 1-Dec 31 for a year, the
-    month's first/last day for a month) - needed to prorate Total/Avg pages by how much of each
-    book's reading span actually falls inside the window (see _prorated_pages), rather than
-    crediting a book's full length to whichever window it happened to finish in. Each tile
-    independently skips entries missing the field it needs (page_count/rating/started_at) rather
-    than estimating. "Avg pages read" and "Avg book length" are the same figure by construction
-    (both = total prorated pages / entries with a computable proration) - kept as separate tiles
-    since they're separate asks with different framing, not a bug. Longest/Shortest book still
-    show each book's real, unprorated page_count (and title) - prorating an individual book's
-    displayed length would read as a data error, not a feature, so only the sum/average prorate."""
+    """Session-independent aggregate tiles over an arbitrary set of finished entries (e.g. a year
+    for GET /stats, a month for GET /calendar). `window_start`/`window_end` prorate Total/Avg
+    pages by how much of each book's reading span falls inside the window (see _prorated_pages),
+    rather than crediting a book's full length to its finish window. "Avg pages read"/"Avg book
+    length" are the same figure by construction but kept as separate tiles intentionally;
+    Longest/Shortest still show each book's real, unprorated page_count."""
     tiles = [{"label": "Books finished", "value": str(len(entries))}]
     if not entries:
         return tiles

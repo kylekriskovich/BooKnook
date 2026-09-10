@@ -3,12 +3,9 @@ import type { components } from '$lib/api/schema';
 type BurndownPoint = components['schemas']['BurndownPointOut'];
 
 /**
- * Maps burndown points onto an SVG viewBox of the given size — mirrors
- * app/stat_tiles.py:burndown_svg_points exactly (x proportional to each point's actual elapsed
- * days since the first point, not its index, so a gap between reading sessions shows up as a gap
- * on the chart instead of being smoothed away by even spacing). Kept client-side rather than
- * server-computed since it's pure presentation, not data — see app/schemas.py's BookDetailOut,
- * which only sends the raw points.
+ * Maps burndown points onto an SVG viewBox — x is proportional to elapsed days since the first
+ * point, not index, so a gap between reading sessions shows as a gap rather than being smoothed
+ * away by even spacing. Kept client-side (pure presentation) rather than server-computed.
  */
 export function burndownSvgPoints(points: BurndownPoint[], width = 300, height = 100): string {
 	if (points.length === 0) return '';

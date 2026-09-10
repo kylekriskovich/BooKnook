@@ -18,8 +18,7 @@
 
 {#if auth.user}
 	<!-- Pure-CSS spine/cover toggle: home's ShelfRow renders both blocks, and
-	     #view-spine:checked ~ main #shelves .shelf-spine (see app.css) shows the right one — same
-	     mechanism the Jinja2/htmx app used, just posting the choice via fetch instead of hx-post. -->
+	     #view-spine:checked ~ main #shelves .shelf-spine (see app.css) shows the right one. -->
 	<input
 		type="radio"
 		name="view"

@@ -129,6 +129,23 @@ CREATE TABLE IF NOT EXISTS books (
 -- Grimmory's normal progress-update endpoint keeps it current even though the session log can't —
 -- used as a fallback wherever session data comes back empty for an audiobook (see
 -- app/main.py:api_book_detail).
+-- owns_physical (0/1) is a purely local, per-user fact: whether this specific person owns a
+-- physical copy of this book. Deliberately never sourced from Grimmory's own physical tag - that
+-- tag is catalog-wide (one flag per book, shared by every account on the instance, confirmed
+-- empirically: marking a book physical under one login showed it as physical under a different
+-- login too), which is the wrong shape once BooKnook's users don't all share one household
+-- bookshelf. Set directly by the user via POST /tbr/{id}/physical, independent of status/dates -
+-- owning a physical copy doesn't imply having read from it (see physical_reading_sessions below
+-- for that).
+-- physical_page_count is this specific physical printing's own page count - deliberately separate
+-- from books.page_count (which reflects whichever digital file Grimmory has cataloged, and can be
+-- a genuinely different printing/edition). Nullable, prompted when owns_physical is switched on,
+-- editable afterward (POST /tbr/{id}/physical-page-count). Used only to convert a
+-- physical_reading_sessions row's start_page/end_page into a percentage at read time (see
+-- app/stat_tiles.py:physical_session_to_grimmory_shape) - editing it retroactively reshapes every
+-- past physical session's computed percentage too, an accepted tradeoff for not storing derived
+-- data that could drift from the raw pages on an edit (see DESIGN-multi-edition-refactor.md
+-- Decision 9).
 CREATE TABLE IF NOT EXISTS tbr_entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id),
@@ -141,7 +158,28 @@ CREATE TABLE IF NOT EXISTS tbr_entries (
     rating INTEGER,
     sort_order INTEGER,
     audiobook_progress_percent REAL,
+    owns_physical INTEGER NOT NULL DEFAULT 0,
+    physical_page_count INTEGER,
     UNIQUE(user_id, book_id)
+);
+
+-- Manually-logged physical reading sessions (DESIGN-multi-edition-refactor.md Decisions 7-9) -
+-- BooKnook-native, mimicking a Grimmory reading session's shape (start/end time -> duration) but
+-- keyed by start_page/end_page instead of a progress percentage, since that's what a person can
+-- actually read off a physical book. Converted to a Grimmory-shaped session dict at read time (see
+-- app/stat_tiles.py:physical_session_to_grimmory_shape) using the entry's own
+-- tbr_entries.physical_page_count - never stores a derived percentage itself, so an edit to either
+-- the raw pages or physical_page_count is reflected immediately with no separate recompute step.
+-- Entry-id-keyed (per-user), never catalog-id-keyed like linked_editions - physical tracking must
+-- stay per-user, unlike audiobook pairing, which is a genuine catalog-wide fact (see the
+-- "booknook-physical-per-user" memory note for why).
+CREATE TABLE IF NOT EXISTS physical_reading_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id INTEGER NOT NULL REFERENCES tbr_entries(id) ON DELETE CASCADE,
+    start_time TEXT NOT NULL,
+    end_time TEXT NOT NULL,
+    start_page INTEGER NOT NULL,
+    end_page INTEGER NOT NULL
 );
 
 -- Local cache of the Grimmory catalog, refreshed by app.library_check.
@@ -163,9 +201,29 @@ CREATE TABLE IF NOT EXISTS library_catalog (
 -- bookkeeping for the admin UI - the ebook stays the source of truth for reading status/stats,
 -- which continue to come only from the ebook's own Grimmory data. Keyed by Grimmory's own catalog
 -- ids (stable across every library_catalog rebuild), never library_catalog.id.
+-- DEPRECATED as of DESIGN-multi-edition-refactor.md Phase 1 - superseded by linked_editions below.
+-- Kept live and dual-written to (see app/main.py:api_admin_pair_audiobook) only for the Phase 1-3
+-- transition window; nothing new should read from this table directly once Phase 2 lands.
 CREATE TABLE IF NOT EXISTS audiobook_pairings (
     audiobook_grimmory_id INTEGER PRIMARY KEY,
     ebook_grimmory_id INTEGER NOT NULL
+);
+
+-- Generalized replacement for audiobook_pairings (see DESIGN-multi-edition-refactor.md) - one row
+-- per non-ebook "linked edition" of a book (audiobook today, physical planned), catalog-id-keyed
+-- like audiobook_pairings was, not local book_id-keyed, since an admin can pair an edition before
+-- any user has added the book to a shelf at all. edition_grimmory_id is this edition's own catalog
+-- id (PRIMARY KEY - same one-ebook-per-edition guarantee audiobook_pairings already had).
+-- ebook_grimmory_id is the anchor this edition is linked to. format distinguishes what kind of
+-- edition this is ('AUDIOBOOK' today). UNIQUE(ebook_grimmory_id, format) caps it at one linked
+-- edition of a given format per ebook, enforced here rather than left to a read-time dict collapse
+-- (see the audiobook_by_ebook_id issue logged in ISSUES-TO-REVIEW.md). Physical ownership does NOT
+-- live here - see tbr_entries.owns_physical - since it's a per-user fact, not a catalog one.
+CREATE TABLE IF NOT EXISTS linked_editions (
+    edition_grimmory_id INTEGER PRIMARY KEY,
+    ebook_grimmory_id INTEGER NOT NULL,
+    format TEXT NOT NULL,
+    UNIQUE(ebook_grimmory_id, format)
 );
 
 -- Single-row table tracking the last catalog sync attempt.
@@ -220,7 +278,8 @@ CREATE TABLE IF NOT EXISTS goals (
 def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     if db_path is None:
         db_path = os.environ.get("TBR_DB_PATH", DEFAULT_DB_PATH)
-    # check_same_thread=False: FastAPI resolves each sync dependency
+    # check_same_thread=False: FastAPI's generator dependencies (see get_db below) can run their
+    # setup and teardown on different threadpool worker threads for the same request.
     db_connection = sqlite3.connect(db_path, check_same_thread=False)
     db_connection.row_factory = sqlite3.Row
     db_connection.execute("PRAGMA foreign_keys = ON")
@@ -336,6 +395,36 @@ def init_db(db_connection: sqlite3.Connection) -> None:
         db_connection.execute("ALTER TABLE library_catalog ADD COLUMN format TEXT")
     except sqlite3.OperationalError:
         pass  # column already exists
+    try:
+        db_connection.execute(
+            "ALTER TABLE tbr_entries ADD COLUMN owns_physical INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    try:
+        db_connection.execute("ALTER TABLE tbr_entries ADD COLUMN physical_page_count INTEGER")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    # One-time backfill of linked_editions from audiobook_pairings (DESIGN-multi-edition-refactor.md
+    # Phase 1) - INSERT OR IGNORE so re-running init_db never duplicates a row already backfilled or
+    # since written directly to linked_editions by the Phase 1 dual-write.
+    db_connection.execute(
+        """
+        INSERT OR IGNORE INTO linked_editions (edition_grimmory_id, ebook_grimmory_id, format)
+        SELECT audiobook_grimmory_id, ebook_grimmory_id, 'AUDIOBOOK' FROM audiobook_pairings
+        """
+    )
+    # A legacy row that collided with the UNIQUE(ebook_grimmory_id, format) constraint above (an
+    # ebook with two audiobooks already paired to it) got silently dropped from linked_editions -
+    # remove it here too so both tables agree on the one pairing that survived.
+    db_connection.execute(
+        """
+        DELETE FROM audiobook_pairings
+        WHERE audiobook_grimmory_id NOT IN (
+            SELECT edition_grimmory_id FROM linked_editions WHERE format = 'AUDIOBOOK'
+        )
+        """
+    )
     # One-time backfill for wanted entries that predate sort_order, preserving today's added_at
     # order. Only touches NULL rows, so it's a no-op after the first init_db() call.
     db_connection.execute(
@@ -395,6 +484,8 @@ class TBREntry:
     rating: Optional[int] = None
     sort_order: Optional[int] = None
     audiobook_progress_percent: Optional[float] = None
+    owns_physical: bool = False
+    physical_page_count: Optional[int] = None
 
 
 @dataclass
@@ -404,10 +495,8 @@ class TBREntryDetail:
     added_at: str
     book: Book
     owned: Optional[bool] = None
-    # Whether the owned-check's matched catalog entry has an admin-paired audiobook edition (see
-    # app.models.audiobook_pairings) - drives the "Audiobook available" badge, computed alongside
-    # `owned` in app.main._tbr_entries_for_user. None whenever `owned` is also None (library-check
-    # unconfigured).
+    # Drives the "Audiobook available" badge (app.models.audiobook_pairings). None when `owned`
+    # is also None (library-check unconfigured).
     has_paired_audiobook: Optional[bool] = None
     finished_at: Optional[str] = None
     started_at: Optional[str] = None
@@ -415,6 +504,18 @@ class TBREntryDetail:
     rating: Optional[int] = None
     sort_order: Optional[int] = None
     audiobook_progress_percent: Optional[float] = None
+    owns_physical: bool = False
+    physical_page_count: Optional[int] = None
+
+
+@dataclass
+class PhysicalReadingSession:
+    id: int
+    entry_id: int
+    start_time: str
+    end_time: str
+    start_page: int
+    end_page: int
 
 
 @dataclass
@@ -433,6 +534,13 @@ class LibraryCatalogEntry:
     published_date: Optional[str] = None
     grimmory_id: Optional[int] = None
     format: Optional[str] = None
+
+
+@dataclass
+class LinkedEdition:
+    edition_grimmory_id: int
+    ebook_grimmory_id: int
+    format: str
 
 
 @dataclass
@@ -513,6 +621,8 @@ def _row_to_tbr_entry(row: sqlite3.Row) -> TBREntry:
         rating=row["rating"],
         sort_order=row["sort_order"],
         audiobook_progress_percent=row["audiobook_progress_percent"],
+        owns_physical=bool(row["owns_physical"]),
+        physical_page_count=row["physical_page_count"],
     )
 
 
@@ -669,9 +779,10 @@ def list_tbr_entries_with_books(db_connection: sqlite3.Connection, user_id: int)
         SELECT tbr_entries.id AS entry_id, tbr_entries.status, tbr_entries.added_at,
                tbr_entries.finished_at, tbr_entries.started_at, tbr_entries.started_at_manual,
                tbr_entries.rating, tbr_entries.sort_order, tbr_entries.audiobook_progress_percent,
+               tbr_entries.owns_physical, tbr_entries.physical_page_count,
                books.id AS book_id, books.title, books.author, books.isbn, books.cover_url,
                books.published_date, books.page_count, books.grimmory_book_id, books.cover_color,
-               books.format
+               books.manual_match_grimmory_id, books.format
         FROM tbr_entries
         JOIN books ON books.id = tbr_entries.book_id
         WHERE tbr_entries.user_id = ?
@@ -690,6 +801,8 @@ def list_tbr_entries_with_books(db_connection: sqlite3.Connection, user_id: int)
             rating=row["rating"],
             sort_order=row["sort_order"],
             audiobook_progress_percent=row["audiobook_progress_percent"],
+            owns_physical=bool(row["owns_physical"]),
+            physical_page_count=row["physical_page_count"],
             book=Book(
                 id=row["book_id"],
                 title=row["title"],
@@ -700,6 +813,7 @@ def list_tbr_entries_with_books(db_connection: sqlite3.Connection, user_id: int)
                 page_count=row["page_count"],
                 grimmory_book_id=row["grimmory_book_id"],
                 cover_color=row["cover_color"],
+                manual_match_grimmory_id=row["manual_match_grimmory_id"],
                 format=row["format"],
             ),
         )
@@ -884,6 +998,98 @@ def set_tbr_entry_audiobook_progress_percent(
     db_connection.commit()
 
 
+def set_tbr_entry_owns_physical(db_connection: sqlite3.Connection, entry_id: int, owns_physical: bool) -> None:
+    db_connection.execute(
+        "UPDATE tbr_entries SET owns_physical = ? WHERE id = ?", (int(owns_physical), entry_id)
+    )
+    db_connection.commit()
+
+
+def set_tbr_entry_physical_page_count(
+    db_connection: sqlite3.Connection, entry_id: int, physical_page_count: Optional[int]
+) -> None:
+    db_connection.execute(
+        "UPDATE tbr_entries SET physical_page_count = ? WHERE id = ?", (physical_page_count, entry_id)
+    )
+    db_connection.commit()
+
+
+# --- physical_reading_sessions ---
+
+
+def _row_to_physical_reading_session(row: sqlite3.Row) -> PhysicalReadingSession:
+    return PhysicalReadingSession(
+        id=row["id"],
+        entry_id=row["entry_id"],
+        start_time=row["start_time"],
+        end_time=row["end_time"],
+        start_page=row["start_page"],
+        end_page=row["end_page"],
+    )
+
+
+def add_physical_reading_session(
+    db_connection: sqlite3.Connection,
+    entry_id: int,
+    start_time: str,
+    end_time: str,
+    start_page: int,
+    end_page: int,
+) -> PhysicalReadingSession:
+    cur = db_connection.execute(
+        """
+        INSERT INTO physical_reading_sessions (entry_id, start_time, end_time, start_page, end_page)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (entry_id, start_time, end_time, start_page, end_page),
+    )
+    db_connection.commit()
+    return get_physical_reading_session(db_connection, cur.lastrowid)
+
+
+def get_physical_reading_session(
+    db_connection: sqlite3.Connection, session_id: int
+) -> Optional[PhysicalReadingSession]:
+    row = db_connection.execute(
+        "SELECT * FROM physical_reading_sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    return _row_to_physical_reading_session(row) if row else None
+
+
+def list_physical_reading_sessions(
+    db_connection: sqlite3.Connection, entry_id: int
+) -> list[PhysicalReadingSession]:
+    rows = db_connection.execute(
+        "SELECT * FROM physical_reading_sessions WHERE entry_id = ? ORDER BY start_time",
+        (entry_id,),
+    ).fetchall()
+    return [_row_to_physical_reading_session(r) for r in rows]
+
+
+def update_physical_reading_session(
+    db_connection: sqlite3.Connection,
+    session_id: int,
+    start_time: str,
+    end_time: str,
+    start_page: int,
+    end_page: int,
+) -> None:
+    db_connection.execute(
+        """
+        UPDATE physical_reading_sessions
+        SET start_time = ?, end_time = ?, start_page = ?, end_page = ?
+        WHERE id = ?
+        """,
+        (start_time, end_time, start_page, end_page, session_id),
+    )
+    db_connection.commit()
+
+
+def delete_physical_reading_session(db_connection: sqlite3.Connection, session_id: int) -> None:
+    db_connection.execute("DELETE FROM physical_reading_sessions WHERE id = ?", (session_id,))
+    db_connection.commit()
+
+
 # --- library_catalog / library_sync_state ---
 
 def _row_to_library_catalog_entry(row: sqlite3.Row) -> LibraryCatalogEntry:
@@ -963,6 +1169,62 @@ def get_audiobook_pairings(db_connection: sqlite3.Connection) -> dict[int, int]:
         "SELECT audiobook_grimmory_id, ebook_grimmory_id FROM audiobook_pairings"
     ).fetchall()
     return {row["audiobook_grimmory_id"]: row["ebook_grimmory_id"] for row in rows}
+
+
+# --- linked_editions (Phase 1 generalization of audiobook_pairings - see
+# DESIGN-multi-edition-refactor.md) ---
+
+
+def set_linked_edition(
+    db_connection: sqlite3.Connection, edition_grimmory_id: int, ebook_grimmory_id: int, format: str
+) -> None:
+    db_connection.execute(
+        """
+        INSERT INTO linked_editions (edition_grimmory_id, ebook_grimmory_id, format) VALUES (?, ?, ?)
+        ON CONFLICT(edition_grimmory_id) DO UPDATE SET ebook_grimmory_id = excluded.ebook_grimmory_id,
+                                                        format = excluded.format
+        """,
+        (edition_grimmory_id, ebook_grimmory_id, format),
+    )
+    db_connection.commit()
+
+
+def clear_linked_edition(db_connection: sqlite3.Connection, edition_grimmory_id: int) -> None:
+    db_connection.execute(
+        "DELETE FROM linked_editions WHERE edition_grimmory_id = ?", (edition_grimmory_id,)
+    )
+    db_connection.commit()
+
+
+def get_linked_editions(db_connection: sqlite3.Connection) -> list[LinkedEdition]:
+    rows = db_connection.execute(
+        "SELECT edition_grimmory_id, ebook_grimmory_id, format FROM linked_editions"
+    ).fetchall()
+    return [
+        LinkedEdition(
+            edition_grimmory_id=row["edition_grimmory_id"],
+            ebook_grimmory_id=row["ebook_grimmory_id"],
+            format=row["format"],
+        )
+        for row in rows
+    ]
+
+
+def get_linked_editions_for_ebook(
+    db_connection: sqlite3.Connection, ebook_grimmory_id: int
+) -> list[LinkedEdition]:
+    rows = db_connection.execute(
+        "SELECT edition_grimmory_id, ebook_grimmory_id, format FROM linked_editions WHERE ebook_grimmory_id = ?",
+        (ebook_grimmory_id,),
+    ).fetchall()
+    return [
+        LinkedEdition(
+            edition_grimmory_id=row["edition_grimmory_id"],
+            ebook_grimmory_id=row["ebook_grimmory_id"],
+            format=row["format"],
+        )
+        for row in rows
+    ]
 
 
 def get_library_sync_state(db_connection: sqlite3.Connection) -> Optional[LibrarySyncState]:

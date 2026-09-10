@@ -338,11 +338,9 @@ def test_get_valid_access_token_clears_stored_token_on_rejection(base_url, conn,
 def test_get_valid_access_token_uses_fresh_db_token_not_stale_caller_object(
     base_url, conn, monkeypatch
 ):
-    # Regression test for a real bug (caught 2026-07-29 against a live account): two requests for
-    # the same user each get their own freshly-loaded User object (see main.py:current_user), so
-    # the second one's `.grimmory_refresh_token` can be stale by the time it's this function's
-    # turn to run — it must re-read the DB inside the lock rather than trust that attribute,
-    # since Grimmory's refresh tokens are single-use and would reject the stale one.
+    # Regression test: two requests for the same user each get their own freshly-loaded User
+    # object, so the second one's `.grimmory_refresh_token` can be stale by the time this runs -
+    # it must re-read the DB inside the lock, since Grimmory's refresh tokens are single-use.
     created = get_or_create_user(conn, "kyle")
     set_grimmory_refresh_token(conn, created.id, "token-a")
 
