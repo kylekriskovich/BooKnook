@@ -89,6 +89,12 @@ main > h1:first-child {
   margin: 1.25rem 0 0.75rem;
 }
 
+/* Reserves room below the last row of content so it can scroll clear of .bottom-nav (fixed,
+   floating) instead of ending up rendered behind it on a tall page. */
+main {
+  padding-bottom: calc(96px + env(safe-area-inset-bottom));
+}
+
 .login-form {
   display: grid;
   gap: 0.6rem;

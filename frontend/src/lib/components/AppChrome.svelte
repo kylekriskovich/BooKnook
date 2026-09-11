@@ -17,8 +17,9 @@
 </header>
 
 {#if auth.user}
-	<!-- Pure-CSS spine/cover toggle: home's ShelfRow renders both blocks, and
-	     #view-spine:checked ~ main #shelves .shelf-spine (see app.css) shows the right one. -->
+	<!-- Persisted spine/cover preference toggle. Drives #account-sheet's tab highlighting
+	     (see app.css's #view-spine:checked ~ #account-sheet rules); ShelfRow/ShelfList each pick
+	     their own branch in JS off auth.user.view_preference. -->
 	<input
 		type="radio"
 		name="view"
