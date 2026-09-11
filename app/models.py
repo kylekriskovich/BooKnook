@@ -449,9 +449,10 @@ def _row_to_user(row: sqlite3.Row) -> User:
     )
 
 
-def _row_to_book(row: sqlite3.Row) -> Book:
+def _row_to_book(row: sqlite3.Row, id_column: str = "id") -> Book:
+    # id_column supports a joined query that had to alias books.id, e.g. "AS book_id".
     return Book(
-        id=row["id"],
+        id=row[id_column],
         title=row["title"],
         author=row["author"],
         isbn=row["isbn"],
@@ -660,19 +661,7 @@ def list_tbr_entries_with_books(db_connection: sqlite3.Connection, user_id: int)
             audiobook_progress_percent=row["audiobook_progress_percent"],
             owns_physical=bool(row["owns_physical"]),
             physical_page_count=row["physical_page_count"],
-            book=Book(
-                id=row["book_id"],
-                title=row["title"],
-                author=row["author"],
-                isbn=row["isbn"],
-                cover_url=row["cover_url"],
-                published_date=row["published_date"],
-                page_count=row["page_count"],
-                grimmory_book_id=row["grimmory_book_id"],
-                cover_color=row["cover_color"],
-                manual_match_grimmory_id=row["manual_match_grimmory_id"],
-                format=row["format"],
-            ),
+            book=_row_to_book(row, id_column="book_id"),
         )
         for row in rows
     ]
@@ -683,7 +672,8 @@ def list_aggregate_tbr(db_connection: sqlite3.Connection) -> list[AggregateTBREn
     rows = db_connection.execute(
         """
         SELECT books.id AS book_id, books.title, books.author, books.isbn, books.cover_url,
-               books.grimmory_book_id, books.manual_match_grimmory_id, users.name AS user_name
+               books.published_date, books.page_count, books.grimmory_book_id, books.cover_color,
+               books.manual_match_grimmory_id, books.format, users.name AS user_name
         FROM tbr_entries
         JOIN books ON books.id = tbr_entries.book_id
         JOIN users ON users.id = tbr_entries.user_id
@@ -695,18 +685,7 @@ def list_aggregate_tbr(db_connection: sqlite3.Connection) -> list[AggregateTBREn
     for row in rows:
         book_id = row["book_id"]
         if book_id not in entries:
-            entries[book_id] = AggregateTBREntry(
-                book=Book(
-                    id=book_id,
-                    title=row["title"],
-                    author=row["author"],
-                    isbn=row["isbn"],
-                    cover_url=row["cover_url"],
-                    grimmory_book_id=row["grimmory_book_id"],
-                    manual_match_grimmory_id=row["manual_match_grimmory_id"],
-                ),
-                wanted_by=[],
-            )
+            entries[book_id] = AggregateTBREntry(book=_row_to_book(row, id_column="book_id"), wanted_by=[])
         entries[book_id].wanted_by.append(row["user_name"])
     return list(entries.values())
 
