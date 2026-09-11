@@ -378,6 +378,34 @@ def test_api_remove_from_tbr(client):
     conn.close()
 
 
+def test_api_remove_from_tbr_unassigns_grimmory_shelf(client, monkeypatch):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    models.set_book_grimmory_id(conn, book.id, 42)
+    models.set_want_to_read_shelf_id(conn, user.id, 7)
+    entry = models.add_tbr_entry(conn, user.id, book.id)
+    conn.close()
+
+    monkeypatch.setattr(grimmory_auth, "get_valid_access_token", lambda conn, u: "access-token")
+    calls = []
+    monkeypatch.setattr(
+        library_check,
+        "assign_book_shelves",
+        lambda base_url, token, book_ids, shelves_to_assign=frozenset(), shelves_to_unassign=frozenset(): calls.append(
+            (book_ids, shelves_to_unassign)
+        ),
+    )
+
+    response = client.post(f"/api/tbr/{entry.id}/remove")
+
+    assert response.status_code == 204
+    assert calls == [({42}, {7})]
+    conn = models.get_connection()
+    assert models.get_tbr_entry(conn, entry.id) is None
+    conn.close()
+
+
 def test_api_cannot_remove_another_users_entry(client):
     owner = _make_user("Owner")
     conn = models.get_connection()

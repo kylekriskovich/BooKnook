@@ -16,7 +16,11 @@
 
 	// Popover light-dismiss fires on pointerdown, but the click that follows re-targets after
 	// the popover is gone and hits whatever's underneath. Swallow that click unless it
-	// originated inside a popover (e.g. a popovertargetaction="hide" button).
+	// originated inside a popover (e.g. a popovertargetaction="hide" button) - or is the browser's
+	// own forwarded click from a <label> inside a popover to its associated control, which for
+	// this app's CSS-only view toggles (app.css's #view-spine:checked etc.) intentionally lives
+	// outside the popover - swallowing that click meant the toggle could never fire once a popover
+	// was open.
 	let popoverOpenAtPointerDown = false;
 
 	function onPointerDownCapture() {
@@ -25,11 +29,13 @@
 
 	function onClickCapture(event: MouseEvent) {
 		const target = event.target as Element | null;
-		if (popoverOpenAtPointerDown && !target?.closest('[popover]')) {
-			event.preventDefault();
-			event.stopPropagation();
-			event.stopImmediatePropagation();
+		if (!popoverOpenAtPointerDown || target?.closest('[popover]')) return;
+		if (target instanceof HTMLInputElement && [...(target.labels ?? [])].some((label) => label.closest('[popover]'))) {
+			return;
 		}
+		event.preventDefault();
+		event.stopPropagation();
+		event.stopImmediatePropagation();
 	}
 </script>
 

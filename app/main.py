@@ -112,10 +112,8 @@ def _secret_key() -> bytes:
 
 
 def sign_session_cookie(user_id: int, issued_at: "int | None" = None) -> str:
-    """Cookie holds "<user_id>.<issued_at>.<hmac>". issued_at is covered by the signature (not
-    just appended after it) so it can't be tampered with to extend a session, and lets
-    _verify_session_cookie enforce SESSION_MAX_AGE_SECONDS server-side rather than relying solely
-    on the browser honoring the cookie's max_age."""
+    """Cookie is "<user_id>.<issued_at>.<hmac>"; issued_at is signed so it can't be extended,
+    letting _verify_session_cookie enforce SESSION_MAX_AGE_SECONDS server-side."""
     if issued_at is None:
         issued_at = int(time.time())
     payload = f"{user_id}.{issued_at}"
@@ -143,10 +141,8 @@ def _verify_session_cookie(value: str) -> "int | None":
 
 
 async def spa_fallback(full_path: str) -> FileResponse:
-    """Serves a real file from the SvelteKit build when `full_path` matches one; otherwise falls
-    back to index.html so the client-side router can resolve deep links (e.g. /book/42) that have
-    no server-side route. Registered from inside lifespan(), not as a module-level decorator —
-    see the comment there for why the ordering matters."""
+    """Serves a real build file if `full_path` matches one, else index.html for client-side
+    routing. Registered from lifespan(), not as a module decorator — see that comment for why."""
     if full_path.startswith("api/") or full_path.startswith("covers/"):
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -205,10 +201,8 @@ def _user_from_cookie(request: Request, db_connection: sqlite3.Connection) -> Op
 
 
 def get_db():
-    """FastAPI dependency yielding one connection per request, closed once the request finishes.
-    Cached by FastAPI across every `Depends(get_db)` in a single request (including indirectly via
-    get_current_user/require_user below), so a request only ever opens one connection no matter
-    how many routes/dependencies ask for it."""
+    """One DB connection per request, closed when it finishes. FastAPI caches this across every
+    `Depends(get_db)` in the request, so multiple dependencies never open a second connection."""
     db_connection = get_connection()
     try:
         yield db_connection
@@ -318,12 +312,8 @@ def _resolve_client_today(raw: str) -> date:
     """Parses a client-supplied "YYYY-MM-DD" local date, falling back to UTC today if missing/
     malformed - the frontend sends the browser's own local date since the server's UTC clock lags
     behind for timezones ahead of UTC, which would otherwise show stale calendar/stats/estimates."""
-    if raw:
-        try:
-            return date.fromisoformat(raw)
-        except ValueError:
-            pass
-    return dates.today_utc()
+    parsed = dates.parse_date(raw) if raw else None
+    return parsed if parsed is not None else dates.today_utc()
 
 
 def _parse_calendar_month(raw: str, today: date) -> tuple[int, int]:
@@ -382,6 +372,14 @@ def _calendar_context(db_connection, user_id: int, year: int, month: int, today:
     }
 
 
+def _open_library_results(query: str) -> "tuple[list[SearchResult], bool]":
+    """Runs an Open Library search - (results, error), error=True on any network failure."""
+    try:
+        return search_books(query), False
+    except httpx.HTTPError:
+        return [], True
+
+
 def _spice_labels() -> list[str]:
     """One label per chili level (0-5), derived from grimmory_auth.RESTRICTION_TIERS so the UI
     text can never drift out of sync with the actual thresholds sync_restriction_level applies."""
@@ -405,6 +403,24 @@ def _requested_row(entry) -> dict:
     }
 
 
+def _catalog_matches_to_search_results(catalog_matches) -> list[schemas.SearchResultOut]:
+    return [
+        schemas.SearchResultOut(
+            title=entry.title,
+            author=", ".join(entry.authors) if entry.authors else None,
+            isbn=entry.isbn13 or entry.isbn10,
+            cover_url=None,
+            published_date=entry.published_date,
+            grimmory_id=entry.grimmory_id,
+        )
+        for entry in catalog_matches
+    ]
+
+
+def _catalog_by_grimmory_id(db_connection) -> dict:
+    return {c.grimmory_id: c for c in get_library_catalog(db_connection) if c.grimmory_id is not None}
+
+
 def _catalog_row(catalog_entry, wanted_by: list[str]) -> dict:
     return {
         "title": catalog_entry.title,
@@ -419,6 +435,12 @@ def _catalog_row(catalog_entry, wanted_by: list[str]) -> dict:
 # JSON API
 # ---------------------------------------------------------------------------
 # /admin* routes have no in-app auth, intentionally - gated at the reverse proxy instead.
+
+
+def _keep_if_blank(new: str, existing: Optional[str]) -> Optional[str]:
+    """A blank submitted secret means "leave unchanged" (schemas.py documents this convention) -
+    falls back to the existing stored value rather than overwriting it with blank."""
+    return new or existing
 
 
 def _is_admin(user: User) -> bool:
@@ -492,11 +514,9 @@ def _find_entry_detail(db_connection, user_id: int, entry_id: int):
 def _unified_progress_and_estimated_page(
     entry, session_lists: list[list[dict]], fallback_percents: list["float | None"]
 ):
-    """Unified "how far into this book am I" across every linked edition (Decision 5): the max
-    of each edition's latest tracked percentage, falling back to its synced percentage when
-    session data has none (audiobooks never get progress deltas from Grimmory).
-    `session_lists`/`fallback_percents` are parallel per-edition lists; estimated_page derives
-    from the shared book page_count."""
+    """Max of each linked edition's latest tracked progress, falling back to its synced percentage
+    when session data is empty (Decision 5). `session_lists`/`fallback_percents` are parallel
+    per-edition lists."""
     if entry.status != "reading":
         return None, None
     candidates = []
@@ -577,8 +597,7 @@ def api_login(payload: schemas.LoginIn, db_connection: sqlite3.Connection = Depe
         try:
             library_check.sync_user_reading_status(db_connection, user.id, base_url, access_token)
         except LibraryCheckUnavailable as exc:
-            if exc.is_auth_rejection:
-                grimmory_auth.evict_access_token(access_token)
+            grimmory_auth.evict_on_rejection(access_token, exc)
             logger.exception("Grimmory reading-status sync failed")
 
     response = JSONResponse(_to_me_out(user).model_dump(mode="json"))
@@ -706,20 +725,17 @@ def api_book_detail(
                     base_url, access_token, entry.book.grimmory_book_id
                 )
             except LibraryCheckUnavailable as exc:
-                if exc.is_auth_rejection:
-                    grimmory_auth.evict_access_token(access_token)
+                grimmory_auth.evict_on_rejection(access_token, exc)
         if audiobook_grimmory_id is not None:
             try:
                 audiobook_sessions = library_check.fetch_reading_sessions_for_book(
                     base_url, access_token, audiobook_grimmory_id
                 )
             except LibraryCheckUnavailable as exc:
-                if exc.is_auth_rejection:
-                    grimmory_auth.evict_access_token(access_token)
+                grimmory_auth.evict_on_rejection(access_token, exc)
 
-    # Manually-logged physical sessions (DESIGN-multi-edition-refactor.md Decisions 7-9) - converted
-    # to the same Grimmory-shaped dict every other session already is, so nothing downstream needs
-    # to know it didn't come from Grimmory at all.
+    # Manually-logged physical sessions (Decisions 7-9), converted to the same Grimmory-shaped
+    # dict so nothing downstream needs to know they didn't come from Grimmory.
     physical_sessions = (
         [
             stat_tiles.physical_session_to_grimmory_shape(s, entry.physical_page_count)
@@ -747,9 +763,8 @@ def api_book_detail(
             set_tbr_entry_started_at(db_connection, entry.id, derived.isoformat(), manual=False)
             entry.started_at = derived.isoformat()
 
-    # Time-spent-by-medium tiles stay split (Decision 6), but physical merges into the Reading
-    # bucket rather than getting a third tab (Decision 8) - page-turning is the same activity as
-    # ebook reading, just untracked by Grimmory, unlike listening which is genuinely different.
+    # Time-spent-by-medium tiles stay split (Decision 6); physical merges into Reading rather than
+    # a third tab (Decision 8) - it's the same activity, just untracked by Grimmory.
     tiles = stat_tiles.build_book_tiles(
         entry, sessions + physical_sessions, resolved_today, is_audiobook=False
     )
@@ -757,9 +772,8 @@ def api_book_detail(
         entry, audiobook_sessions, resolved_today, is_audiobook=True
     )
 
-    # Progress is a per-source high-water mark, not merged (Decision 5) - a physical stretch
-    # that read further than the ebook's last session must still win. Burndown/started_at do
-    # flatten sources. audiobook_progress_percent may be stale, so trust it only if paired now.
+    # Progress is a per-source high-water mark, not merged (Decision 5); burndown/started_at do
+    # flatten sources. audiobook_progress_percent is trusted only while actually paired.
     audiobook_fallback_percent = entry.audiobook_progress_percent if audiobook_grimmory_id is not None else None
     progress_percent, estimated_page = _unified_progress_and_estimated_page(
         entry,
@@ -880,8 +894,7 @@ def api_settings_sync(
         try:
             library_check.sync_user_reading_status(db_connection, user.id, base_url, access_token)
         except LibraryCheckUnavailable as exc:
-            if exc.is_auth_rejection:
-                grimmory_auth.evict_access_token(access_token)
+            grimmory_auth.evict_on_rejection(access_token, exc)
             error = str(exc)
 
     return schemas.SyncResultOut(error=error)
@@ -904,8 +917,7 @@ def api_settings_shelves(
         own_id = grimmory_auth.get_own_grimmory_user_id(base_url, access_token)
         shelves = library_check.list_own_shelves(base_url, access_token, own_id)
     except LibraryCheckUnavailable as exc:
-        if exc.is_auth_rejection:
-            grimmory_auth.evict_access_token(access_token)
+        grimmory_auth.evict_on_rejection(access_token, exc)
         return schemas.ShelfOptionsOut(shelves=[], error=str(exc))
 
     return schemas.ShelfOptionsOut(
@@ -986,18 +998,7 @@ def api_search_library(
     catalog_matches = [
         entry for entry in search_library_catalog(db_connection, query) if entry.format != "AUDIOBOOK"
     ]
-    results = [
-        schemas.SearchResultOut(
-            title=entry.title,
-            author=", ".join(entry.authors) if entry.authors else None,
-            isbn=entry.isbn13 or entry.isbn10,
-            cover_url=None,
-            published_date=entry.published_date,
-            grimmory_id=entry.grimmory_id,
-        )
-        for entry in catalog_matches
-    ]
-    return schemas.SearchOut(query=query, results=results)
+    return schemas.SearchOut(query=query, results=_catalog_matches_to_search_results(catalog_matches))
 
 
 @app.get("/api/search", response_model=schemas.SearchOut)
@@ -1020,10 +1021,7 @@ def api_search(
             error = True
             error_message = "Hardcover search failed — try Open Library below."
     elif query:
-        try:
-            results = search_books(query)
-        except httpx.HTTPError:
-            error = True
+        results, error = _open_library_results(query)
 
     return schemas.SearchOut(
         query=query,
@@ -1037,13 +1035,7 @@ def api_search(
 @app.get("/api/search/more", response_model=schemas.SearchOut)
 def api_search_more(q: str = "", user: User = Depends(require_user)):
     query = q.strip()
-    error = False
-    results = []
-    if query:
-        try:
-            results = search_books(query)
-        except httpx.HTTPError:
-            error = True
+    results, error = _open_library_results(query) if query else ([], False)
     return schemas.SearchOut(
         query=query, results=[schemas.SearchResultOut(**vars(r)) for r in results], error=error
     )
@@ -1089,6 +1081,22 @@ def api_remove_from_tbr(
 ):
     entry = get_tbr_entry(db_connection, entry_id)
     if entry and entry.user_id == user.id and entry.status == "wanted":
+        # Unassign from Grimmory's Want to Read shelf too, or the next sync's additive shelf-pull
+        # (library_check.sync_user_reading_status pass 3) recreates this entry from the shelf.
+        base_url = os.environ.get(grimmory_auth.GRIMMORY_BASE_URL_ENV)
+        book = get_book(db_connection, entry.book_id)
+        if base_url and user.want_to_read_shelf_id is not None and book is not None and book.grimmory_book_id is not None:
+            access_token = grimmory_auth.get_valid_access_token(db_connection, user)
+            if access_token is not None:
+                try:
+                    library_check.assign_book_shelves(
+                        base_url,
+                        access_token,
+                        {book.grimmory_book_id},
+                        shelves_to_unassign={user.want_to_read_shelf_id},
+                    )
+                except LibraryCheckUnavailable as exc:
+                    grimmory_auth.evict_on_rejection(access_token, exc)
         remove_tbr_entry(db_connection, entry_id)
     return Response(status_code=204)
 
@@ -1112,10 +1120,7 @@ def api_set_tbr_dates(
 
     finished_at_value = payload.finished_at.strip() or None
     if entry.status == "finished" and finished_at_value:
-        try:
-            finished_date = date.fromisoformat(finished_at_value)
-        except ValueError:
-            finished_date = None
+        finished_date = dates.parse_date(finished_at_value)
         if finished_date is not None:
             set_tbr_entry_finished_at(
                 db_connection, entry_id, f"{finished_date.isoformat()}T00:00:00+00:00"
@@ -1130,8 +1135,7 @@ def api_set_tbr_dates(
                             base_url, access_token, book.grimmory_book_id, finished_date
                         )
                     except LibraryCheckUnavailable as exc:
-                        if exc.is_auth_rejection:
-                            grimmory_auth.evict_access_token(access_token)
+                        grimmory_auth.evict_on_rejection(access_token, exc)
     elif entry.status == "finished":
         set_tbr_entry_finished_at(db_connection, entry_id, None)
 
@@ -1384,18 +1388,7 @@ def api_admin_library_search(
             for entry in catalog_matches
             if entry.format != "AUDIOBOOK" and entry.grimmory_id not in already_paired_ebook_ids
         ]
-    results = [
-        schemas.SearchResultOut(
-            title=entry.title,
-            author=", ".join(entry.authors) if entry.authors else None,
-            isbn=entry.isbn13 or entry.isbn10,
-            cover_url=None,
-            published_date=entry.published_date,
-            grimmory_id=entry.grimmory_id,
-        )
-        for entry in catalog_matches
-    ]
-    return schemas.SearchOut(query=query, results=results)
+    return schemas.SearchOut(query=query, results=_catalog_matches_to_search_results(catalog_matches))
 
 
 @app.post("/api/admin/books/{book_id}/match", status_code=204)
@@ -1417,8 +1410,7 @@ def api_admin_match_book(
         )
         return Response(status_code=204)
 
-    catalog_by_id = {c.grimmory_id: c for c in get_library_catalog(db_connection) if c.grimmory_id is not None}
-    target = catalog_by_id.get(payload.grimmory_id)
+    target = _catalog_by_grimmory_id(db_connection).get(payload.grimmory_id)
     if target is not None and target.format == "AUDIOBOOK":
         raise HTTPException(
             status_code=422,
@@ -1443,7 +1435,7 @@ def api_admin_pair_audiobook(
     payload: schemas.AdminPairAudiobookIn,
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
-    catalog_by_id = {c.grimmory_id: c for c in get_library_catalog(db_connection) if c.grimmory_id is not None}
+    catalog_by_id = _catalog_by_grimmory_id(db_connection)
 
     audiobook_entry = catalog_by_id.get(audiobook_grimmory_id)
     if audiobook_entry is None or audiobook_entry.format != "AUDIOBOOK":
@@ -1462,9 +1454,8 @@ def api_admin_pair_audiobook(
     if ebook_entry.format == "AUDIOBOOK":
         raise HTTPException(status_code=422, detail="Cannot pair to another audiobook")
 
-    # linked_editions first - its UNIQUE(ebook_grimmory_id, format) can reject this pairing
-    # (ebook already has a different audiobook linked), and audiobook_pairings has no such
-    # constraint to catch it.
+    # linked_editions first - its UNIQUE(ebook_grimmory_id, format) can reject this pairing;
+    # audiobook_pairings has no such constraint.
     try:
         set_linked_edition(db_connection, audiobook_grimmory_id, payload.ebook_grimmory_id, "AUDIOBOOK")
     except sqlite3.IntegrityError:
@@ -1504,7 +1495,7 @@ def api_admin_settings_save(
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
     existing = get_library_settings(db_connection)
-    resolved_password = payload.password or (existing.password if existing else None)
+    resolved_password = _keep_if_blank(payload.password, existing.password if existing else None)
     set_library_settings(
         db_connection,
         base_url=payload.base_url or None,
@@ -1521,7 +1512,7 @@ def api_admin_settings_save_hardcover(
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
     existing = get_search_settings(db_connection)
-    resolved_key = payload.hardcover_api_key or (existing.hardcover_api_key if existing else None)
+    resolved_key = _keep_if_blank(payload.hardcover_api_key, existing.hardcover_api_key if existing else None)
     set_search_settings(db_connection, hardcover_api_key=resolved_key)
     return api_admin_settings(db_connection)
 
@@ -1532,7 +1523,7 @@ def api_admin_settings_save_grimmory_admin(
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
     existing = get_grimmory_admin_settings(db_connection)
-    resolved_password = payload.password or (existing.password if existing else None)
+    resolved_password = _keep_if_blank(payload.password, existing.password if existing else None)
     set_grimmory_admin_settings(
         db_connection, username=payload.username or None, password=resolved_password
     )

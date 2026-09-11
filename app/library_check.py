@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Iterable, Optional
+from typing import Iterable, NoReturn, Optional
 
 import httpx
 from rapidfuzz import fuzz
@@ -86,9 +86,8 @@ FINISHED_READ_STATUSES = {"READ"}
 READING_READ_STATUSES = {"READING", "RE_READING", "PARTIALLY_READ"}
 ABANDONED_READ_STATUSES = {"WONT_READ", "ABANDONED"}
 
-# Off for now - Grimmory's audiobook session/progress gaps caused duplicate entries and broken
-# stats. Every audiobook branch gates on format=="AUDIOBOOK", so flipping this back is safe.
-# get_audiobook_pairings' paired-status pass is independent of this flag.
+# Off for now - Grimmory's audiobook session/progress gaps caused duplicate entries/broken stats.
+# Every branch gates on format=="AUDIOBOOK", so re-enabling is safe.
 AUDIOBOOKS_ENABLED = False
 
 
@@ -113,6 +112,19 @@ class LibraryCheckUnavailable(Exception):
     def from_http_error(cls, exc: httpx.HTTPError, message: str) -> "LibraryCheckUnavailable":
         status_code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
         return cls(message, status_code=status_code)
+
+# Function Name: raise_for_grimmory_error
+# Description: Logs (unless client()'s hooks already did) and raises LibraryCheckUnavailable for a
+#   failed Grimmory request - the try/except shape repeated at every Grimmory call site.
+# Parameters:
+# - exc (httpx.HTTPError): The caught error.
+# - action (str): Describes the failed request, for the log line only, e.g. "shelf-books fetch for
+#   shelf 42".
+# Returns: Never returns - always raises.
+def raise_for_grimmory_error(exc: httpx.HTTPError, action: str) -> NoReturn:
+    if not grimmory_http.already_logged(exc):
+        logger.warning("Grimmory %s failed: %s", action, exc)
+    raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
 
 # Function Name: _config
 # Description: Reads the Grimmory connection settings, if fully configured.
@@ -162,6 +174,22 @@ def _book_to_catalog_entry(book: dict) -> LibraryCatalogEntry:
         format=(book.get("primaryFile") or {}).get("bookType"),
     )
 
+# Function Name: _create_book_from_catalog_entry
+# Description: Creates a local book from a catalog entry - the same field mapping needed each time
+#   sync_user_reading_status mints a new local book from a Grimmory catalog match.
+# Parameters:
+# - db_connection: Database connection.
+# - catalog_entry (LibraryCatalogEntry): Source catalog entry (title must be non-empty).
+# Returns: The newly created book (Book)
+def _create_book_from_catalog_entry(db_connection, catalog_entry: LibraryCatalogEntry) -> Book:
+    return create_book(
+        db_connection,
+        title=catalog_entry.title,
+        author=", ".join(catalog_entry.authors) or None,
+        isbn=catalog_entry.isbn13 or catalog_entry.isbn10,
+        published_date=catalog_entry.published_date,
+    )
+
 # Function Name: fetch_catalog
 # Description: Logs into Grimmory and fetches the full book catalog.
 # Parameters:
@@ -190,9 +218,7 @@ def fetch_catalog(db_connection) -> list[LibraryCatalogEntry]:
             books_response.raise_for_status()
             books = books_response.json()
     except httpx.HTTPError as exc:
-        if not grimmory_http.already_logged(exc):
-            logger.warning("Grimmory catalog fetch failed: %s", exc)
-        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
+        raise_for_grimmory_error(exc, "catalog fetch")
 
     entries = [_book_to_catalog_entry(book) for book in books]
     # Backfill grimmory_book_id/covers for any locally-known book that matches - reuses the
@@ -283,9 +309,8 @@ def resolve_catalog_match(book: Book, catalog: list[LibraryCatalogEntry]) -> Opt
     return find_catalog_match(book.title, book.isbn, book.author, catalog)
 
 # Function Name: find_owning_book_id
-# Description: Finds which local book (if any) currently owns a given Grimmory catalog id, via
-#   either a manual match or an auto-match - used to block matching the same catalog book to two
-#   different needed entries.
+# Description: Finds which local book (if any) already claims a given Grimmory catalog id (manual
+#   match or auto-match) - used to block a duplicate claim.
 # Parameters:
 # - db_connection: Database connection.
 # - grimmory_id (int): The Grimmory book id being claimed.
@@ -321,9 +346,7 @@ def fetch_user_books(base_url: str, access_token: str) -> list[dict]:
             response.raise_for_status()
             return response.json()
     except httpx.HTTPError as exc:
-        if not grimmory_http.already_logged(exc):
-            logger.warning("Grimmory user-books fetch failed: %s", exc)
-        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
+        raise_for_grimmory_error(exc, "user-books fetch")
 
 # Function Name: fetch_reading_sessions_for_book
 # Description: Fetches every reading session Grimmory has recorded for one book, for the calling
@@ -356,11 +379,7 @@ def fetch_reading_sessions_for_book(
                 if page >= total_pages:
                     break
     except httpx.HTTPError as exc:
-        if not grimmory_http.already_logged(exc):
-            logger.warning(
-                "Grimmory reading-sessions fetch failed for book %s: %s", grimmory_book_id, exc
-            )
-        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
+        raise_for_grimmory_error(exc, f"reading-sessions fetch for book {grimmory_book_id}")
     return sessions
 
 # Function Name: list_own_shelves
@@ -379,15 +398,12 @@ def list_own_shelves(base_url: str, access_token: str, own_grimmory_user_id: int
             response.raise_for_status()
             shelves = response.json()
     except httpx.HTTPError as exc:
-        if not grimmory_http.already_logged(exc):
-            logger.warning("Grimmory shelves fetch failed: %s", exc)
-        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
+        raise_for_grimmory_error(exc, "shelves fetch")
     return [shelf for shelf in shelves if shelf.get("userId") == own_grimmory_user_id]
 
 # Function Name: _shelf_name_key
-# Description: Normalizes a shelf name for matching - Grimmory's duplicate-name check is
-#   case-insensitive, so this must be too, or get_or_create_shelf_by_name loops forever on a 409
-#   it can't resolve.
+# Description: Normalizes a shelf name for matching, to agree with Grimmory's case-insensitive
+#   duplicate check.
 # Parameters:
 # - name (str): Raw shelf name.
 # Returns: Normalized name (str)
@@ -435,9 +451,7 @@ def get_or_create_shelf_by_name(
                 )
             return body["id"]
     except httpx.HTTPError as exc:
-        if not grimmory_http.already_logged(exc):
-            logger.warning("Grimmory get-or-create shelf %r failed: %s", name, exc)
-        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
+        raise_for_grimmory_error(exc, f"get-or-create shelf {name!r}")
 
 # Function Name: fetch_shelf_books
 # Description: Fetches every book currently on a Grimmory shelf.
@@ -456,9 +470,7 @@ def fetch_shelf_books(base_url: str, access_token: str, shelf_id: int) -> list[d
             response.raise_for_status()
             return response.json()
     except httpx.HTTPError as exc:
-        if not grimmory_http.already_logged(exc):
-            logger.warning("Grimmory shelf-books fetch failed for shelf %s: %s", shelf_id, exc)
-        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
+        raise_for_grimmory_error(exc, f"shelf-books fetch for shelf {shelf_id}")
 
 # Function Name: assign_book_shelves
 # Description: Batched shelf-membership assign/unassign for one or more books.
@@ -476,9 +488,8 @@ def assign_book_shelves(
     shelves_to_assign: Iterable[int] = frozenset(),
     shelves_to_unassign: Iterable[int] = frozenset(),
 ) -> None:
-    # shelves_to_assign/unassign apply uniformly to every id in book_ids (confirmed against
-    # Grimmory's BookUpdateService) - this is not a per-book instruction list, so callers must
-    # issue one call per distinct (assign-set, unassign-set) combination they need.
+    # shelves_to_assign/unassign apply uniformly to every book_id, not per-book - issue one call
+    # per distinct (assign-set, unassign-set) combination.
     if not book_ids:
         return
     try:
@@ -494,9 +505,7 @@ def assign_book_shelves(
             )
             response.raise_for_status()
     except httpx.HTTPError as exc:
-        if not grimmory_http.already_logged(exc):
-            logger.warning("Grimmory assign-book-shelves failed: %s", exc)
-        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
+        raise_for_grimmory_error(exc, "assign-book-shelves")
 
 # Function Name: _target_status
 # Description: Determines the shelf a Grimmory book belongs on, based on its readStatus.
@@ -808,13 +817,7 @@ def sync_user_reading_status(
         catalog_entry = catalog[i]
         if not catalog_entry.title:
             continue
-        new_book = create_book(
-            db_connection,
-            title=catalog_entry.title,
-            author=", ".join(catalog_entry.authors) or None,
-            isbn=catalog_entry.isbn13 or catalog_entry.isbn10,
-            published_date=catalog_entry.published_date,
-        )
+        new_book = _create_book_from_catalog_entry(db_connection, catalog_entry)
 
         new_entry = add_tbr_entry(db_connection, user_id, new_book.id)
         _apply_status(
@@ -855,13 +858,7 @@ def sync_user_reading_status(
             catalog_entry = catalog[ebook_idx]
             if not catalog_entry.title:
                 continue
-            new_book = create_book(
-                db_connection,
-                title=catalog_entry.title,
-                author=", ".join(catalog_entry.authors) or None,
-                isbn=catalog_entry.isbn13 or catalog_entry.isbn10,
-                published_date=catalog_entry.published_date,
-            )
+            new_book = _create_book_from_catalog_entry(db_connection, catalog_entry)
             new_entry = add_tbr_entry(db_connection, user_id, new_book.id)
             _apply_status(
                 db_connection, new_entry.id, new_entry.status, new_entry.started_at, target, audiobook_book
@@ -894,13 +891,7 @@ def sync_user_reading_status(
         catalog_entry = _book_to_catalog_entry(book)
         if not catalog_entry.title:
             continue
-        new_book = create_book(
-            db_connection,
-            title=catalog_entry.title,
-            author=", ".join(catalog_entry.authors) or None,
-            isbn=catalog_entry.isbn13 or catalog_entry.isbn10,
-            published_date=catalog_entry.published_date,
-        )
+        new_book = _create_book_from_catalog_entry(db_connection, catalog_entry)
         new_entry = add_tbr_entry(db_connection, user_id, new_book.id, status="wanted")
         _sync_book_metadata(db_connection, new_book.id, new_entry.id, book)
         _maybe_download_cover(db_connection, base_url, access_token, new_book.id, grimmory_id)
@@ -999,10 +990,8 @@ def _sync_all_user_reading_status(db_connection) -> None:
         try:
             sync_user_reading_status(db_connection, user.id, base_url, access_token)
         except LibraryCheckUnavailable as exc:
-            # One user's failure never blocks the others. Evict the cached token only on an
-            # actual auth rejection, not a transient failure.
-            if exc.is_auth_rejection:
-                grimmory_auth.evict_access_token(access_token)
+            # One user's failure never blocks the others.
+            grimmory_auth.evict_on_rejection(access_token, exc)
             logger.exception("Background reading-status sync failed for user_id=%s", user.id)
 
 # Function Name: _run_sync_cycle

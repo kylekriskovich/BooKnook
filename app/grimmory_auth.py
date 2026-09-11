@@ -16,7 +16,7 @@ from typing import Optional
 import httpx
 
 from app import grimmory_http
-from app.library_check import LOGIN_PATH, LibraryCheckUnavailable
+from app.library_check import LOGIN_PATH, LibraryCheckUnavailable, raise_for_grimmory_error
 from app.models import User, get_grimmory_admin_settings, get_user, set_grimmory_refresh_token
 
 logger = logging.getLogger(__name__)
@@ -54,9 +54,8 @@ def refresh_lock(user_id: int) -> threading.Lock:
 # calling refresh() on every request when the existing token is still good for up to two hours.
 _access_token_cache: "dict[int, tuple[str, float]]" = {}
 
-# Guards _access_token_cache writes - FastAPI's threadpool and the periodic sync loop can mutate it
-# concurrently for different users. Separate from _refresh_locks so an unrelated user's cache write
-# never blocks on this user's in-flight refresh.
+# Guards _access_token_cache writes across FastAPI's threadpool and the sync loop. Separate from
+# _refresh_locks so one user's refresh never blocks another's cache write.
 _cache_lock = threading.Lock()
 
 # Refreshed this long before Grimmory's own expiry, not right up against it.
@@ -98,6 +97,19 @@ def evict_access_token(access_token: str) -> None:
         ]
         for user_id in stale_user_ids:
             _access_token_cache.pop(user_id, None)
+
+
+# Function Name: evict_on_rejection
+# Description: Evicts access_token if exc is a Grimmory auth rejection (401/403) - the
+#   "should I evict" check repeated in every except LibraryCheckUnavailable block that has an
+#   access_token in hand.
+# Parameters:
+# - access_token (str): The access token that was in use when exc was raised.
+# - exc (LibraryCheckUnavailable): The caught exception.
+# Returns: None
+def evict_on_rejection(access_token: str, exc: LibraryCheckUnavailable) -> None:
+    if exc.is_auth_rejection:
+        evict_access_token(access_token)
 
 
 # TEMPORARY diagnostic for the 2026-08-21 force-logout investigation - lets logs confirm which
@@ -272,9 +284,7 @@ def update_book_finished_date(
         grimmory_http.log_call("POST", url, response, time.monotonic() - start)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        if not grimmory_http.already_logged(exc):
-            logger.warning("Grimmory book-progress update failed for book %s: %s", grimmory_book_id, exc)
-        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
+        raise_for_grimmory_error(exc, f"book-progress update for book {grimmory_book_id}")
 
 # Function Name: get_own_grimmory_user_id
 # Description: Returns the calling user's own Grimmory numeric user id.
@@ -292,9 +302,7 @@ def get_own_grimmory_user_id(base_url: str, access_token: str) -> int:
         response.raise_for_status()
         body = response.json()
     except httpx.HTTPError as exc:
-        if not grimmory_http.already_logged(exc):
-            logger.warning("Grimmory /users/me request failed: %s", exc)
-        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
+        raise_for_grimmory_error(exc, "/users/me request")
     except ValueError as exc:
         # A non-JSON body, e.g. an HTML error page from a proxy in front of Grimmory.
         raise LibraryCheckUnavailable(f"Grimmory API returned an invalid response: {exc}") from exc
@@ -355,9 +363,7 @@ def _admin_login(base_url: str, username: str, password: str) -> str:
         grimmory_http.log_call("POST", url, response, time.monotonic() - start)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        if not grimmory_http.already_logged(exc):
-            logger.warning("Grimmory admin login request failed: %s", exc)
-        raise LibraryCheckUnavailable(f"Grimmory admin login failed: {exc}") from exc
+        raise_for_grimmory_error(exc, "admin login")
     return response.json()["accessToken"]
 
 # Function Name: find_grimmory_user_id
@@ -375,9 +381,7 @@ def find_grimmory_user_id(base_url: str, admin_token: str, username: str) -> Opt
         grimmory_http.log_call("GET", url, response, time.monotonic() - start)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        if not grimmory_http.already_logged(exc):
-            logger.warning("Grimmory users list request failed: %s", exc)
-        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
+        raise_for_grimmory_error(exc, "users list request")
 
     for user in response.json():
         if user.get("username") == username:
@@ -399,9 +403,7 @@ def get_content_restrictions(base_url: str, admin_token: str, user_id: int) -> l
         grimmory_http.log_call("GET", url, response, time.monotonic() - start)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        if not grimmory_http.already_logged(exc):
-            logger.warning("Grimmory content-restrictions GET failed for user %s: %s", user_id, exc)
-        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
+        raise_for_grimmory_error(exc, f"content-restrictions GET for user {user_id}")
     return response.json()
 
 # Function Name: put_content_restrictions
@@ -424,9 +426,7 @@ def put_content_restrictions(
         grimmory_http.log_call("PUT", url, response, time.monotonic() - start)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        if not grimmory_http.already_logged(exc):
-            logger.warning("Grimmory content-restrictions PUT failed for user %s: %s", user_id, exc)
-        raise LibraryCheckUnavailable.from_http_error(exc, f"Grimmory API request failed: {exc}") from exc
+        raise_for_grimmory_error(exc, f"content-restrictions PUT for user {user_id}")
 
 # Function Name: sync_restriction_level
 # Description: Updates a user's content restrictions based on their preferred "spice" level.
