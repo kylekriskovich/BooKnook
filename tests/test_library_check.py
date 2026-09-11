@@ -372,6 +372,48 @@ def test_resolve_catalog_match_pin_missing_from_catalog_returns_none():
     assert library_check.resolve_catalog_match(book, catalog) is None
 
 
+def test_resolve_catalog_match_trusts_known_grimmory_book_id_over_fuzzy_scan():
+    catalog = [_catalog_entry(title="Dune", grimmory_id=42)]
+    # Title/author don't fuzzy-match anything in the catalog - only the known id can find it.
+    book = models.Book(
+        id=1, title="Some Totally Different Title", author="Nobody", isbn=None, cover_url=None,
+        grimmory_book_id=42,
+    )
+
+    match = library_check.resolve_catalog_match(book, catalog)
+
+    assert match is not None and match.grimmory_id == 42
+
+
+def test_resolve_catalog_match_manual_pin_wins_over_grimmory_book_id():
+    catalog = [
+        _catalog_entry(title="Dune", grimmory_id=42),
+        _catalog_entry(title="Dune Messiah", grimmory_id=43),
+    ]
+    book = models.Book(
+        id=1, title="Dune", author="Frank Herbert", isbn=None, cover_url=None,
+        grimmory_book_id=42, manual_match_grimmory_id=43,
+    )
+
+    match = library_check.resolve_catalog_match(book, catalog)
+
+    assert match is not None and match.grimmory_id == 43
+
+
+def test_resolve_catalog_match_falls_back_to_fuzzy_when_known_id_no_longer_resolves():
+    catalog = [_catalog_entry(title="Dune", grimmory_id=42)]
+    # grimmory_book_id=99 isn't in the (fresh) catalog anymore - falls through to a real re-match
+    # instead of reporting unowned, so a re-uploaded/re-ided book is still found.
+    book = models.Book(
+        id=1, title="Dune", author="Frank Herbert", isbn=None, cover_url=None,
+        grimmory_book_id=99,
+    )
+
+    match = library_check.resolve_catalog_match(book, catalog)
+
+    assert match is not None and match.grimmory_id == 42
+
+
 def test_find_owning_book_id_detects_manual_pin_conflict(conn):
     # Compares against each book's own persisted claim, not a freshly-loaded catalog list, so no
     # library_catalog seeding is needed here (see find_owning_book_id's docstring).

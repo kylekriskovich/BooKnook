@@ -292,8 +292,8 @@ def find_catalog_match(
     return None
 
 # Function Name: resolve_catalog_match
-# Description: Finds the catalog entry a book should be considered to own — an admin-asserted
-#   manual pin (see POST /api/admin/books/{id}/match) always wins over the fuzzy matcher.
+# Description: Finds the catalog entry a book should be considered to own - manual pin, then
+#   known grimmory_book_id, then the fuzzy matcher, in priority order.
 # Parameters:
 # - book (Book): The local book to resolve a match for.
 # - catalog (list[LibraryCatalogEntry]): Catalog entries to search.
@@ -306,6 +306,11 @@ def resolve_catalog_match(book: Book, catalog: list[LibraryCatalogEntry]) -> Opt
             if entry.grimmory_id == book.manual_match_grimmory_id:
                 return entry
         return None
+    if book.grimmory_book_id is not None:
+        # Stable once matched - trust it over redoing the fuzzy scan; falls through if stale.
+        for entry in catalog:
+            if entry.grimmory_id == book.grimmory_book_id:
+                return entry
     return find_catalog_match(book.title, book.isbn, book.author, catalog)
 
 # Function Name: find_owning_book_id
