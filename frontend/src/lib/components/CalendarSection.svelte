@@ -4,6 +4,7 @@
 	import type { components } from '$lib/api/schema';
 	import { paletteFor } from '$lib/utils/palette';
 	import CalendarDayCell from './CalendarDayCell.svelte';
+	import StatTileGrid from './StatTileGrid.svelte';
 
 	type Calendar = components['schemas']['CalendarOut'];
 
@@ -106,13 +107,5 @@
 		{/if}
 	</div>
 
-	<div class="stats-tile-carousel">
-		{#each calendar.tiles as tile (tile.label)}
-			<div class="stats-tile">
-				<span class="stats-tile-label">{tile.label}</span>
-				<span class="stats-tile-value">{tile.value}</span>
-				{#if tile.sub}<span class="stats-tile-sub">{tile.sub}</span>{/if}
-			</div>
-		{/each}
-	</div>
+	<StatTileGrid tiles={calendar.tiles} class="stats-tile-carousel" />
 </div>

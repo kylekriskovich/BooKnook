@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { api, unwrap, ApiError } from '$lib/api/client';
+	import { api, describeError, unwrap } from '$lib/api/client';
 	import { auth } from '$lib/stores/auth.svelte';
 
 	let username = $state('');
@@ -17,7 +17,7 @@
 			auth.set(me);
 			await goto(me.onboarded ? '/home' : '/onboarding');
 		} catch (err) {
-			error = err instanceof ApiError ? err.message : "Couldn't reach the server — try again.";
+			error = describeError(err);
 		} finally {
 			submitting = false;
 		}

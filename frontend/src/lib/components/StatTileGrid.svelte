@@ -3,10 +3,11 @@
 
 	type StatTile = components['schemas']['StatTileOut'];
 
-	let { tiles }: { tiles: StatTile[] } = $props();
+	let { tiles, class: wrapperClass = 'stats-tile-grid' }: { tiles: StatTile[]; class?: string } =
+		$props();
 </script>
 
-<div class="stats-tile-grid">
+<div class={wrapperClass}>
 	{#each tiles as tile (tile.label)}
 		<div class="stats-tile">
 			<span class="stats-tile-label">{tile.label}</span>

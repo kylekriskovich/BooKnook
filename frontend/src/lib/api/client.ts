@@ -35,3 +35,9 @@ export function unwrap<R extends { data?: unknown; error?: unknown; response: Re
 	}
 	return result.data as UnwrappedData<R>;
 }
+
+/** User-facing message for a caught unwrap() error: the API's own detail, or a generic fallback
+ * for a network failure. */
+export function describeError(err: unknown): string {
+	return err instanceof ApiError ? err.message : 'Could not reach the server — try again.';
+}

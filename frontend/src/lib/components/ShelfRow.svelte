@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { components } from '$lib/api/schema';
+	import { auth } from '$lib/stores/auth.svelte';
 	import SpineBook from './SpineBook.svelte';
 	import CoverBook from './CoverBook.svelte';
 	import BookModal from './BookModal.svelte';
@@ -20,23 +21,22 @@
 	</a>
 
 	{#if shelf.entries.length}
-		<!-- Both spine and cover views render unconditionally; app.css's #view-spine:checked /
-		     #view-cover:checked sibling selectors (see (app)/+layout.svelte) show only one — same
-		     CSS-only toggle the Jinja2/htmx app used, so switching views never needs a re-fetch. -->
-		<div class="shelf-spine">
-			<ul class="spine-row">
+		{#if auth.user?.view_preference === 'cover'}
+			<div class="mini-shelf-cover">
 				{#each shelf.entries as entry (entry.id)}
-					<li><SpineBook {entry} /></li>
+					<CoverBook {entry} />
 				{/each}
-			</ul>
-			<div class="shelf-ledge"></div>
-		</div>
-
-		<div class="mini-shelf-cover">
-			{#each shelf.entries as entry (entry.id)}
-				<CoverBook {entry} />
-			{/each}
-		</div>
+			</div>
+		{:else}
+			<div class="shelf-spine">
+				<ul class="spine-row">
+					{#each shelf.entries as entry (entry.id)}
+						<li><SpineBook {entry} /></li>
+					{/each}
+				</ul>
+				<div class="shelf-ledge"></div>
+			</div>
+		{/if}
 
 		{#each shelf.entries.filter((e) => e.status === 'wanted') as entry (entry.id)}
 			<BookModal {entry} />

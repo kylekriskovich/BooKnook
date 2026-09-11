@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { invalidateAll } from '$app/navigation';
-	import { api, ApiError, unwrap } from '$lib/api/client';
+	import { api, describeError, unwrap } from '$lib/api/client';
 	import type { components } from '$lib/api/schema';
 	import { adminMatchTarget } from '$lib/stores/adminMatch.svelte';
 	import { adminPairTarget } from '$lib/stores/adminPair.svelte';
@@ -36,7 +36,7 @@
 			);
 			await invalidateAll();
 		} catch (err) {
-			unmatchError = err instanceof ApiError ? err.message : 'Could not reach the server — try again.';
+			unmatchError = describeError(err);
 		} finally {
 			unmatching = false;
 		}
@@ -60,7 +60,7 @@
 			);
 			await invalidateAll();
 		} catch (err) {
-			unpairError = err instanceof ApiError ? err.message : 'Could not reach the server — try again.';
+			unpairError = describeError(err);
 		} finally {
 			unpairing = false;
 		}

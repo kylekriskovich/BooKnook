@@ -89,30 +89,6 @@ main > h1:first-child {
   margin: 1.25rem 0 0.75rem;
 }
 
-.user-list {
-  list-style: none;
-  padding: 0;
-  display: grid;
-  gap: 0.5rem;
-}
-
-.user-button {
-  width: 100%;
-  padding: 0.85rem 1rem;
-  font: 1rem system-ui;
-  border: 1px solid var(--border);
-  border-radius: 0.75rem;
-  background: var(--panel);
-  color: var(--text);
-  cursor: pointer;
-  transition: transform 120ms ease, border-color 120ms ease;
-}
-
-.user-button:active {
-  border-color: var(--accent);
-  transform: scale(0.98);
-}
-
 .login-form {
   display: grid;
   gap: 0.6rem;
@@ -173,12 +149,9 @@ main > h1:first-child {
   border-radius: 8px;
 }
 
-/* View switch (COVER / SPINE toggle) — the two radios (base.html) sit as top-level siblings of
-   <main> and #account-sheet (in that order in the DOM), not of #shelves/#account-sheet's own
-   contents directly, so every rule below chains an extra descendant hop after the `~` sibling
-   combinator to reach them (`~` alone only matches a direct sibling of the radio). Moved here
-   from a home.html-only popover so the toggle is reachable from the account dropdown on every
-   page, not just home — see _account_sheet.html. */
+/* View switch (COVER / SPINE toggle) — the radios drive the account-sheet tab highlighting below;
+   both /home (ShelfRow) and /shelf/{status} (ShelfList) pick their own spine/cover branch in JS
+   off auth.user.view_preference instead of a CSS-only toggle. */
 
 .view-radio {
   position: absolute;
@@ -213,32 +186,10 @@ main > h1:first-child {
   color: var(--accent);
 }
 
-.shelf-spine,
-.shelf-cover {
-  display: none;
-}
-
-#view-spine:checked ~ main #shelves .shelf-spine {
-  display: block;
-}
-
-#view-cover:checked ~ main #shelves .shelf-cover {
-  display: grid;
-}
-
-/* Full shelf page (/shelf/{status}) has no toggle radios — view_preference picks one branch
-   server-side in _shelf_books.html, so whichever renders must always be visible. */
-#shelf-list .shelf-spine {
-  display: block;
-}
-
-#shelf-list .shelf-cover {
-  display: grid;
-}
-
 /* Spine view */
 
 .shelf-spine {
+  display: block;
   margin-top: 1.25rem;
   padding-bottom: 1rem;
 }
@@ -292,6 +243,7 @@ main > h1:first-child {
 /* Cover view */
 
 .shelf-cover {
+  display: grid;
   margin-top: 1.25rem;
   grid-template-columns: repeat(3, 1fr);
   gap: 14px;
@@ -402,7 +354,7 @@ main > h1:first-child {
 }
 
 .mini-shelf-cover {
-  display: none;
+  display: flex;
   gap: 14px;
   overflow-x: auto;
   padding: 0.9rem 0 0.5rem;
@@ -411,10 +363,6 @@ main > h1:first-child {
 .mini-shelf-cover .cover-book {
   width: 104px;
   flex: none;
-}
-
-#view-cover:checked ~ main #shelves .mini-shelf-cover {
-  display: flex;
 }
 
 /* Book detail / remove modal (popover) */
@@ -479,12 +427,9 @@ main > h1:first-child {
 }
 
 .book-modal-cover {
-  /* Height is set inline from BookHeader.svelte (a measured bind:clientHeight of
-     .book-modal-info), not CSS stretch - see that component for why. Width follows from that
-     height via aspect-ratio. Both capped: a book with every optional metadata row present
-     (started+finished dates, page count, both badges) measures tall enough that matching it
-     exactly reads as oversized - beyond max-height the cover stops growing with the info column
-     rather than dominating the page. */
+  /* Height is set inline from BookHeader.svelte's measured info-column height, not CSS stretch;
+     width follows via aspect-ratio. max-height/max-width cap it so a book with every optional
+     metadata row doesn't blow the cover up oversized. */
   flex: none;
   width: auto;
   aspect-ratio: 2 / 3;
@@ -540,37 +485,6 @@ main > h1:first-child {
 .confirm-actions {
   display: flex;
   gap: 10px;
-}
-
-.book-modal-started-form {
-  display: flex;
-  align-items: flex-end;
-  gap: 10px;
-  margin-bottom: 12px;
-}
-
-.book-modal-started-label {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 0.8rem;
-  color: var(--text-dim);
-}
-
-.book-modal-started-label input[type="date"] {
-  font: inherit;
-  color: var(--text);
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 8px 10px;
-}
-
-.book-modal-started-form .btn {
-  flex: none;
-  padding: 8px 16px;
-  font-size: 0.85rem;
 }
 
 .btn {
@@ -745,10 +659,9 @@ main > h1:first-child {
   color: var(--danger);
 }
 
-/* Admin: Need to acquire / In library / Audiobooks segmented control — same visually-hidden-radio
-   + CSS sibling-selector pattern as the spine/cover and grid/list toggles elsewhere (see
-   .view-radio). Always resets to "Need to acquire" on load (not a persisted preference like those
-   two — this is an occasional admin-only view, not worth a settings column for). */
+/* Admin: Need to acquire / In library / Audiobooks segmented control — same hidden-radio + CSS
+   sibling-selector pattern as .view-radio elsewhere. Not persisted; resets to "Need to acquire"
+   on load. */
 
 .admin-view-tabs {
   margin: 1rem 0;
@@ -779,12 +692,9 @@ main > h1:first-child {
   display: block;
 }
 
-/* Book detail: Reading / Listening segmented control — same visually-hidden-radio + CSS
-   sibling-selector pattern as the admin tabs above. Only rendered at all when the entry has a
-   paired audiobook (see BookHeader's "Audiobook available" badge for the same condition); when
-   absent, .book-view-reading-section has no toggle above it and no rule hides it, so an unpaired
-   book's page looks exactly as it did before this control existed. Always resets to "Reading" on
-   load, same reasoning as the admin tabs. */
+/* Book detail: Reading / Listening segmented control — same pattern as the admin tabs above.
+   Only rendered when the entry has a paired audiobook; otherwise .book-view-reading-section is
+   unconditionally visible. Not persisted; resets to "Reading" on load. */
 
 .book-view-tabs {
   margin: 1rem 0;
@@ -892,11 +802,8 @@ main > h1:first-child {
   height: 1.1rem;
 }
 
-/* iOS/Android-style toggle switch — used where a single boolean reads better as a switch than a
-   checkbox (see PhysicalOwnershipSection.svelte). The real <input type="checkbox"> stays present
-   and clickable (opacity: 0, stretched over the track) for accessibility/keyboard support; the
-   track + thumb are purely visual, driven off :checked via a sibling selector, no JS needed for
-   the animation itself. */
+/* iOS/Android-style toggle switch. The real checkbox stays present (opacity 0, stretched over
+   the track) for accessibility; track + thumb are purely visual, driven by :checked. */
 .switch-row {
   display: flex;
   align-items: center;
@@ -1064,8 +971,7 @@ main > h1:first-child {
   gap: 0.75rem;
   overflow-x: auto;
   padding-bottom: 0.25rem;
-  /* Sits below the calendar grid/list view now (see _calendar_section.html) — needs its own
-     breathing room since neither of those has bottom margin of its own. */
+  /* Sits below the calendar grid/list view, which has no bottom margin of its own. */
   margin-top: 1.25rem;
 }
 
@@ -1109,10 +1015,8 @@ main > h1:first-child {
    left:N% align exactly with the SVG's own day-proportional x-position. */
 .burndown-grid {
   display: grid;
-  /* minmax(0, 1fr), not bare 1fr - a bare 1fr track has an implicit auto minimum width, which lets
-     the chart's own content floor the track (and the whole page) wider than intended instead of
-     shrinking to fit - the actual cause of the chart overflowing past the page's own render width
-     every previous width/max-width tweak here was only working around, not fixing. */
+  /* minmax(0, 1fr), not bare 1fr — a bare 1fr track has an implicit auto min-width, which let the
+     chart's content force the track (and page) wider than intended. */
   grid-template-columns: auto minmax(0, 1fr);
   column-gap: 0.5rem;
   row-gap: 0.4rem;
@@ -1134,11 +1038,8 @@ main > h1:first-child {
   grid-column: 2;
   grid-row: 1;
   display: block;
-  /* Explicit width, not left to grid stretch - the <svg> has no width/height attributes (only
-     viewBox), and while grid items stretch to fill their column by default, that inference has
-     been unreliable for replaced elements like <svg> specifically on mobile Safari, which falls
-     back to an intrinsic size instead of the grid cell's actual width - causing real horizontal
-     overflow on phones that never showed up testing in Chrome. */
+  /* Explicit width, not grid stretch — mobile Safari doesn't reliably stretch a viewBox-only
+     <svg> to its grid cell, falling back to intrinsic size and overflowing on phones. */
   width: 100%;
   min-width: 0;
   height: 120px;
@@ -1303,17 +1204,6 @@ button {
 
 .sync-success {
   color: var(--accent);
-}
-
-.htmx-indicator {
-  opacity: 0;
-  transition: opacity 200ms ease-in;
-  color: var(--text-muted2);
-}
-
-.htmx-request.htmx-indicator,
-.htmx-request .htmx-indicator {
-  opacity: 1;
 }
 
 /* Bottom nav */
@@ -1497,12 +1387,9 @@ button {
   min-height: 0;
 }
 
-/* Every card is centered by default (translateX(-50%) against left:50%); the direction
-   modifiers below add an offset on top of that centering — right for "started today, not
-   finished" (heading forward), left for "finished today, not started" (arriving from the
-   past), center stays put since a same-day start+finish can't be more specific to this date.
-   A second card sharing a direction (rare: 2+ same-day reads, or 2+ same-direction milestones)
-   steps out further via the `~` sibling rules so it isn't fully hidden behind the first. */
+/* Cards center by default; the direction modifiers below offset right (started today) or left
+   (finished today). A second card sharing a direction fans out further via the `~` rules below
+   so it isn't fully hidden behind the first. */
 .calendar-day-cover-card {
   position: absolute;
   top: 0;
@@ -1618,10 +1505,9 @@ button {
   background: transparent;
 }
 
-/* Bridges a bar into the next/previous day's cell so a multi-day book reads as one continuous
-   line rather than separate pills per day. -9px covers the full gap between two bars' default
-   inset edges: 2px padding + 1px border + 3px grid gap + 1px border + 2px padding. Squares off
-   the bridging edge (no rounded cap there) since that's not the span's actual start/end. */
+/* Bridges a bar into the neighboring day's cell so a multi-day book reads as one continuous
+   line. -9px closes the padding+border+gap between cells; the bridging edge is squared off since
+   it isn't the span's real start/end. */
 .calendar-day-bar--connects-left {
   margin-left: -9px;
   border-top-left-radius: 0;

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { api, ApiError, unwrap } from '$lib/api/client';
+	import { api, describeError, unwrap } from '$lib/api/client';
 
 	let {
 		wantToReadShelfId: initialWantToReadShelfId,
@@ -30,10 +30,6 @@
 
 	let reconnectPassword = $state('');
 	let reconnecting = $state(false);
-
-	function describeError(err: unknown): string {
-		return err instanceof ApiError ? err.message : 'Could not reach the server — try again.';
-	}
 
 	async function loadShelves() {
 		loadingShelves = true;
