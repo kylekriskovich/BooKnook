@@ -29,6 +29,6 @@
 {#if data.stats.tiles.length}
 	<div class="settings-section">
 		<div class="settings-section-title">{data.stats.year} so far</div>
-		<StatTileGrid tiles={data.stats.tiles} />
+		<StatTileGrid tiles={data.stats.tiles} class="stats-tile-grid-3col" showIcons />
 	</div>
 {/if}

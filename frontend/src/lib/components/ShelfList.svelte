@@ -43,8 +43,23 @@
 		<span class="list-title">{label}</span>
 		<span class="list-count">{entries.length}</span>
 		{#if status === 'wanted' && entries.length > 1}
-			<button type="button" class="btn btn-ghost" onclick={() => (editing = !editing)}>
-				{editing ? 'Done' : 'Edit'}
+			<button
+				type="button"
+				class="iconbtn"
+				aria-label={editing ? 'Done reordering' : 'Reorder books'}
+				onclick={() => (editing = !editing)}
+			>
+				{#if editing}
+					<svg viewBox="0 -960 960 960" fill="currentColor" aria-hidden="true">
+						<path d="M382-240 154-468l57-57 171 171 356-356 57 57-413 413Z" />
+					</svg>
+				{:else}
+					<svg viewBox="0 -960 960 960" fill="currentColor" aria-hidden="true">
+						<path
+							d="M200-200h57l391-391-57-57-391 391v57Zm-80 80v-170l528-527q11-12 26-18t31-6q16 0 30.5 6t25.5 18l55 56q12 11 18 25.5t6 30.5q0 16-6 31t-18 26L293-120H120Zm640-584-56-56 56 56Z"
+						/>
+					</svg>
+				{/if}
 			</button>
 		{/if}
 	</div>
