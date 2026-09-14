@@ -1128,7 +1128,9 @@ def test_api_stats_counts_books_finished_this_year(client):
     body = response.json()
     assert body["year"] == year
     assert body["finished_count"] == 1
-    assert any(t["label"] == "Books finished" and t["value"] == "1" for t in body["tiles"])
+    assert any(
+        t["label"] == "Books finished" and t["value"] == "1" for t in body["tile_groups"]["overview"]
+    )
 
 
 def test_api_stats_year_uses_client_today_not_server_utc(client, monkeypatch):
@@ -1149,6 +1151,72 @@ def test_api_stats_year_uses_client_today_not_server_utc(client, monkeypatch):
     body = response.json()
     assert body["year"] == 2027
     assert body["finished_count"] == 1
+
+
+def test_api_stats_caches_session_fetches_within_ttl(client, monkeypatch):
+    # Session-derived tiles cost a Grimmory API call per finished book (see
+    # main._cached_stats_tile_groups) - a second /api/stats call for the same user+year within
+    # the TTL must reuse the cached result rather than refetch.
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    models.set_book_grimmory_id(conn, book.id, 42)
+    entry = models.add_tbr_entry(conn, user.id, book.id)
+    year = date.today().year
+    models.set_tbr_entry_status(conn, entry.id, "finished", f"{year}-06-01T00:00:00+00:00")
+    models.set_grimmory_refresh_token(conn, user.id, "stored-refresh")
+    conn.close()
+
+    monkeypatch.setattr(grimmory_auth, "get_valid_access_token", lambda conn, u: "access-token")
+    call_count = 0
+
+    def fake_sessions(base_url, token, book_id):
+        nonlocal call_count
+        call_count += 1
+        return [
+            {"startTime": f"{year}-06-01T10:00:00Z", "endProgress": 10.0, "progressDelta": 10.0, "durationSeconds": 600}
+        ]
+
+    monkeypatch.setattr(library_check, "fetch_reading_sessions_for_book", fake_sessions)
+    main._stats_session_cache.clear()
+
+    first = client.get("/api/stats")
+    second = client.get("/api/stats")
+
+    assert first.status_code == 200 and second.status_code == 200
+    assert first.json()["tile_groups"] == second.json()["tile_groups"]
+    assert call_count == 1
+
+
+def test_api_stats_refetches_sessions_after_ttl_expires(client, monkeypatch):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    models.set_book_grimmory_id(conn, book.id, 42)
+    entry = models.add_tbr_entry(conn, user.id, book.id)
+    year = date.today().year
+    models.set_tbr_entry_status(conn, entry.id, "finished", f"{year}-06-01T00:00:00+00:00")
+    models.set_grimmory_refresh_token(conn, user.id, "stored-refresh")
+    conn.close()
+
+    monkeypatch.setattr(grimmory_auth, "get_valid_access_token", lambda conn, u: "access-token")
+    call_count = 0
+
+    def fake_sessions(base_url, token, book_id):
+        nonlocal call_count
+        call_count += 1
+        return [
+            {"startTime": f"{year}-06-01T10:00:00Z", "endProgress": 10.0, "progressDelta": 10.0, "durationSeconds": 600}
+        ]
+
+    monkeypatch.setattr(library_check, "fetch_reading_sessions_for_book", fake_sessions)
+    monkeypatch.setattr(main, "_STATS_SESSION_CACHE_TTL_SECONDS", 0)
+    main._stats_session_cache.clear()
+
+    client.get("/api/stats")
+    client.get("/api/stats")
+
+    assert call_count == 2
 
 
 def test_api_calendar_places_reading_span_on_grid(client):

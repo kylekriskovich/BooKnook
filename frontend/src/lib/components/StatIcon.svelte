@@ -44,4 +44,34 @@
 		<path d="M12 9v4l3 2" stroke-linecap="round" stroke-linejoin="round" />
 		<path d="M9 2h6" stroke-linecap="round" />
 	</svg>
+{:else if label === 'Total sessions' || label === 'Audio session count' || label === 'Physical session count'}
+	<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+		<path d="M4 4h16v3H4zM4 10.5h16v3H4zM4 17h16v3H4z" />
+	</svg>
+{:else if label === 'Total reading time' || label === 'Total listening time' || label === 'Avg listening session'}
+	<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+		<circle cx="12" cy="12" r="8" />
+		<path d="M12 8v4l3 2" stroke-linecap="round" stroke-linejoin="round" />
+	</svg>
+{:else if label === 'Avg pages per month'}
+	<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+		<rect x="4" y="13" width="4" height="7" />
+		<rect x="10" y="8" width="4" height="12" />
+		<rect x="16" y="3" width="4" height="17" />
+	</svg>
+{:else if label === 'Best day'}
+	<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+		<polygon
+			points="12,3 14.12,9.09 20.56,9.22 15.42,13.11 17.29,19.28 12,15.6 6.71,19.28 8.58,13.11 3.44,9.22 9.88,9.09"
+		/>
+	</svg>
+{:else if label === 'Largest session'}
+	<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+		<path d="M12 4l7 7h-4v9h-6v-9H5z" />
+	</svg>
+{:else if label === 'Reading speed'}
+	<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+		<path d="M3 17l5-5 4 4 8-8" stroke-linecap="round" stroke-linejoin="round" />
+		<path d="M15 8h5v5" stroke-linecap="round" stroke-linejoin="round" />
+	</svg>
 {/if}

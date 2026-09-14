@@ -729,6 +729,69 @@ main {
   display: block;
 }
 
+/* Stats page: Overview / Averages / Highlights segmented control - same 3-way radio/CSS-sibling
+   pattern as .admin-view-tabs above, but icon-only: each tab is just its icon until selected,
+   at which point it grows a text label inside the accent pill - unlike .view-tab elsewhere, which
+   always shows its full label. Not persisted; resets to "Overview" on load. */
+
+.stats-view-tabs {
+  margin: 1rem 0;
+  background: none;
+  border: none;
+  padding: 0;
+  gap: 0.5rem;
+  justify-content: flex-start;
+}
+
+.stats-view-tabs .view-tab {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.5rem 0.6rem;
+}
+
+.stats-view-tabs .view-tab svg {
+  width: 20px;
+  height: 20px;
+  flex: none;
+}
+
+.stats-view-tabs .view-tab-label {
+  display: none;
+}
+
+#stats-view-overview:checked ~ .stats-view-tabs label[for="stats-view-overview"] .view-tab-label,
+#stats-view-averages:checked ~ .stats-view-tabs label[for="stats-view-averages"] .view-tab-label,
+#stats-view-highlights:checked ~ .stats-view-tabs label[for="stats-view-highlights"] .view-tab-label {
+  display: inline;
+}
+
+.stats-view-averages-section,
+.stats-view-highlights-section {
+  display: none;
+}
+
+#stats-view-overview:checked ~ .stats-view-tabs label[for="stats-view-overview"],
+#stats-view-averages:checked ~ .stats-view-tabs label[for="stats-view-averages"],
+#stats-view-highlights:checked ~ .stats-view-tabs label[for="stats-view-highlights"] {
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+#stats-view-averages:checked ~ .stats-view-overview-section,
+#stats-view-highlights:checked ~ .stats-view-overview-section {
+  display: none;
+}
+
+#stats-view-averages:checked ~ .stats-view-averages-section {
+  display: block;
+}
+
+#stats-view-highlights:checked ~ .stats-view-highlights-section {
+  display: block;
+}
+
 .sync-now-btn {
   flex: none;
   padding: 0.5rem 0.85rem;
@@ -1065,13 +1128,16 @@ main {
 .burndown-y-axis {
   grid-column: 1;
   grid-row: 1;
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
-  padding: 0.2rem 0;
+  position: relative;
   font-size: 0.7rem;
   color: var(--text-muted2);
   text-align: right;
+}
+
+.burndown-y-label {
+  position: absolute;
+  right: 0;
+  white-space: nowrap;
 }
 
 .burndown-chart {
@@ -1082,7 +1148,7 @@ main {
      <svg> to its grid cell, falling back to intrinsic size and overflowing on phones. */
   width: 100%;
   min-width: 0;
-  height: 120px;
+  height: 200px;
   border: 1px solid var(--border);
   /* Kept small deliberately - the polyline's first/last points sit exactly at the box's corners
      (day 0 and the final day both touch 0%/100% on their axis by construction), and a bigger
@@ -1096,6 +1162,15 @@ main {
   stroke-width: 1;
 }
 
+.burndown-gridline-mid {
+  stroke-dasharray: 2 2;
+  opacity: 0.5;
+}
+
+.burndown-node {
+  fill: var(--accent);
+}
+
 .burndown-x-axis {
   grid-column: 2;
   grid-row: 2;
@@ -1104,6 +1179,14 @@ main {
   height: 1em;
   font-size: 0.8rem;
   color: var(--text-muted2);
+}
+
+.burndown-day-notch {
+  position: absolute;
+  top: 0;
+  width: 1px;
+  height: 6px;
+  background: var(--border-soft);
 }
 
 .burndown-tick {

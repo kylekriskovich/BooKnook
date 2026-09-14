@@ -295,13 +295,22 @@ def _prorated_pages(entry, window_start: date, window_end: date) -> Optional[flo
     return page_count * overlap_days / span_days
 
 
-def build_collection_tiles(entries: list, window_start: date, window_end: date) -> list[dict]:
-    """Session-independent aggregate tiles over an arbitrary set of finished entries (e.g. a year
-    for GET /stats, a month for GET /calendar). `window_start`/`window_end` prorate Total/Avg
-    pages by how much of each book's reading span falls inside the window (see _prorated_pages),
-    rather than crediting a book's full length to its finish window. "Avg pages read"/"Avg book
-    length" are the same figure by construction but kept as separate tiles intentionally;
-    Longest/Shortest still show each book's real, unprorated page_count."""
+def build_collection_tiles(
+    entries: list,
+    window_start: date,
+    window_end: date,
+    sessions_by_entry_id: Optional[dict[int, list[dict]]] = None,
+) -> list[dict]:
+    """Aggregate tiles over an arbitrary set of finished entries (e.g. a year for GET /stats, a
+    month for GET /calendar). `window_start`/`window_end` prorate "Total pages read" by how much
+    of each book's reading span falls inside the window (see _prorated_pages), rather than
+    crediting a book's full length to its finish window. "Avg pages read" is a true per-session
+    average instead - every session (all-time, not window-filtered - session dates aren't trusted
+    enough to filter on) across every entry in `sessions_by_entry_id`, keyed by entry.id; omitted
+    (tile skipped) when the caller has no session data to pass. "Avg book length" is the plain
+    unprorated average of book.page_count, a distinct figure from "Avg pages read" describing book
+    length rather than reading pace. Longest/Shortest also use each book's real, unprorated
+    page_count."""
     tiles = [{"label": "Books finished", "value": str(len(entries))}]
     if not entries:
         return tiles
@@ -313,15 +322,24 @@ def build_collection_tiles(entries: list, window_start: date, window_end: date) 
     ]
     if prorated:
         total_pages = sum(pages for _, pages in prorated)
-        avg_pages = round(total_pages / len(prorated))
-        tiles += [
-            {"label": "Total pages read", "value": f"{round(total_pages):,}"},
-            {"label": "Avg pages read", "value": f"{avg_pages:,}"},
-            {"label": "Avg book length", "value": f"{avg_pages:,}"},
+        tiles.append({"label": "Total pages read", "value": f"{round(total_pages):,}"})
+
+    if sessions_by_entry_id:
+        page_deltas = [
+            pd
+            for entry in entries
+            for s in sessions_by_entry_id.get(entry.id) or []
+            if s.get("progressDelta") and (pd := _session_page_delta(s, entry.book.page_count)) is not None
         ]
+        if page_deltas:
+            avg_pages_per_session = round(sum(page_deltas) / len(page_deltas))
+            if avg_pages_per_session > 0:
+                tiles.append({"label": "Avg pages read", "value": f"{avg_pages_per_session:,}"})
 
     with_pages = [e for e in entries if e.book.page_count]
     if with_pages:
+        avg_book_length = round(sum(e.book.page_count for e in with_pages) / len(with_pages))
+        tiles.append({"label": "Avg book length", "value": f"{avg_book_length:,}"})
         longest = max(with_pages, key=lambda e: e.book.page_count)
         shortest = min(with_pages, key=lambda e: e.book.page_count)
         tiles += [
@@ -336,6 +354,137 @@ def build_collection_tiles(entries: list, window_start: date, window_end: date) 
 
     tiles += finish_time_tiles_for_collection(entries)
     return tiles
+
+
+def _session_hours(session: dict) -> float:
+    return (session.get("durationSeconds") or 0) / 3600
+
+
+def reading_session_tiles(sessions_with_page_counts: list[tuple[dict, Optional[int]]]) -> list[dict]:
+    """Ebook-only session stats, spread across the Stats page's Overview/Averages/Highlights tabs
+    by group_stat_tiles (kept separate from physical sessions here, unlike build_collection_tiles's
+    "Avg pages read" which merges them - these are meant to read as "what Grimmory itself
+    tracked"). `sessions_with_page_counts` pairs each raw Grimmory session with its own book's
+    page_count (for _session_page_delta's percentage fallback), flattened across every entry - one
+    row per session, entry boundaries don't matter here since every stat below is either a
+    straight count/sum or grouped by session date."""
+    meaningful = [(s, pc) for s, pc in sessions_with_page_counts if _has_meaningful_progress(s)]
+    if not meaningful:
+        return []
+    tiles = [{"label": "Total sessions", "value": str(len(meaningful))}]
+
+    total_seconds = sum((s.get("durationSeconds") or 0) for s, _ in meaningful)
+    if total_seconds > 0:
+        tiles.append({"label": "Total reading time", "value": format_duration(total_seconds)})
+
+    dated_pages = [
+        (day, pages)
+        for s, pc in meaningful
+        if (day := session_date(s)) is not None and (pages := _session_page_delta(s, pc))
+    ]
+    if dated_pages:
+        active_months = {(day.year, day.month) for day, _ in dated_pages}
+        total_pages = sum(pages for _, pages in dated_pages)
+        avg_per_month = round(total_pages / len(active_months))
+        tiles.append({"label": "Avg pages per month", "value": f"{avg_per_month:,}"})
+
+        by_day: dict[date, float] = {}
+        for day, pages in dated_pages:
+            by_day[day] = by_day.get(day, 0) + pages
+        best_day, best_day_pages = max(by_day.items(), key=lambda kv: kv[1])
+        tiles.append(
+            {"label": "Best day", "value": f"{round(best_day_pages):,} pages", "sub": best_day.isoformat()}
+        )
+
+        largest_day, largest_pages = max(dated_pages, key=lambda dp: dp[1])
+        tiles.append(
+            {
+                "label": "Largest session",
+                "value": f"{round(largest_pages):,} pages",
+                "sub": largest_day.isoformat(),
+            }
+        )
+
+    timed_pages = [
+        pages
+        for s, pc in meaningful
+        if (s.get("durationSeconds") or 0) > 0 and (pages := _session_page_delta(s, pc))
+    ]
+    total_hours = sum(_session_hours(s) for s, _ in meaningful if (s.get("durationSeconds") or 0) > 0)
+    if timed_pages and total_hours > 0:
+        tiles.append({"label": "Reading speed", "value": f"{sum(timed_pages) / total_hours:.0f} pages/hr"})
+
+    return tiles
+
+
+def listening_session_tiles(sessions: list[dict]) -> list[dict]:
+    """Audiobook-only session stats, spread across the Stats page's tabs by group_stat_tiles."""
+    meaningful = [s for s in sessions if _has_meaningful_progress(s)]
+    if not meaningful:
+        return []
+    total_seconds = sum((s.get("durationSeconds") or 0) for s in meaningful)
+    tiles = []
+    if total_seconds > 0:
+        avg_minutes = round(total_seconds / 60 / len(meaningful))
+        tiles.append({"label": "Avg listening session", "value": f"{avg_minutes} min"})
+        tiles.append({"label": "Total listening time", "value": format_duration(total_seconds)})
+    tiles.append({"label": "Audio session count", "value": str(len(meaningful))})
+    return tiles
+
+
+def physical_session_tiles(sessions: list[dict]) -> list[dict]:
+    """Physical-only session stats - every manually-logged session counts, not just ones with a
+    "meaningful" page delta, since the user typed each one in directly rather than Grimmory
+    recording it automatically."""
+    if not sessions:
+        return []
+    return [{"label": "Physical session count", "value": str(len(sessions))}]
+
+
+# Fixed label->tab assignment for the Stats page's single Overview/Averages/Highlights tab group -
+# order here is the display order within each tab, not source order, so the layout stays stable
+# regardless of which underlying build_collection_tiles/*_session_tiles tiles happen to be present
+# this run. Every label any of those functions can currently produce must appear exactly once here.
+STAT_TILE_GROUPS: dict[str, list[str]] = {
+    "overview": [
+        "Books finished",
+        "Total pages read",
+        "Total sessions",
+        "Total reading time",
+        "Total listening time",
+        "Physical session count",
+        "Audio session count",
+        "Longest book",
+        "Shortest book",
+    ],
+    "averages": [
+        "Avg pages read",
+        "Avg book length",
+        "Avg pages per month",
+        "Reading speed",
+        "Avg listening session",
+        "Avg rating",
+        "Avg finish time",
+    ],
+    "highlights": [
+        "Best day",
+        "Largest session",
+        "Fastest finish",
+        "Slowest finish",
+    ],
+}
+
+
+def group_stat_tiles(tiles: list[dict]) -> dict[str, list[dict]]:
+    """Buckets a flat pool of stat tiles (build_collection_tiles + the *_session_tiles builders,
+    concatenated) into the Stats page's Overview/Averages/Highlights tabs per STAT_TILE_GROUPS.
+    A tile whose data wasn't available this run (e.g. no rated books, so no "Avg rating") is simply
+    absent from `tiles` and skipped here rather than erroring."""
+    by_label = {t["label"]: t for t in tiles}
+    return {
+        group: [by_label[label] for label in labels if label in by_label]
+        for group, labels in STAT_TILE_GROUPS.items()
+    }
 
 
 def burndown_points(sessions: list[dict]) -> list[tuple[date, int]]:

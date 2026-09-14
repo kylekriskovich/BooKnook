@@ -809,11 +809,10 @@ export interface components {
         };
         /**
          * DayCellOut
-         * @description active/cover/bar mirror reading_calendar.DayCell's active_spans/cover_spans/bar_spans —
-         *     same precedence (declutter, milestone ranking, lane-gap None-padding) already computed
-         *     server-side, just referencing spans by entry_id instead of embedding BookSpan objects.
-         *     bar_entry_ids preserves interior None gaps (an unoccupied lane below a higher occupied one);
-         *     it is never trimmed to a shorter list than the highest occupied lane + 1.
+         * @description active/cover/bar mirror reading_calendar.DayCell's active_spans/cover_spans/bar_spans,
+         *     computed server-side and referenced here by entry_id instead of embedding BookSpan objects.
+         *     bar_entry_ids preserves interior None gaps — never trimmed shorter than the highest occupied
+         *     lane + 1.
          */
         DayCellOut: {
             /**
@@ -1098,6 +1097,15 @@ export interface components {
             /** Error */
             error?: string | null;
         };
+        /** StatTileGroupsOut */
+        StatTileGroupsOut: {
+            /** Overview */
+            overview: components["schemas"]["StatTileOut"][];
+            /** Averages */
+            averages: components["schemas"]["StatTileOut"][];
+            /** Highlights */
+            highlights: components["schemas"]["StatTileOut"][];
+        };
         /** StatTileOut */
         StatTileOut: {
             /** Label */
@@ -1114,8 +1122,7 @@ export interface components {
             goal?: components["schemas"]["GoalOut"] | null;
             /** Finished Count */
             finished_count: number;
-            /** Tiles */
-            tiles: components["schemas"]["StatTileOut"][];
+            tile_groups: components["schemas"]["StatTileGroupsOut"];
         };
         /** SyncIn */
         SyncIn: {

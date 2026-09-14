@@ -608,11 +608,35 @@ def test_build_collection_tiles_pages_and_longest_shortest():
     tiles = stat_tiles.build_collection_tiles(entries, *_YEAR_WINDOW)
     by_label = {t["label"]: t for t in tiles}
     assert by_label["Total pages read"]["value"] == "400"
-    assert by_label["Avg pages read"]["value"] == "200"
+    assert by_label["Avg book length"]["value"] == "200"
     assert by_label["Longest book"]["value"] == "300"
     assert by_label["Longest book"]["sub"] == "Long Book"
     assert by_label["Shortest book"]["value"] == "100"
     assert by_label["Shortest book"]["sub"] == "Short Book"
+
+
+def test_build_collection_tiles_avg_pages_read_omitted_without_session_data():
+    # No sessions_by_entry_id passed - the caller has no session data (e.g. no Grimmory base URL
+    # configured), so "Avg pages read" is skipped rather than shown as 0 or reusing "Avg book length".
+    entries = [_finished_entry(1, "A", page_count=100, started_at="2026-01-01", finished_at="2026-01-05T00:00:00Z")]
+    tiles = stat_tiles.build_collection_tiles(entries, *_YEAR_WINDOW)
+    assert not any(t["label"] == "Avg pages read" for t in tiles)
+
+
+def test_build_collection_tiles_avg_pages_read_averages_every_session_across_entries():
+    # A true per-session average, not per-book: 3 sessions total (2 from entry 1, 1 from entry 2)
+    # averaging (40 + 60 + 100) / 3 = 66.67 -> 67, not an average of each book's own per-book average.
+    entries = [
+        _finished_entry(1, "A", page_count=200, started_at="2026-01-01", finished_at="2026-01-05T00:00:00Z"),
+        _finished_entry(2, "B", page_count=200, started_at="2026-01-10", finished_at="2026-01-15T00:00:00Z"),
+    ]
+    sessions_by_entry_id = {
+        1: [{"progressDelta": 20, "pageDelta": 40}, {"progressDelta": 30, "pageDelta": 60}],
+        2: [{"progressDelta": 50, "pageDelta": 100}],
+    }
+    tiles = stat_tiles.build_collection_tiles(entries, *_YEAR_WINDOW, sessions_by_entry_id)
+    by_label = {t["label"]: t["value"] for t in tiles}
+    assert by_label["Avg pages read"] == "67"
 
 
 def test_build_collection_tiles_prorates_pages_for_span_crossing_window_boundary():
@@ -691,3 +715,159 @@ def test_finish_time_and_days_to_complete_use_the_same_duration_math():
         t["value"] for t in stat_tiles.build_book_tiles(entry, []) if t["label"] == "Days to Complete"
     )
     assert collection_days == "11d" == book_days
+
+
+# --- reading_session_tiles ---
+
+
+def test_reading_session_tiles_empty_without_sessions():
+    assert stat_tiles.reading_session_tiles([]) == []
+
+
+def test_reading_session_tiles_counts_and_sums_minutes():
+    sessions = [
+        (_session("2026-01-01", 0, 10, duration_seconds=1800), 200),
+        (_session("2026-01-02", 10, 25, duration_seconds=1800), 200),
+    ]
+    tiles = stat_tiles.reading_session_tiles(sessions)
+    by_label = {t["label"]: t["value"] for t in tiles}
+    assert by_label["Total sessions"] == "2"
+    assert by_label["Total reading time"] == "1h"
+
+
+def test_reading_session_tiles_avg_per_month_counts_only_active_months():
+    # Two sessions in January (20 + 20 = 40 pages), one in March (30 pages) - average is over the
+    # 2 active months (40+30)/2 = 35, not divided by a fixed 12 or by the number of sessions.
+    sessions = [
+        (_session("2026-01-01", 0, 10, duration_seconds=0), 200),
+        (_session("2026-01-15", 10, 20, duration_seconds=0), 200),
+        (_session("2026-03-01", 20, 35, duration_seconds=0), 200),
+    ]
+    tiles = stat_tiles.reading_session_tiles(sessions)
+    by_label = {t["label"]: t["value"] for t in tiles}
+    assert by_label["Avg pages per month"] == "35"
+
+
+def test_reading_session_tiles_best_day_sums_same_day_sessions():
+    # Two sessions on the same day (10 + 15 = 25 pages) should outrank a single 20-page day.
+    sessions = [
+        (_session("2026-01-01", 0, 5, duration_seconds=0), 200),
+        (_session("2026-01-01", 5, 12.5, duration_seconds=0), 200),
+        (_session("2026-01-02", 0, 10, duration_seconds=0), 200),
+    ]
+    tiles = stat_tiles.reading_session_tiles(sessions)
+    by_label = {t["label"]: t for t in tiles}
+    assert by_label["Best day"]["value"] == "25 pages"
+    assert by_label["Best day"]["sub"] == "2026-01-01"
+
+
+def test_reading_session_tiles_largest_session_is_a_single_session_not_a_day_total():
+    # Contrast with the best-day test above: this is the single biggest session, so the combined
+    # same-day pair (5 + 7.5 = 12.5 each) loses to the one 20-page session on a different day.
+    sessions = [
+        (_session("2026-01-01", 0, 2.5, duration_seconds=0), 200),
+        (_session("2026-01-01", 2.5, 6.25, duration_seconds=0), 200),
+        (_session("2026-01-02", 0, 10, duration_seconds=0), 200),
+    ]
+    tiles = stat_tiles.reading_session_tiles(sessions)
+    by_label = {t["label"]: t for t in tiles}
+    assert by_label["Largest session"]["value"] == "20 pages"
+    assert by_label["Largest session"]["sub"] == "2026-01-02"
+
+
+def test_reading_session_tiles_reading_speed_only_uses_timed_sessions():
+    # 20 pages in 0.5h -> 40 pages/hr; a same-size session with no duration recorded is excluded
+    # from both the page and hour totals, not treated as 0 hours (which would divide by zero/skew).
+    sessions = [
+        (_session("2026-01-01", 0, 10, duration_seconds=1800), 200),
+        (_session("2026-01-02", 0, 10, duration_seconds=0), 200),
+    ]
+    tiles = stat_tiles.reading_session_tiles(sessions)
+    by_label = {t["label"]: t["value"] for t in tiles}
+    assert by_label["Reading speed"] == "40 pages/hr"
+
+
+# --- listening_session_tiles ---
+
+
+def test_listening_session_tiles_empty_without_sessions():
+    assert stat_tiles.listening_session_tiles([]) == []
+
+
+def test_listening_session_tiles_counts_and_averages_duration():
+    sessions = [
+        _audiobook_session("2026-01-01", duration_seconds=1800),
+        _audiobook_session("2026-01-02", duration_seconds=3600),
+    ]
+    tiles = stat_tiles.listening_session_tiles(sessions)
+    by_label = {t["label"]: t["value"] for t in tiles}
+    assert by_label["Audio session count"] == "2"
+    assert by_label["Total listening time"] == "1h 30m"
+    assert by_label["Avg listening session"] == "45 min"
+
+
+# --- physical_session_tiles ---
+
+
+def test_physical_session_tiles_empty_without_sessions():
+    assert stat_tiles.physical_session_tiles([]) == []
+
+
+def test_physical_session_tiles_counts_every_logged_session():
+    sessions = [{"pageDelta": 10}, {"pageDelta": 0}]
+    tiles = stat_tiles.physical_session_tiles(sessions)
+    assert tiles == [{"label": "Physical session count", "value": "2"}]
+
+
+# --- group_stat_tiles ---
+
+
+def test_group_stat_tiles_buckets_by_fixed_group_regardless_of_input_order():
+    tiles = [
+        {"label": "Best day", "value": "10 pages"},
+        {"label": "Books finished", "value": "5"},
+        {"label": "Avg rating", "value": "4.0"},
+        {"label": "Total pages read", "value": "500"},
+    ]
+    grouped = stat_tiles.group_stat_tiles(tiles)
+    assert grouped["overview"] == [
+        {"label": "Books finished", "value": "5"},
+        {"label": "Total pages read", "value": "500"},
+    ]
+    assert grouped["averages"] == [{"label": "Avg rating", "value": "4.0"}]
+    assert grouped["highlights"] == [{"label": "Best day", "value": "10 pages"}]
+
+
+def test_group_stat_tiles_omits_missing_labels_without_erroring():
+    grouped = stat_tiles.group_stat_tiles([])
+    assert grouped == {"overview": [], "averages": [], "highlights": []}
+
+
+def test_group_stat_tiles_covers_every_label_every_builder_can_produce():
+    # Every label reading_session_tiles/listening_session_tiles/physical_session_tiles/
+    # build_collection_tiles can emit must have a home in STAT_TILE_GROUPS, or it would silently
+    # vanish from the Stats page instead of erroring.
+    reading_labels = {
+        "Total sessions",
+        "Total reading time",
+        "Avg pages per month",
+        "Best day",
+        "Largest session",
+        "Reading speed",
+    }
+    listening_labels = {"Avg listening session", "Total listening time", "Audio session count"}
+    physical_labels = {"Physical session count"}
+    collection_labels = {
+        "Books finished",
+        "Total pages read",
+        "Avg pages read",
+        "Avg book length",
+        "Longest book",
+        "Shortest book",
+        "Avg rating",
+        "Avg finish time",
+        "Fastest finish",
+        "Slowest finish",
+    }
+    grouped_labels = {label for labels in stat_tiles.STAT_TILE_GROUPS.values() for label in labels}
+    assert reading_labels | listening_labels | physical_labels | collection_labels == grouped_labels

@@ -78,11 +78,17 @@ class StatTileOut(BaseModel):
     sub: Optional[str] = None
 
 
+class StatTileGroupsOut(BaseModel):
+    overview: list[StatTileOut]
+    averages: list[StatTileOut]
+    highlights: list[StatTileOut]
+
+
 class StatsOut(BaseModel):
     year: int
     goal: Optional[GoalOut] = None
     finished_count: int
-    tiles: list[StatTileOut]
+    tile_groups: StatTileGroupsOut
 
 
 class BurndownPointOut(BaseModel):

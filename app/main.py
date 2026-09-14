@@ -330,9 +330,88 @@ def _parse_calendar_month(raw: str, today: date) -> tuple[int, int]:
     return today.year, today.month
 
 
-def _calendar_context(db_connection, user_id: int, year: int, month: int, today: date) -> dict:
+def _fetch_sessions_by_entry_id(db_connection, user: User, entries: list) -> dict[int, list[dict]]:
+    """Ebook + physical reading sessions per entry, for stat_tiles.build_collection_tiles's "Avg
+    pages read". Audiobook listening sessions are excluded - they carry no real page data, only a
+    percentage-of-ebook-pages estimate, which would skew a pages-read average. One Grimmory API
+    call per entry with a grimmory_book_id (no caching), so only call this for a bounded set of
+    already-finished entries, not the full library."""
+    base_url = os.environ.get(grimmory_auth.GRIMMORY_BASE_URL_ENV)
+    access_token = grimmory_auth.get_valid_access_token(db_connection, user) if base_url else None
+    result: dict[int, list[dict]] = {}
+    for entry in entries:
+        sessions: list[dict] = []
+        if access_token is not None and entry.book.grimmory_book_id:
+            try:
+                sessions = library_check.fetch_reading_sessions_for_book(
+                    base_url, access_token, entry.book.grimmory_book_id
+                )
+            except LibraryCheckUnavailable as exc:
+                grimmory_auth.evict_on_rejection(access_token, exc)
+        if entry.owns_physical:
+            sessions = sessions + [
+                stat_tiles.physical_session_to_grimmory_shape(s, entry.physical_page_count)
+                for s in list_physical_reading_sessions(db_connection, entry.id)
+            ]
+        result[entry.id] = sessions
+    return result
+
+
+def _fetch_stats_page_sessions(db_connection, user: User, entries: list) -> dict[int, dict[str, list[dict]]]:
+    """Ebook, audiobook, and physical sessions per entry, kept separate by source (unlike
+    _fetch_sessions_by_entry_id, which merges ebook+physical for build_collection_tiles's "Avg
+    pages read") - powers the Stats page's Reading/Listening/Physical tab stats
+    (stat_tiles.reading_session_tiles/listening_session_tiles/physical_session_tiles). Up to two
+    Grimmory API calls per entry (ebook + any paired audiobook, no caching), on top of the calls
+    _fetch_sessions_by_entry_id already makes for the same page - only call this for the bounded,
+    already-finished-this-year set, not the full library."""
+    base_url = os.environ.get(grimmory_auth.GRIMMORY_BASE_URL_ENV)
+    access_token = grimmory_auth.get_valid_access_token(db_connection, user) if base_url else None
+    result: dict[int, dict[str, list[dict]]] = {}
+    for entry in entries:
+        ebook_sessions: list[dict] = []
+        audiobook_sessions: list[dict] = []
+        if access_token is not None:
+            if entry.book.grimmory_book_id:
+                try:
+                    ebook_sessions = library_check.fetch_reading_sessions_for_book(
+                        base_url, access_token, entry.book.grimmory_book_id
+                    )
+                except LibraryCheckUnavailable as exc:
+                    grimmory_auth.evict_on_rejection(access_token, exc)
+            audiobook_grimmory_id = None
+            if entry.book.grimmory_book_id is not None:
+                linked = get_linked_editions_for_ebook(db_connection, entry.book.grimmory_book_id)
+                audiobook_edition = next((le for le in linked if le.format == "AUDIOBOOK"), None)
+                audiobook_grimmory_id = (
+                    audiobook_edition.edition_grimmory_id if audiobook_edition else None
+                )
+            if audiobook_grimmory_id is not None:
+                try:
+                    audiobook_sessions = library_check.fetch_reading_sessions_for_book(
+                        base_url, access_token, audiobook_grimmory_id
+                    )
+                except LibraryCheckUnavailable as exc:
+                    grimmory_auth.evict_on_rejection(access_token, exc)
+        physical_sessions = (
+            [
+                stat_tiles.physical_session_to_grimmory_shape(s, entry.physical_page_count)
+                for s in list_physical_reading_sessions(db_connection, entry.id)
+            ]
+            if entry.owns_physical
+            else []
+        )
+        result[entry.id] = {
+            "ebook": ebook_sessions,
+            "audiobook": audiobook_sessions,
+            "physical": physical_sessions,
+        }
+    return result
+
+
+def _calendar_context(db_connection, user: User, year: int, month: int, today: date) -> dict:
     """Shared aggregation behind GET /api/calendar."""
-    entries = list_tbr_entries_with_books(db_connection, user_id)
+    entries = list_tbr_entries_with_books(db_connection, user.id)
     spans = reading_calendar.month_spans(entries, year, month, today)
     for span in spans:
         cover_color.ensure_cover_color(db_connection, span.entry.book)
@@ -358,7 +437,10 @@ def _calendar_context(db_connection, user_id: int, year: int, month: int, today:
     ]
     month_start = date(year, month, 1)
     month_end = date(year, month, calendar.monthrange(year, month)[1])
-    calendar_tiles += stat_tiles.build_collection_tiles(finished_this_month, month_start, month_end)
+    sessions_by_entry_id = _fetch_sessions_by_entry_id(db_connection, user, finished_this_month)
+    calendar_tiles += stat_tiles.build_collection_tiles(
+        finished_this_month, month_start, month_end, sessions_by_entry_id
+    )
 
     return {
         "calendar_year": year,
@@ -795,6 +877,67 @@ def api_book_detail(
 
 # --- stats / calendar ---
 
+# Session-derived stat tiles (build_collection_tiles's "Avg pages read"/"Avg book length" plus
+# every *_session_tiles tile, together forming the Stats page's single Overview/Averages/
+# Highlights tab group) cost up to 2 Grimmory API calls per finished book with no caching
+# upstream, so the grouped result is cached here per (user, year) for a short TTL rather than
+# recomputed on every page view. Everything else in StatsOut (goal, finished_count) is a cheap
+# local DB read and stays uncached, so editing a goal shows up immediately rather than waiting out
+# the TTL. Plain in-process dict, not a DB table - deliberately kept lightweight (see
+# conversation) rather than persisting raw session data, which would need its own invalidation/
+# sync story.
+_STATS_SESSION_CACHE_TTL_SECONDS = 900
+_stats_session_cache: dict[tuple[int, int], tuple[float, schemas.StatTileGroupsOut]] = {}
+
+
+def _cached_stats_tile_groups(
+    db_connection, user: User, year: int, finished_this_year: list
+) -> schemas.StatTileGroupsOut:
+    cache_key = (user.id, year)
+    cached = _stats_session_cache.get(cache_key)
+    if cached is not None:
+        cached_at, cached_groups = cached
+        if time.monotonic() - cached_at < _STATS_SESSION_CACHE_TTL_SECONDS:
+            return cached_groups
+
+    sessions_by_source = _fetch_stats_page_sessions(db_connection, user, finished_this_year)
+    # "Avg pages read"/"Avg book length" (build_collection_tiles) still want ebook+physical merged
+    # per Decision 8; derived here rather than fetched a second time via _fetch_sessions_by_entry_id.
+    reading_plus_physical_by_entry_id = {
+        entry_id: sessions["ebook"] + sessions["physical"] for entry_id, sessions in sessions_by_source.items()
+    }
+    collection_tiles = stat_tiles.build_collection_tiles(
+        finished_this_year, date(year, 1, 1), date(year, 12, 31), reading_plus_physical_by_entry_id
+    )
+
+    page_count_by_entry_id = {entry.id: entry.book.page_count for entry in finished_this_year}
+    reading_sessions_with_page_counts = [
+        (session, page_count_by_entry_id[entry_id])
+        for entry_id, sessions in sessions_by_source.items()
+        for session in sessions["ebook"]
+    ]
+    listening_sessions = [
+        session for sessions in sessions_by_source.values() for session in sessions["audiobook"]
+    ]
+    physical_sessions = [
+        session for sessions in sessions_by_source.values() for session in sessions["physical"]
+    ]
+    all_tiles = (
+        collection_tiles
+        + stat_tiles.reading_session_tiles(reading_sessions_with_page_counts)
+        + stat_tiles.listening_session_tiles(listening_sessions)
+        + stat_tiles.physical_session_tiles(physical_sessions)
+    )
+    grouped = stat_tiles.group_stat_tiles(all_tiles)
+    tile_groups = schemas.StatTileGroupsOut(
+        overview=[_to_tile_out(t) for t in grouped["overview"]],
+        averages=[_to_tile_out(t) for t in grouped["averages"]],
+        highlights=[_to_tile_out(t) for t in grouped["highlights"]],
+    )
+
+    _stats_session_cache[cache_key] = (time.monotonic(), tile_groups)
+    return tile_groups
+
 
 @app.get("/api/stats", response_model=schemas.StatsOut)
 def api_stats(
@@ -809,12 +952,13 @@ def api_stats(
         for entry in list_tbr_entries_with_books(db_connection, user.id)
         if entry.status == "finished" and entry.finished_at and entry.finished_at.startswith(str(year))
     ]
-    tiles = stat_tiles.build_collection_tiles(finished_this_year, date(year, 1, 1), date(year, 12, 31))
+    tile_groups = _cached_stats_tile_groups(db_connection, user, year, finished_this_year)
+
     return schemas.StatsOut(
         year=year,
         goal=_to_goal_out(goal),
         finished_count=len(finished_this_year),
-        tiles=[_to_tile_out(t) for t in tiles],
+        tile_groups=tile_groups,
     )
 
 
@@ -827,7 +971,7 @@ def api_calendar(
 ):
     resolved_today = _resolve_client_today(today)
     cal_year, cal_month = _parse_calendar_month(month, resolved_today)
-    calendar_context = _calendar_context(db_connection, user.id, cal_year, cal_month, resolved_today)
+    calendar_context = _calendar_context(db_connection, user, cal_year, cal_month, resolved_today)
     return _to_calendar_out(calendar_context, user.calendar_view_preference)
 
 
