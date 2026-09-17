@@ -197,6 +197,31 @@ CREATE TABLE IF NOT EXISTS goals (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(user_id, timeframe)
 );
+
+-- Local mirror of a book's Grimmory reading sessions (app.library_check.
+-- get_or_fetch_reading_sessions), so a "finished" entry never needs to re-fetch/re-page its whole
+-- session history on every book/stats page load. book_type is 'EBOOK'|'AUDIOBOOK' - which of the
+-- entry's linked editions this session belongs to, since both share one entry_id (paired
+-- audiobooks push status onto their ebook's entry, never their own). grimmory_session_id is
+-- Grimmory's own session id, used to dedupe on import - never re-inserted once seen, so a
+-- resync can't silently resurrect a tombstoned row. deleted_at is a soft-delete: Grimmory has no
+-- API to edit/delete a session (confirmed empirically - bad sessions have needed direct DB
+-- surgery on Grimmory's own database in the past), so BooKnook can only exclude a bad session
+-- locally, never fix it upstream; NULL means active. Sessions are otherwise immutable once
+-- imported - Grimmory has no edit endpoint either, so existing rows are never updated, only added.
+CREATE TABLE IF NOT EXISTS cached_reading_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id INTEGER NOT NULL REFERENCES tbr_entries(id) ON DELETE CASCADE,
+    grimmory_session_id INTEGER NOT NULL,
+    book_type TEXT NOT NULL,
+    start_time TEXT NOT NULL,
+    end_time TEXT,
+    duration_seconds INTEGER,
+    end_progress REAL,
+    progress_delta REAL,
+    deleted_at TEXT,
+    UNIQUE(entry_id, grimmory_session_id, book_type)
+);
 """
 
 def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
@@ -924,6 +949,154 @@ def update_physical_reading_session(
 def delete_physical_reading_session(db_connection: sqlite3.Connection, session_id: int) -> None:
     db_connection.execute("DELETE FROM physical_reading_sessions WHERE id = ?", (session_id,))
     db_connection.commit()
+
+
+# --- cached_reading_sessions ---
+
+
+def _row_to_cached_session_dict(row: sqlite3.Row) -> dict:
+    # Grimmory-shaped, matching library_check.fetch_reading_sessions_for_book's raw dicts, so
+    # stat_tiles.py's session functions need no changes to consume either source.
+    return {
+        "id": row["grimmory_session_id"],
+        "bookType": row["book_type"],
+        "startTime": row["start_time"],
+        "endTime": row["end_time"],
+        "durationSeconds": row["duration_seconds"],
+        "endProgress": row["end_progress"],
+        "progressDelta": row["progress_delta"],
+    }
+
+
+# Function Name: add_cached_reading_sessions
+# Description: Bulk-imports raw Grimmory session dicts, ignoring any already cached (by
+#   grimmory_session_id) so a tombstoned or already-seen row is never re-inserted.
+# Parameters:
+# - db_connection: Database connection.
+# - entry_id (int): Local TBR entry these sessions belong to.
+# - book_type (str): "EBOOK" or "AUDIOBOOK" - which of the entry's editions these came from.
+# - sessions (list[dict]): Raw Grimmory session dicts (library_check.fetch_reading_sessions_for_book).
+# Returns: None
+def add_cached_reading_sessions(
+    db_connection: sqlite3.Connection, entry_id: int, book_type: str, sessions: list[dict]
+) -> None:
+    rows = [
+        (
+            entry_id,
+            session["id"],
+            book_type,
+            session.get("startTime"),
+            session.get("endTime"),
+            session.get("durationSeconds"),
+            session.get("endProgress"),
+            session.get("progressDelta"),
+        )
+        for session in sessions
+        if session.get("id") is not None and session.get("startTime")
+    ]
+    if not rows:
+        return
+    db_connection.executemany(
+        """
+        INSERT OR IGNORE INTO cached_reading_sessions
+            (entry_id, grimmory_session_id, book_type, start_time, end_time, duration_seconds,
+             end_progress, progress_delta)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    db_connection.commit()
+
+
+# Function Name: list_cached_reading_sessions
+# Description: Active (non-tombstoned) cached sessions for one entry/edition, Grimmory-shaped.
+# Parameters:
+# - db_connection: Database connection.
+# - entry_id (int): Local TBR entry id.
+# - book_type (str): "EBOOK" or "AUDIOBOOK".
+# Returns: Grimmory-shaped session dicts (list[dict]), oldest first.
+def list_cached_reading_sessions(
+    db_connection: sqlite3.Connection, entry_id: int, book_type: str
+) -> list[dict]:
+    rows = db_connection.execute(
+        """
+        SELECT * FROM cached_reading_sessions
+        WHERE entry_id = ? AND book_type = ? AND deleted_at IS NULL
+        ORDER BY start_time
+        """,
+        (entry_id, book_type),
+    ).fetchall()
+    return [_row_to_cached_session_dict(row) for row in rows]
+
+
+# Function Name: soft_delete_cached_reading_session
+# Description: Tombstones one cached session so it's excluded from every read and never
+#   resurrected by a future import, without erasing the row (deleted_at timestamp for investigation).
+# Parameters:
+# - db_connection: Database connection.
+# - entry_id (int): Local TBR entry id.
+# - grimmory_session_id (int): Grimmory's own session id.
+# - book_type (str): "EBOOK" or "AUDIOBOOK".
+# Returns: None
+def soft_delete_cached_reading_session(
+    db_connection: sqlite3.Connection, entry_id: int, grimmory_session_id: int, book_type: str
+) -> None:
+    db_connection.execute(
+        """
+        UPDATE cached_reading_sessions SET deleted_at = datetime('now')
+        WHERE entry_id = ? AND grimmory_session_id = ? AND book_type = ?
+        """,
+        (entry_id, grimmory_session_id, book_type),
+    )
+    db_connection.commit()
+
+
+# Function Name: group_duplicate_reading_sessions
+# Description: Merges sessions that share an identical start_time within the same book_type -
+#   a confirmed Grimmory bug (see library_check.py's AUDIOBOOKS_ENABLED comment) that fragments
+#   one real listening/reading stretch into many rows, all stamped with the stretch's original
+#   start instead of their own. Each burst collapses into its latest-ending row (duration_seconds
+#   and progress_delta summed across the group - preserves total time exactly, only reduces row
+#   count), the rest hard-deleted. Manual/explicit only, never run automatically as part of
+#   import - see app/main.py's api_group_duplicate_sessions for why this is restricted to
+#   "finished" entries only.
+# Parameters:
+# - db_connection: Database connection.
+# - entry_id (int): Local TBR entry id.
+# Returns: Number of rows removed (int)
+def group_duplicate_reading_sessions(db_connection: sqlite3.Connection, entry_id: int) -> int:
+    rows = db_connection.execute(
+        """
+        SELECT id, book_type, start_time, end_time, duration_seconds, progress_delta
+        FROM cached_reading_sessions
+        WHERE entry_id = ? AND deleted_at IS NULL
+        """,
+        (entry_id,),
+    ).fetchall()
+
+    groups: dict[tuple[str, str], list[sqlite3.Row]] = {}
+    for row in rows:
+        groups.setdefault((row["book_type"], row["start_time"]), []).append(row)
+
+    removed_ids: list[int] = []
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        survivor = max(group, key=lambda r: r["end_time"] or "")
+        total_duration = sum(r["duration_seconds"] or 0 for r in group)
+        total_delta = sum(r["progress_delta"] or 0 for r in group) or None
+        db_connection.execute(
+            "UPDATE cached_reading_sessions SET duration_seconds = ?, progress_delta = ? WHERE id = ?",
+            (total_duration, total_delta, survivor["id"]),
+        )
+        removed_ids += [r["id"] for r in group if r["id"] != survivor["id"]]
+
+    if removed_ids:
+        db_connection.executemany(
+            "DELETE FROM cached_reading_sessions WHERE id = ?", [(i,) for i in removed_ids]
+        )
+    db_connection.commit()
+    return len(removed_ids)
 
 
 # --- library_catalog / library_sync_state ---

@@ -477,6 +477,41 @@ def test_update_book_finished_date_raises_on_http_failure(monkeypatch):
         )
 
 
+# --- update_book_progress_percent ---
+
+
+def test_update_book_progress_percent_posts_expected_body(monkeypatch):
+    calls = []
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        calls.append({"url": url, "json": json, "headers": headers})
+        return FakeHttpResponse(200)
+
+    monkeypatch.setattr(grimmory_auth.httpx, "post", fake_post)
+
+    grimmory_auth.update_book_progress_percent(
+        "https://grimmory.example.com", "access-token", 160, 99, 100.0
+    )
+
+    assert calls[0]["url"] == "https://grimmory.example.com/api/v1/books/progress"
+    # No dateFinished sent - Grimmory derives readStatus/dateFinished itself once the percentage
+    # crosses its own threshold (ReadingProgressService.calculateReadStatus).
+    assert calls[0]["json"] == {
+        "bookId": 160,
+        "fileProgress": {"bookFileId": 99, "progressPercent": 100.0},
+    }
+    assert calls[0]["headers"] == {"Authorization": "Bearer access-token"}
+
+
+def test_update_book_progress_percent_raises_on_http_failure(monkeypatch):
+    monkeypatch.setattr(grimmory_auth.httpx, "post", lambda *a, **k: FakeHttpResponse(500))
+
+    with pytest.raises(grimmory_auth.LibraryCheckUnavailable):
+        grimmory_auth.update_book_progress_percent(
+            "https://grimmory.example.com", "access-token", 160, 99, 100.0
+        )
+
+
 # --- get_own_grimmory_user_id ---
 
 

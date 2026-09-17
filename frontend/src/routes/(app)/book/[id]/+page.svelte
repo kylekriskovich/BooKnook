@@ -4,10 +4,12 @@
 	import PhysicalReadingSessionsSection from '$lib/components/PhysicalReadingSessionsSection.svelte';
 	import ProgressSection from '$lib/components/ProgressSection.svelte';
 	import ReadingDatesSection from '$lib/components/ReadingDatesSection.svelte';
+	import SessionLogModal from '$lib/components/SessionLogModal.svelte';
 	import StatTileGrid from '$lib/components/StatTileGrid.svelte';
 
 	let { data } = $props();
 	let entry = $derived(data.detail.entry);
+	let physicalSectionRef = $state<ReturnType<typeof PhysicalReadingSessionsSection>>();
 	// entry is a fresh object on every invalidateAll() reload - deriving the id separately means
 	// the reset effect below only re-fires when the number actually changes, not on every save.
 	let entryId = $derived(entry.id);
@@ -48,6 +50,18 @@
 	<button
 		type="button"
 		class="iconbtn"
+		aria-label="View session log"
+		popovertarget="session-log-{entry.id}"
+	>
+		<svg viewBox="0 -960 960 960" fill="currentColor" aria-hidden="true">
+			<path
+				d="M480-120q-138 0-240.5-91.5T122-440h82q14 104 92.5 172T480-200q117 0 198.5-81.5T760-480q0-117-81.5-198.5T480-760q-69 0-129 32t-101 88h110v80H120v-240h80v94q51-64 124.5-102T480-840q75 0 140.5 28.5t114 77q48.5 48.5 77 114T840-480q0 75-28.5 140.5t-77 114q-48.5 48.5-114 77T480-120Zm112-192L440-464v-216h80v184l128 128-56 56Z"
+			/>
+		</svg>
+	</button>
+	<button
+		type="button"
+		class="iconbtn"
 		aria-label="Edit reading dates"
 		onclick={() => (editingDates = !editingDates)}
 	>
@@ -67,8 +81,13 @@
 		<ReadingDatesSection {entry} bind:editingDates />
 	{/if}
 	{#if entry.owns_physical}
-		<PhysicalReadingSessionsSection {entry} sessions={data.physicalSessions} />
+		<PhysicalReadingSessionsSection bind:this={physicalSectionRef} {entry} />
 	{/if}
+	<SessionLogModal
+		{entry}
+		sessions={data.sessionLog}
+		onEditPhysical={(session) => physicalSectionRef?.openForEdit(session)}
+	/>
 {/key}
 
 {#if !editingDates}

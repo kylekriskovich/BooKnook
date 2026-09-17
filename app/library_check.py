@@ -13,14 +13,17 @@ from app import grimmory_http
 from app.models import (
     Book,
     LibraryCatalogEntry,
+    add_cached_reading_sessions,
     add_tbr_entry,
     covers_dir,
     create_book,
     get_audiobook_pairings,
     get_connection,
     get_library_settings,
+    get_linked_editions_for_ebook,
     get_user,
     list_books,
+    list_cached_reading_sessions,
     list_tbr_entries_with_books,
     list_users,
     remove_tbr_entry,
@@ -45,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 LOGIN_PATH = "/api/v1/auth/login"
 BOOKS_PATH = "/api/v1/books"
+BOOK_PATH = "/api/v1/books/{book_id}"
 COVER_PATH = "/api/v1/media/book/{book_id}/cover"
 READING_SESSIONS_PATH = "/api/v1/reading-sessions/book/{book_id}"
 READING_SESSIONS_PAGE_SIZE = 100
@@ -353,6 +357,27 @@ def fetch_user_books(base_url: str, access_token: str) -> list[dict]:
     except httpx.HTTPError as exc:
         raise_for_grimmory_error(exc, "user-books fetch")
 
+# Function Name: fetch_book
+# Description: Fetches one book's full payload by Grimmory id, for the calling user - used to
+#   read primaryFile.id (needed for grimmory_auth.update_book_progress_percent) since BooKnook
+#   doesn't otherwise persist a book's file id, only its book id.
+# Parameters:
+# - base_url (str): Grimmory base URL.
+# - access_token (str): The calling user's own access token.
+# - grimmory_book_id (int): Grimmory's own id for the book.
+# Returns: Raw book payload (dict)
+def fetch_book(base_url: str, access_token: str, grimmory_book_id: int) -> dict:
+    try:
+        with grimmory_http.client(base_url=base_url.rstrip("/"), timeout=10.0) as client:
+            response = client.get(
+                BOOK_PATH.format(book_id=grimmory_book_id),
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPError as exc:
+        raise_for_grimmory_error(exc, f"book fetch for book {grimmory_book_id}")
+
 # Function Name: fetch_reading_sessions_for_book
 # Description: Fetches every reading session Grimmory has recorded for one book, for the calling
 #   user, walking all pages.
@@ -385,6 +410,43 @@ def fetch_reading_sessions_for_book(
                     break
     except httpx.HTTPError as exc:
         raise_for_grimmory_error(exc, f"reading-sessions fetch for book {grimmory_book_id}")
+    return sessions
+
+# Function Name: get_or_fetch_reading_sessions
+# Description: Serves a book's reading sessions from the local cache when possible, only calling
+#   Grimmory when there's something new to learn. A "finished" entry's cache is authoritative once
+#   populated - Grimmory sessions are only ever created or (out-of-band) deleted, never edited, so
+#   once every session is imported there's nothing left to re-fetch. A "reading"/"wanted" entry (or
+#   a "finished" one with an empty cache - the first view since this caching shipped, or a paired
+#   edition force-finished by _push_paired_edition_finished without its own sessions imported yet)
+#   always live-fetches, upserting the result into the cache as a side effect so it's already warm
+#   by the time the entry finishes.
+# Parameters:
+# - db_connection: Database connection.
+# - entry_id (int): Local TBR entry these sessions cache under.
+# - entry_status (str): The entry's current status ("finished" enables the cache-only path).
+# - book_type (str): "EBOOK" or "AUDIOBOOK" - which of the entry's editions this is.
+# - base_url (str): Grimmory base URL.
+# - access_token (str): The calling user's own access token.
+# - grimmory_book_id (int): Grimmory's own id for this edition.
+# Returns: Raw Grimmory-shaped session dicts (list[dict]). Raises LibraryCheckUnavailable exactly
+#   like fetch_reading_sessions_for_book when a live fetch is needed and fails - callers keep
+#   their existing try/except pattern unchanged.
+def get_or_fetch_reading_sessions(
+    db_connection,
+    entry_id: int,
+    entry_status: str,
+    book_type: str,
+    base_url: str,
+    access_token: str,
+    grimmory_book_id: int,
+) -> list[dict]:
+    if entry_status == "finished":
+        cached = list_cached_reading_sessions(db_connection, entry_id, book_type)
+        if cached:
+            return cached
+    sessions = fetch_reading_sessions_for_book(base_url, access_token, grimmory_book_id)
+    add_cached_reading_sessions(db_connection, entry_id, book_type, sessions)
     return sessions
 
 # Function Name: list_own_shelves
@@ -557,7 +619,10 @@ def _sync_book_metadata(db_connection, book_id: int, entry_id: int, book: dict) 
 # - current_started_at (Optional[str]): The entry's current started_at, if any.
 # - target_status (str): The shelf Grimmory's readStatus maps onto ("finished" or "reading").
 # - book (dict): Raw Grimmory book payload.
-# Returns: None
+# Returns: True if this call is the fresh transition into "finished" (never fires again for this
+#   entry afterward, since current_status is already "finished" on every later sync) - the only
+#   moment callers can still act on "this specific edition just finished" before that signal is
+#   gone for good. False otherwise.
 def _apply_status(
     db_connection,
     entry_id: int,
@@ -565,11 +630,12 @@ def _apply_status(
     current_started_at: Optional[str],
     target_status: str,
     book: dict,
-) -> None:
+) -> bool:
     # Never downgrades an already reading/finished entry back toward wanted.
     if target_status == "finished" and current_status != "finished":
         finished_at = book.get("dateFinished") or datetime.now(timezone.utc).isoformat()
         set_tbr_entry_status(db_connection, entry_id, "finished", finished_at)
+        return True
     elif target_status == "reading" and current_status == "wanted":
         set_tbr_entry_status(db_connection, entry_id, "reading")
         if current_started_at is None:
@@ -580,6 +646,57 @@ def _apply_status(
             set_tbr_entry_started_at(
                 db_connection, entry_id, datetime.now(timezone.utc).isoformat()
             )
+    return False
+
+# Function Name: _paired_audiobook_grimmory_id
+# Description: Looks up an ebook's paired audiobook edition, if any (app.models.linked_editions).
+# Parameters:
+# - db_connection: Database connection.
+# - ebook_grimmory_id (int): The ebook's own Grimmory book id.
+# Returns: The paired audiobook's Grimmory book id, or None if unpaired.
+def _paired_audiobook_grimmory_id(db_connection, ebook_grimmory_id: int) -> Optional[int]:
+    linked = get_linked_editions_for_ebook(db_connection, ebook_grimmory_id)
+    audiobook_edition = next((le for le in linked if le.format == "AUDIOBOOK"), None)
+    return audiobook_edition.edition_grimmory_id if audiobook_edition else None
+
+# Function Name: _push_paired_edition_finished
+# Description: Best-effort write-back for the "one book, two Grimmory records" split caused by
+#   Grimmory's own broken audiobook/ebook pairing (app.models.audiobook_pairings) - the moment
+#   either edition finishes, pushes the OTHER to 100% progress on Grimmory too (which Grimmory
+#   itself turns into readStatus=READ + dateFinished - see grimmory_auth.update_book_progress_percent),
+#   so they converge together instead of one silently lagging behind. Also imports the pushed
+#   edition's own sessions right away - _apply_status's finished guard is entry-level and never
+#   fires again for this entry afterward, so this is the only chance to cache them (see
+#   get_or_fetch_reading_sessions's docstring).
+# Parameters:
+# - db_connection: Database connection.
+# - base_url (str): Grimmory base URL.
+# - access_token (str): Calling user's own Grimmory access token.
+# - entry_id (int): Local TBR entry both editions share.
+# - other_grimmory_book_id (int): The paired edition's Grimmory book id.
+# - other_book_type (str): "EBOOK" or "AUDIOBOOK" - which slot the paired edition fills.
+# Returns: None
+def _push_paired_edition_finished(
+    db_connection,
+    base_url: str,
+    access_token: str,
+    entry_id: int,
+    other_grimmory_book_id: int,
+    other_book_type: str,
+) -> None:
+    from app import grimmory_auth  # local import: grimmory_auth imports LOGIN_PATH from this module
+
+    try:
+        other_book = fetch_book(base_url, access_token, other_grimmory_book_id)
+        book_file_id = (other_book.get("primaryFile") or {}).get("id")
+        if book_file_id is not None:
+            grimmory_auth.update_book_progress_percent(
+                base_url, access_token, other_grimmory_book_id, book_file_id, 100.0
+            )
+        sessions = fetch_reading_sessions_for_book(base_url, access_token, other_grimmory_book_id)
+        add_cached_reading_sessions(db_connection, entry_id, other_book_type, sessions)
+    except LibraryCheckUnavailable as exc:
+        logger.warning("Paired-edition finish push failed for book %s: %s", other_grimmory_book_id, exc)
 
 # Function Name: fetch_book_cover
 # Description: Downloads a book's cover image from Grimmory.
@@ -808,7 +925,15 @@ def sync_user_reading_status(
         _sync_book_metadata(db_connection, entry.book.id, entry.id, book)
         target = _target_status(book)
         if target is not None:
-            _apply_status(db_connection, entry.id, entry.status, entry.started_at, target, book)
+            just_finished = _apply_status(
+                db_connection, entry.id, entry.status, entry.started_at, target, book
+            )
+            if just_finished and book.get("id") is not None:
+                paired_id = _paired_audiobook_grimmory_id(db_connection, book["id"])
+                if paired_id is not None:
+                    _push_paired_edition_finished(
+                        db_connection, base_url, access_token, entry.id, paired_id, "AUDIOBOOK"
+                    )
         if not _has_local_cover(entry.book.cover_url):
             _maybe_download_cover(
                 db_connection, base_url, access_token, entry.book.id, book.get("id")
@@ -827,9 +952,15 @@ def sync_user_reading_status(
         new_book = _create_book_from_catalog_entry(db_connection, catalog_entry)
 
         new_entry = add_tbr_entry(db_connection, user_id, new_book.id)
-        _apply_status(
+        just_finished = _apply_status(
             db_connection, new_entry.id, new_entry.status, new_entry.started_at, target, book
         )
+        if just_finished and book.get("id") is not None:
+            paired_id = _paired_audiobook_grimmory_id(db_connection, book["id"])
+            if paired_id is not None:
+                _push_paired_edition_finished(
+                    db_connection, base_url, access_token, new_entry.id, paired_id, "AUDIOBOOK"
+                )
         _sync_book_metadata(db_connection, new_book.id, new_entry.id, book)
         _maybe_download_cover(db_connection, base_url, access_token, new_book.id, book.get("id"))
 
@@ -851,9 +982,13 @@ def sync_user_reading_status(
             ebook_grimmory_id = pairings[audiobook_book["id"]]
             entry = entries_by_ebook_grimmory_id.get(ebook_grimmory_id)
             if entry is not None:
-                _apply_status(
+                just_finished = _apply_status(
                     db_connection, entry.id, entry.status, entry.started_at, target, audiobook_book
                 )
+                if just_finished:
+                    _push_paired_edition_finished(
+                        db_connection, base_url, access_token, entry.id, ebook_grimmory_id, "EBOOK"
+                    )
                 audiobook_progress = audiobook_book.get("audiobookProgress") or {}
                 set_tbr_entry_audiobook_progress_percent(
                     db_connection, entry.id, audiobook_progress.get("percentage")
@@ -867,9 +1002,13 @@ def sync_user_reading_status(
                 continue
             new_book = _create_book_from_catalog_entry(db_connection, catalog_entry)
             new_entry = add_tbr_entry(db_connection, user_id, new_book.id)
-            _apply_status(
+            just_finished = _apply_status(
                 db_connection, new_entry.id, new_entry.status, new_entry.started_at, target, audiobook_book
             )
+            if just_finished:
+                _push_paired_edition_finished(
+                    db_connection, base_url, access_token, new_entry.id, ebook_grimmory_id, "EBOOK"
+                )
             # _sync_book_metadata writes audiobook_progress_percent=None for a plain ebook dict, so
             # the real value below must be set after this call or it gets clobbered back to None.
             _sync_book_metadata(db_connection, new_book.id, new_entry.id, books[ebook_idx])

@@ -286,6 +286,41 @@ def update_book_finished_date(
     except httpx.HTTPError as exc:
         raise_for_grimmory_error(exc, f"book-progress update for book {grimmory_book_id}")
 
+# Function Name: update_book_progress_percent
+# Description: Best-effort write-back that sets a book's read progress to a percentage. Grimmory
+#   derives readStatus from this itself (ReadingProgressService.calculateReadStatus) and
+#   auto-sets dateFinished the moment it crosses into READ - there's no separate "mark as read"
+#   field to set. Used to push a paired edition to 100%/READ when its sibling finishes (they're
+#   the same underlying book, split into two Grimmory records only because Grimmory's own
+#   audiobook/ebook pairing is broken - see app.models.audiobook_pairings).
+# Parameters:
+# - base_url (str): Grimmory base URL.
+# - access_token (str): Calling user's own Grimmory access token.
+# - grimmory_book_id (int): Grimmory's numeric id for the book.
+# - book_file_id (int): Grimmory's id for that book's primary file (book.primaryFile.id).
+# - percent (float): Progress percentage to set (0-100).
+# Returns: None
+def update_book_progress_percent(
+    base_url: str, access_token: str, grimmory_book_id: int, book_file_id: int, percent: float
+) -> None:
+    # Callers must swallow LibraryCheckUnavailable and keep the local edit regardless.
+    url = f"{base_url.rstrip('/')}{BOOK_PROGRESS_PATH}"
+    start = time.monotonic()
+    try:
+        response = httpx.post(
+            url,
+            json={
+                "bookId": grimmory_book_id,
+                "fileProgress": {"bookFileId": book_file_id, "progressPercent": percent},
+            },
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10.0,
+        )
+        grimmory_http.log_call("POST", url, response, time.monotonic() - start)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise_for_grimmory_error(exc, f"book-progress-percent update for book {grimmory_book_id}")
+
 # Function Name: get_own_grimmory_user_id
 # Description: Returns the calling user's own Grimmory numeric user id.
 # Parameters:

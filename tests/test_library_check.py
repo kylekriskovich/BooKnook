@@ -832,6 +832,9 @@ def test_sync_paired_audiobook_updates_progress_percent_on_existing_entry(conn, 
 
 def test_sync_paired_audiobook_upgrades_existing_wanted_entry_to_finished(conn, monkeypatch):
     monkeypatch.setattr(library_check, "_maybe_download_cover", lambda *a, **k: None)
+    # The paired-edition write-back has its own dedicated tests below; stub it out here so this
+    # test only exercises the status-sync mechanic.
+    monkeypatch.setattr(library_check, "_push_paired_edition_finished", lambda *a, **k: None)
     user = models.get_or_create_user(conn, "alice")
     book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
     models.set_book_grimmory_id(conn, book.id, 1)
@@ -882,6 +885,7 @@ def test_sync_paired_audiobook_tie_keeps_ebooks_own_finished_at(conn, monkeypatc
     # Ebook and audiobook both READ, with different dateFinished values - the ebook's own data,
     # applied first, must win; the audiobook's later call is a no-op since the entry is already
     # "finished".
+    monkeypatch.setattr(library_check, "_push_paired_edition_finished", lambda *a, **k: None)
     user = models.get_or_create_user(conn, "alice")
     book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
     models.set_book_grimmory_id(conn, book.id, 1)
@@ -902,6 +906,67 @@ def test_sync_paired_audiobook_tie_keeps_ebooks_own_finished_at(conn, monkeypatc
     entry = models.list_tbr_entries_with_books(conn, user.id)[0]
     assert entry.status == "finished"
     assert entry.finished_at == "2026-01-01T00:00:00Z"
+
+
+class FullSyncFakeClient:
+    """Routes every GET Pass 1/2 + the paired-edition write-back can make during one sync:
+    the user's book list, a single-book fetch (for bookFileId), and paginated reading sessions."""
+
+    def __init__(self, books_payload, book_payloads_by_id, sessions_by_id):
+        self._books_payload = books_payload
+        self._book_payloads_by_id = book_payloads_by_id
+        self._sessions_by_id = sessions_by_id
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def get(self, path, params=None, headers=None):
+        if path == library_check.BOOKS_PATH:
+            return FakeResponse(self._books_payload)
+        if params is not None:  # paginated reading-sessions endpoint
+            book_id = int(path.rsplit("/", 1)[-1])
+            sessions = self._sessions_by_id.get(book_id, [])
+            return FakeResponse({"content": sessions, "page": {"totalPages": 1}})
+        book_id = int(path.rsplit("/", 1)[-1])  # single-book endpoint
+        return FakeResponse(self._book_payloads_by_id[book_id])
+
+
+def test_sync_ebook_finishing_pushes_paired_audiobook_to_100_percent(conn, monkeypatch):
+    # End-to-end: ebook transitions to "finished" in Pass 1 -> _push_paired_edition_finished
+    # fires for its paired audiobook (app.models.linked_editions), which the ebook<->audiobook
+    # direction reads instead of the deprecated audiobook_pairings dict.
+    monkeypatch.setattr(library_check, "_maybe_download_cover", lambda *a, **k: None)
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
+    models.set_book_grimmory_id(conn, book.id, 1)
+    models.add_tbr_entry(conn, user.id, book.id)  # starts "wanted"
+    models.set_linked_edition(conn, edition_grimmory_id=2, ebook_grimmory_id=1, format="AUDIOBOOK")
+
+    ebook = _grimmory_book(title="Dune", read_status="READ", date_finished="2026-01-01T00:00:00Z")
+    ebook["id"] = 1
+    ebook["primaryFile"] = {"bookType": "EPUB"}
+
+    fake_client = FullSyncFakeClient(
+        books_payload=[ebook],
+        book_payloads_by_id={2: {"id": 2, "primaryFile": {"id": 99}}},
+        sessions_by_id={2: [{"id": 501, "startTime": "2026-01-01T00:00:00Z"}]},
+    )
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+    posted = []
+    monkeypatch.setattr(
+        library_check.httpx, "post",
+        lambda url, json, headers, timeout: posted.append(json) or FakeResponse({}),
+    )
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entry = models.list_tbr_entries_with_books(conn, user.id)[0]
+    assert entry.status == "finished"
+    assert posted == [{"bookId": 2, "fileProgress": {"bookFileId": 99, "progressPercent": 100.0}}]
+    assert len(models.list_cached_reading_sessions(conn, entry.id, "AUDIOBOOK")) == 1
 
 
 def test_sync_unpaired_audiobook_reading_has_no_effect(conn, monkeypatch):
@@ -1391,6 +1456,165 @@ def test_fetch_reading_sessions_for_book_raises_on_http_failure(monkeypatch):
 
     with pytest.raises(library_check.LibraryCheckUnavailable):
         library_check.fetch_reading_sessions_for_book("https://grimmory.example.com", "token", 42)
+
+
+# --- get_or_fetch_reading_sessions ---
+
+
+def _entry(conn):
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert")
+    return models.add_tbr_entry(conn, user.id, book.id)
+
+
+def test_get_or_fetch_reading_sessions_uses_cache_without_calling_grimmory_when_finished(conn, monkeypatch):
+    entry = _entry(conn)
+    models.add_cached_reading_sessions(
+        conn, entry.id, "EBOOK", [{"id": 1, "startTime": "2026-01-01T00:00:00Z"}]
+    )
+
+    def _boom(*a, **k):
+        raise AssertionError("must not call Grimmory when the cache is already warm")
+
+    monkeypatch.setattr(library_check, "fetch_reading_sessions_for_book", _boom)
+
+    sessions = library_check.get_or_fetch_reading_sessions(
+        conn, entry.id, "finished", "EBOOK", "https://grimmory.example.com", "token", 42
+    )
+    assert len(sessions) == 1
+    assert sessions[0]["startTime"] == "2026-01-01T00:00:00Z"
+
+
+def test_get_or_fetch_reading_sessions_backfills_once_when_finished_but_cache_empty(conn, monkeypatch):
+    entry = _entry(conn)
+    fake_client = PaginatedFakeClient([[{"id": 1, "startTime": "2026-01-01T00:00:00Z"}]])
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+
+    sessions = library_check.get_or_fetch_reading_sessions(
+        conn, entry.id, "finished", "EBOOK", "https://grimmory.example.com", "token", 42
+    )
+    assert len(sessions) == 1
+    assert len(fake_client.get_calls) == 1  # the one-time backfill
+
+    # Second read must come from the now-warm cache, no further Grimmory call.
+    monkeypatch.setattr(
+        library_check, "fetch_reading_sessions_for_book",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("cache should be warm now")),
+    )
+    again = library_check.get_or_fetch_reading_sessions(
+        conn, entry.id, "finished", "EBOOK", "https://grimmory.example.com", "token", 42
+    )
+    assert len(again) == 1
+
+
+def test_get_or_fetch_reading_sessions_always_live_fetches_and_upserts_when_reading(conn, monkeypatch):
+    entry = _entry(conn)
+    fake_client = PaginatedFakeClient([[{"id": 1, "startTime": "2026-01-01T00:00:00Z"}]])
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+
+    library_check.get_or_fetch_reading_sessions(
+        conn, entry.id, "reading", "EBOOK", "https://grimmory.example.com", "token", 42
+    )
+    library_check.get_or_fetch_reading_sessions(
+        conn, entry.id, "reading", "EBOOK", "https://grimmory.example.com", "token", 42
+    )
+
+    assert len(fake_client.get_calls) == 2  # live every time, not just the first
+    assert len(models.list_cached_reading_sessions(conn, entry.id, "EBOOK")) == 1  # deduped
+
+
+# --- fetch_book ---
+
+
+def test_fetch_book_returns_payload(monkeypatch):
+    class BookFakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, path, headers=None):
+            assert path == "/api/v1/books/42"
+            return FakeResponse({"id": 42, "primaryFile": {"id": 99}})
+
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: BookFakeClient())
+
+    book = library_check.fetch_book("https://grimmory.example.com", "token", 42)
+    assert book["primaryFile"]["id"] == 99
+
+
+# --- _push_paired_edition_finished ---
+
+
+class BookAndSessionsFakeClient:
+    """Routes GET by path prefix - the single-book fetch vs. the paginated sessions fetch."""
+
+    def __init__(self, book_payload, session_pages):
+        self._book_payload = book_payload
+        self._session_pages = session_pages
+        self.get_calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def get(self, path, params=None, headers=None):
+        self.get_calls.append({"path": path, "params": params})
+        if params is not None:  # the paginated reading-sessions endpoint
+            page_num = params["page"]
+            return FakeResponse(
+                {"content": self._session_pages[page_num], "page": {"totalPages": len(self._session_pages)}}
+            )
+        return FakeResponse(self._book_payload)
+
+
+def test_push_paired_edition_finished_pushes_progress_and_caches_sessions(conn, monkeypatch):
+    entry = _entry(conn)
+    fake_client = BookAndSessionsFakeClient(
+        book_payload={"id": 42, "primaryFile": {"id": 99}},
+        session_pages=[[{"id": 1, "startTime": "2026-01-01T00:00:00Z"}]],
+    )
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+    posted = []
+    monkeypatch.setattr(
+        library_check.httpx, "post",
+        lambda url, json, headers, timeout: posted.append({"url": url, "json": json}) or FakeResponse({}),
+    )
+
+    library_check._push_paired_edition_finished(
+        conn, "https://grimmory.example.com", "token", entry.id, 42, "AUDIOBOOK"
+    )
+
+    assert len(posted) == 1
+    assert posted[0]["json"] == {
+        "bookId": 42,
+        "fileProgress": {"bookFileId": 99, "progressPercent": 100.0},
+    }
+    assert len(models.list_cached_reading_sessions(conn, entry.id, "AUDIOBOOK")) == 1
+
+
+def test_push_paired_edition_finished_is_best_effort_on_failure(conn, monkeypatch):
+    entry = _entry(conn)
+
+    class FailingClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, path, params=None, headers=None):
+            return FakeResponse({}, status_code=500)
+
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: FailingClient())
+
+    # Must not raise - callers (sync_user_reading_status) rely on this being swallowed.
+    library_check._push_paired_edition_finished(
+        conn, "https://grimmory.example.com", "token", entry.id, 42, "AUDIOBOOK"
+    )
 
 
 # --- list_own_shelves / get_or_create_shelf_by_name / fetch_shelf_books / assign_book_shelves ---

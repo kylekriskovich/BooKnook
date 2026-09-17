@@ -49,7 +49,7 @@ def _has_meaningful_progress(session: dict) -> bool:
     return session.get("bookType") == "AUDIOBOOK" and (session.get("durationSeconds") or 0) > 0
 
 
-def _session_page_delta(session: dict, fallback_page_count: Optional[int]) -> Optional[float]:
+def session_page_delta(session: dict, fallback_page_count: Optional[int]) -> Optional[float]:
     """A session's own known page delta (physical sessions) if present, else an estimate from its
     percentage progressDelta against the ebook's page_count (Grimmory sessions have no raw pages)."""
     if session.get("pageDelta") is not None:
@@ -193,13 +193,13 @@ def build_book_tiles(
             page_deltas = [
                 pd
                 for s in sessions
-                if s.get("progressDelta") and (pd := _session_page_delta(s, page_count)) is not None
+                if s.get("progressDelta") and (pd := session_page_delta(s, page_count)) is not None
             ]
             if page_deltas:
                 avg_pages = round(sum(page_deltas) / len(page_deltas))
                 if avg_pages > 0:
                     tiles.append({"label": "Pages per session", "value": str(avg_pages)})
-                best_page_delta = _session_page_delta(best_session, page_count)
+                best_page_delta = session_page_delta(best_session, page_count)
                 best_pages = round(best_page_delta) if best_page_delta else 0
                 if best_pages > 0:
                     tiles.append(
@@ -340,7 +340,7 @@ def build_collection_tiles(
             pd
             for entry in entries
             for s in sessions_by_entry_id.get(entry.id) or []
-            if s.get("progressDelta") and (pd := _session_page_delta(s, entry.book.page_count)) is not None
+            if s.get("progressDelta") and (pd := session_page_delta(s, entry.book.page_count)) is not None
         ]
         if page_deltas:
             avg_pages_per_session = round(sum(page_deltas) / len(page_deltas))
@@ -378,7 +378,7 @@ def reading_session_tiles(
     by group_stat_tiles (kept separate from physical sessions here, unlike build_collection_tiles's
     "Avg pages read" which merges them - these are meant to read as "what Grimmory itself
     tracked"). `sessions_with_page_counts` pairs each raw Grimmory session with its own book's
-    page_count (for _session_page_delta's percentage fallback), flattened across every entry - one
+    page_count (for session_page_delta's percentage fallback), flattened across every entry - one
     row per session, entry boundaries don't matter here since every stat below is either a
     straight count/sum or grouped by session date."""
     meaningful = [(s, pc) for s, pc in sessions_with_page_counts if _has_meaningful_progress(s)]
@@ -393,7 +393,7 @@ def reading_session_tiles(
     dated_pages = [
         (day, pages)
         for s, pc in meaningful
-        if (day := session_date(s, zone)) is not None and (pages := _session_page_delta(s, pc))
+        if (day := session_date(s, zone)) is not None and (pages := session_page_delta(s, pc))
     ]
     if dated_pages:
         active_months = {(day.year, day.month) for day, _ in dated_pages}
@@ -421,7 +421,7 @@ def reading_session_tiles(
     timed_pages = [
         pages
         for s, pc in meaningful
-        if (s.get("durationSeconds") or 0) > 0 and (pages := _session_page_delta(s, pc))
+        if (s.get("durationSeconds") or 0) > 0 and (pages := session_page_delta(s, pc))
     ]
     total_hours = sum(_session_hours(s) for s, _ in meaningful if (s.get("durationSeconds") or 0) > 0)
     if timed_pages and total_hours > 0:

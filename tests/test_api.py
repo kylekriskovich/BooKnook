@@ -696,6 +696,212 @@ def test_api_remove_physical_reading_session(client):
     conn.close()
 
 
+def test_api_session_log_merges_and_sorts_all_sources_newest_first(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="finished")
+    models.add_cached_reading_sessions(
+        conn, entry.id, "EBOOK", [{"id": 1, "startTime": "2026-01-01T00:00:00Z", "endProgress": 10.0}]
+    )
+    models.add_cached_reading_sessions(
+        conn, entry.id, "AUDIOBOOK", [{"id": 2, "startTime": "2026-02-01T00:00:00Z"}]
+    )
+    models.add_physical_reading_session(conn, entry.id, "2026-03-01T00:00:00Z", "2026-03-01T01:00:00Z", 0, 20)
+    conn.close()
+
+    response = client.get(f"/api/tbr/{entry.id}/sessions")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [row["source"] for row in body] == ["physical", "audiobook", "ebook"]  # newest first
+    assert body[2]["end_progress"] == 10.0
+
+
+def test_api_session_log_computes_pages_per_source(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    models.set_book_page_count(conn, book.id, 400)
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="finished")
+    models.add_cached_reading_sessions(
+        conn,
+        entry.id,
+        "EBOOK",
+        [{"id": 1, "startTime": "2026-01-01T00:00:00Z", "progressDelta": 5.0}],  # 5% of 400 = 20
+    )
+    models.add_cached_reading_sessions(
+        conn, entry.id, "AUDIOBOOK", [{"id": 2, "startTime": "2026-02-01T00:00:00Z", "durationSeconds": 300}]
+    )
+    models.add_physical_reading_session(conn, entry.id, "2026-03-01T00:00:00Z", "2026-03-01T01:00:00Z", 10, 35)
+    conn.close()
+
+    response = client.get(f"/api/tbr/{entry.id}/sessions")
+
+    assert response.status_code == 200
+    by_source = {row["source"]: row for row in response.json()}
+    assert by_source["ebook"]["pages"] == 20
+    assert by_source["audiobook"]["pages"] is None  # no page concept for audio
+    assert by_source["physical"]["pages"] == 25  # exact: 35 - 10
+
+
+def test_api_session_log_requires_ownership(client):
+    owner = _make_user("Owner")
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, owner.id, book.id)
+    conn.close()
+
+    _logged_in_client(client)
+    response = client.get(f"/api/tbr/{entry.id}/sessions")
+
+    assert response.status_code == 404
+
+
+def test_api_remove_session_log_entry_soft_deletes_ebook_session(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="finished")
+    models.add_cached_reading_sessions(conn, entry.id, "EBOOK", [{"id": 1, "startTime": "2026-01-01T00:00:00Z"}])
+    conn.close()
+
+    response = client.post(f"/api/tbr/{entry.id}/sessions/ebook/1/remove")
+
+    assert response.status_code == 204
+    conn = models.get_connection()
+    assert models.list_cached_reading_sessions(conn, entry.id, "EBOOK") == []
+    conn.close()
+
+
+def test_api_remove_session_log_entry_never_resurrected_by_a_later_resync(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="finished")
+    models.add_cached_reading_sessions(conn, entry.id, "EBOOK", [{"id": 1, "startTime": "2026-01-01T00:00:00Z"}])
+    conn.close()
+
+    client.post(f"/api/tbr/{entry.id}/sessions/ebook/1/remove")
+
+    conn = models.get_connection()
+    # Same session id reappearing from a later Grimmory fetch must stay excluded.
+    models.add_cached_reading_sessions(conn, entry.id, "EBOOK", [{"id": 1, "startTime": "2026-01-01T00:00:00Z"}])
+    assert models.list_cached_reading_sessions(conn, entry.id, "EBOOK") == []
+    conn.close()
+
+
+def test_api_remove_session_log_entry_removes_physical_session(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="reading")
+    session = models.add_physical_reading_session(
+        conn, entry.id, "2026-08-21T10:00:00Z", "2026-08-21T11:00:00Z", 0, 140
+    )
+    conn.close()
+
+    response = client.post(f"/api/tbr/{entry.id}/sessions/physical/{session.id}/remove")
+
+    assert response.status_code == 204
+    conn = models.get_connection()
+    assert models.get_physical_reading_session(conn, session.id) is None
+    conn.close()
+
+
+def test_api_remove_session_log_entry_rejects_unknown_source(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id)
+    conn.close()
+
+    response = client.post(f"/api/tbr/{entry.id}/sessions/paperback/1/remove")
+
+    assert response.status_code == 422
+
+
+def test_api_group_duplicate_sessions_merges_a_burst(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="finished")
+    models.add_cached_reading_sessions(
+        conn,
+        entry.id,
+        "AUDIOBOOK",
+        [
+            {"id": 1, "startTime": "2026-08-26T06:12:25Z", "endTime": "2026-08-26T06:17:25Z", "durationSeconds": 300},
+            {"id": 2, "startTime": "2026-08-26T06:12:25Z", "endTime": "2026-08-26T06:22:25Z", "durationSeconds": 300},
+        ],
+    )
+    conn.close()
+
+    response = client.post(f"/api/tbr/{entry.id}/sessions/group")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body) == 1
+    assert body[0]["duration_seconds"] == 600
+    conn = models.get_connection()
+    assert len(models.list_cached_reading_sessions(conn, entry.id, "AUDIOBOOK")) == 1
+    conn.close()
+
+
+def test_api_group_duplicate_sessions_rejects_non_finished_entry(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="reading")
+    models.add_cached_reading_sessions(
+        conn,
+        entry.id,
+        "AUDIOBOOK",
+        [
+            {"id": 1, "startTime": "2026-08-26T06:12:25Z", "endTime": "2026-08-26T06:17:25Z", "durationSeconds": 300},
+            {"id": 2, "startTime": "2026-08-26T06:12:25Z", "endTime": "2026-08-26T06:22:25Z", "durationSeconds": 300},
+        ],
+    )
+    conn.close()
+
+    response = client.post(f"/api/tbr/{entry.id}/sessions/group")
+
+    assert response.status_code == 400
+    conn = models.get_connection()
+    assert len(models.list_cached_reading_sessions(conn, entry.id, "AUDIOBOOK")) == 2  # untouched
+    conn.close()
+
+
+def test_api_group_duplicate_sessions_requires_ownership(client):
+    owner = _make_user("Owner")
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, owner.id, book.id, status="finished")
+    conn.close()
+
+    _logged_in_client(client)
+    response = client.post(f"/api/tbr/{entry.id}/sessions/group")
+
+    assert response.status_code == 404
+
+
+def test_api_remove_session_log_entry_requires_ownership(client):
+    owner = _make_user("Owner")
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Dune")
+    entry = models.add_tbr_entry(conn, owner.id, book.id, status="finished")
+    models.add_cached_reading_sessions(conn, entry.id, "EBOOK", [{"id": 1, "startTime": "2026-01-01T00:00:00Z"}])
+    conn.close()
+
+    _logged_in_client(client)
+    response = client.post(f"/api/tbr/{entry.id}/sessions/ebook/1/remove")
+
+    assert response.status_code == 404
+    conn = models.get_connection()
+    assert len(models.list_cached_reading_sessions(conn, entry.id, "EBOOK")) == 1  # untouched
+    conn.close()
+
+
 def test_api_book_detail_includes_physical_sessions_merged_into_reading_bucket(client):
     # DESIGN-multi-edition-refactor.md Decisions 7-9: a manually-logged physical session is
     # converted to a Grimmory-shaped dict and merges into the Reading tile bucket (not a third

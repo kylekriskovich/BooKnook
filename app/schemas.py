@@ -56,6 +56,26 @@ class PhysicalReadingSessionOut(BaseModel):
     end_page: int
 
 
+class SessionLogEntryOut(BaseModel):
+    """One row of the book detail page's merged, newest-first session log - ebook/audiobook rows
+    come from cached_reading_sessions (id is Grimmory's own session id), physical rows from
+    physical_reading_sessions (id is that table's own id). `source` disambiguates the id space for
+    the delete action, since the two are otherwise unrelated integers. `pages` is exact for
+    physical (end_page - start_page), an estimate from progress_delta * book.page_count for ebook
+    (same method as stat_tiles.session_page_delta), and always None for audiobook - Grimmory
+    never tracks audiobook position in pages."""
+    source: str  # "ebook" | "audiobook" | "physical"
+    id: int
+    start_time: str
+    end_time: Optional[str] = None
+    duration_seconds: Optional[int] = None
+    end_progress: Optional[float] = None
+    progress_delta: Optional[float] = None
+    start_page: Optional[int] = None
+    end_page: Optional[int] = None
+    pages: Optional[int] = None
+
+
 class ShelfOut(BaseModel):
     status: str
     label: str

@@ -393,3 +393,174 @@ def test_clear_audiobook_pairing_removes_it(conn):
     models.set_audiobook_pairing(conn, audiobook_grimmory_id=2, ebook_grimmory_id=1)
     models.clear_audiobook_pairing(conn, audiobook_grimmory_id=2)
     assert models.get_audiobook_pairings(conn) == {}
+
+
+# --- cached_reading_sessions ---
+
+
+def _entry(conn):
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert")
+    return models.add_tbr_entry(conn, user.id, book.id)
+
+
+def test_add_and_list_cached_reading_sessions_round_trips(conn):
+    entry = _entry(conn)
+    session = {
+        "id": 101,
+        "startTime": "2026-01-01T10:00:00Z",
+        "endTime": "2026-01-01T10:30:00Z",
+        "durationSeconds": 1800,
+        "endProgress": 25.0,
+        "progressDelta": 5.0,
+    }
+    models.add_cached_reading_sessions(conn, entry.id, "EBOOK", [session])
+
+    cached = models.list_cached_reading_sessions(conn, entry.id, "EBOOK")
+    assert len(cached) == 1
+    assert cached[0]["startTime"] == "2026-01-01T10:00:00Z"
+    assert cached[0]["durationSeconds"] == 1800
+    assert cached[0]["bookType"] == "EBOOK"
+
+
+def test_add_cached_reading_sessions_ignores_duplicates_by_grimmory_session_id(conn):
+    entry = _entry(conn)
+    session = {"id": 101, "startTime": "2026-01-01T10:00:00Z"}
+    models.add_cached_reading_sessions(conn, entry.id, "EBOOK", [session])
+    models.add_cached_reading_sessions(conn, entry.id, "EBOOK", [session])
+
+    assert len(models.list_cached_reading_sessions(conn, entry.id, "EBOOK")) == 1
+
+
+def test_add_cached_reading_sessions_skips_sessions_without_id_or_start_time(conn):
+    entry = _entry(conn)
+    models.add_cached_reading_sessions(
+        conn, entry.id, "EBOOK", [{"startTime": "2026-01-01T10:00:00Z"}, {"id": 5}, {}]
+    )
+    assert models.list_cached_reading_sessions(conn, entry.id, "EBOOK") == []
+
+
+def test_cached_reading_sessions_separate_by_book_type(conn):
+    entry = _entry(conn)
+    models.add_cached_reading_sessions(conn, entry.id, "EBOOK", [{"id": 1, "startTime": "2026-01-01T00:00:00Z"}])
+    models.add_cached_reading_sessions(conn, entry.id, "AUDIOBOOK", [{"id": 1, "startTime": "2026-01-02T00:00:00Z"}])
+
+    assert len(models.list_cached_reading_sessions(conn, entry.id, "EBOOK")) == 1
+    assert len(models.list_cached_reading_sessions(conn, entry.id, "AUDIOBOOK")) == 1
+
+
+def test_soft_delete_cached_reading_session_excludes_it_from_list(conn):
+    entry = _entry(conn)
+    models.add_cached_reading_sessions(conn, entry.id, "EBOOK", [{"id": 101, "startTime": "2026-01-01T00:00:00Z"}])
+
+    models.soft_delete_cached_reading_session(conn, entry.id, 101, "EBOOK")
+
+    assert models.list_cached_reading_sessions(conn, entry.id, "EBOOK") == []
+
+
+def test_soft_deleted_session_is_never_resurrected_by_a_later_import(conn):
+    entry = _entry(conn)
+    session = {"id": 101, "startTime": "2026-01-01T00:00:00Z"}
+    models.add_cached_reading_sessions(conn, entry.id, "EBOOK", [session])
+    models.soft_delete_cached_reading_session(conn, entry.id, 101, "EBOOK")
+
+    # A future resync re-fetches the same session from Grimmory - INSERT OR IGNORE must not
+    # revive the tombstoned row.
+    models.add_cached_reading_sessions(conn, entry.id, "EBOOK", [session])
+
+    assert models.list_cached_reading_sessions(conn, entry.id, "EBOOK") == []
+
+
+# --- group_duplicate_reading_sessions ---
+
+
+def test_group_duplicate_reading_sessions_merges_a_burst(conn):
+    entry = _entry(conn)
+    # The observed Grimmory bug: every row in a burst shares the stretch's original start_time,
+    # with end_time creeping forward and duration_seconds representing each real ~5-min chunk.
+    models.add_cached_reading_sessions(
+        conn,
+        entry.id,
+        "AUDIOBOOK",
+        [
+            {"id": 1, "startTime": "2026-08-26T06:12:25Z", "endTime": "2026-08-26T06:17:25Z", "durationSeconds": 300},
+            {"id": 2, "startTime": "2026-08-26T06:12:25Z", "endTime": "2026-08-26T06:22:25Z", "durationSeconds": 300},
+            {"id": 3, "startTime": "2026-08-26T06:12:25Z", "endTime": "2026-08-26T06:27:25Z", "durationSeconds": 259},
+        ],
+    )
+
+    removed = models.group_duplicate_reading_sessions(conn, entry.id)
+
+    assert removed == 2
+    cached = models.list_cached_reading_sessions(conn, entry.id, "AUDIOBOOK")
+    assert len(cached) == 1
+    assert cached[0]["id"] == 3  # the latest-ending row survives
+    assert cached[0]["startTime"] == "2026-08-26T06:12:25Z"
+    assert cached[0]["endTime"] == "2026-08-26T06:27:25Z"
+    assert cached[0]["durationSeconds"] == 859  # summed, not overwritten - preserves total time
+
+
+def test_group_duplicate_reading_sessions_leaves_unique_sessions_untouched(conn):
+    entry = _entry(conn)
+    models.add_cached_reading_sessions(
+        conn,
+        entry.id,
+        "EBOOK",
+        [
+            {"id": 1, "startTime": "2026-01-01T00:00:00Z", "durationSeconds": 100},
+            {"id": 2, "startTime": "2026-01-02T00:00:00Z", "durationSeconds": 200},
+        ],
+    )
+
+    removed = models.group_duplicate_reading_sessions(conn, entry.id)
+
+    assert removed == 0
+    assert len(models.list_cached_reading_sessions(conn, entry.id, "EBOOK")) == 2
+
+
+def test_group_duplicate_reading_sessions_never_merges_across_book_types(conn):
+    entry = _entry(conn)
+    # Same start_time, but one ebook one audiobook - must not merge across the two.
+    models.add_cached_reading_sessions(
+        conn, entry.id, "EBOOK", [{"id": 1, "startTime": "2026-01-01T00:00:00Z", "durationSeconds": 100}]
+    )
+    models.add_cached_reading_sessions(
+        conn, entry.id, "AUDIOBOOK", [{"id": 1, "startTime": "2026-01-01T00:00:00Z", "durationSeconds": 200}]
+    )
+
+    removed = models.group_duplicate_reading_sessions(conn, entry.id)
+
+    assert removed == 0
+    assert len(models.list_cached_reading_sessions(conn, entry.id, "EBOOK")) == 1
+    assert len(models.list_cached_reading_sessions(conn, entry.id, "AUDIOBOOK")) == 1
+
+
+def test_group_duplicate_reading_sessions_ignores_tombstoned_sessions(conn):
+    entry = _entry(conn)
+    models.add_cached_reading_sessions(
+        conn,
+        entry.id,
+        "AUDIOBOOK",
+        [
+            {"id": 1, "startTime": "2026-01-01T00:00:00Z", "endTime": "2026-01-01T00:05:00Z", "durationSeconds": 300},
+            {"id": 2, "startTime": "2026-01-01T00:00:00Z", "endTime": "2026-01-01T00:10:00Z", "durationSeconds": 300},
+        ],
+    )
+    models.soft_delete_cached_reading_session(conn, entry.id, 2, "AUDIOBOOK")
+
+    removed = models.group_duplicate_reading_sessions(conn, entry.id)
+
+    # Only one active row remains (the other is tombstoned) - nothing to merge with.
+    assert removed == 0
+    assert len(models.list_cached_reading_sessions(conn, entry.id, "AUDIOBOOK")) == 1
+
+
+def test_cached_reading_sessions_cascade_delete_with_entry(conn):
+    entry = _entry(conn)
+    models.add_cached_reading_sessions(conn, entry.id, "EBOOK", [{"id": 101, "startTime": "2026-01-01T00:00:00Z"}])
+
+    conn.execute("DELETE FROM tbr_entries WHERE id = ?", (entry.id,))
+    conn.commit()
+
+    rows = conn.execute("SELECT * FROM cached_reading_sessions WHERE entry_id = ?", (entry.id,)).fetchall()
+    assert rows == []

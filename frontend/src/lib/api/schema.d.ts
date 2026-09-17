@@ -465,6 +465,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/tbr/{entry_id}/sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Api Session Log */
+        get: operations["api_session_log_api_tbr__entry_id__sessions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tbr/{entry_id}/sessions/{source}/{session_id}/remove": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Api Remove Session Log Entry */
+        post: operations["api_remove_session_log_entry_api_tbr__entry_id__sessions__source___session_id__remove_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tbr/{entry_id}/sessions/group": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Api Group Duplicate Sessions */
+        post: operations["api_group_duplicate_sessions_api_tbr__entry_id__sessions_group_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/preferences/view": {
         parameters: {
             query?: never;
@@ -1014,6 +1065,38 @@ export interface components {
             published_date?: string | null;
             /** Grimmory Id */
             grimmory_id?: number | null;
+        };
+        /**
+         * SessionLogEntryOut
+         * @description One row of the book detail page's merged, newest-first session log - ebook/audiobook rows
+         *     come from cached_reading_sessions (id is Grimmory's own session id), physical rows from
+         *     physical_reading_sessions (id is that table's own id). `source` disambiguates the id space for
+         *     the delete action, since the two are otherwise unrelated integers. `pages` is exact for
+         *     physical (end_page - start_page), an estimate from progress_delta * book.page_count for ebook
+         *     (same method as stat_tiles.session_page_delta), and always None for audiobook - Grimmory
+         *     never tracks audiobook position in pages.
+         */
+        SessionLogEntryOut: {
+            /** Source */
+            source: string;
+            /** Id */
+            id: number;
+            /** Start Time */
+            start_time: string;
+            /** End Time */
+            end_time?: string | null;
+            /** Duration Seconds */
+            duration_seconds?: number | null;
+            /** End Progress */
+            end_progress?: number | null;
+            /** Progress Delta */
+            progress_delta?: number | null;
+            /** Start Page */
+            start_page?: number | null;
+            /** End Page */
+            end_page?: number | null;
+            /** Pages */
+            pages?: number | null;
         };
         /** SettingsOut */
         SettingsOut: {
@@ -2129,6 +2212,99 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    api_session_log_api_tbr__entry_id__sessions_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                entry_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionLogEntryOut"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    api_remove_session_log_entry_api_tbr__entry_id__sessions__source___session_id__remove_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                entry_id: number;
+                source: string;
+                session_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    api_group_duplicate_sessions_api_tbr__entry_id__sessions_group_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                entry_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionLogEntryOut"][];
+                };
             };
             /** @description Validation Error */
             422: {

@@ -47,8 +47,10 @@ from app.models import (
     get_search_settings,
     get_tbr_entry,
     get_user,
+    group_duplicate_reading_sessions,
     init_db,
     list_aggregate_tbr,
+    list_cached_reading_sessions,
     list_physical_reading_sessions,
     list_tbr_entries_with_books,
     remove_tbr_entry,
@@ -72,6 +74,7 @@ from app.models import (
     set_view_preference,
     set_wanted_order,
     set_want_to_read_shelf_id,
+    soft_delete_cached_reading_session,
     update_physical_reading_session,
     upsert_goal,
 )
@@ -334,9 +337,10 @@ def _parse_calendar_month(raw: str, today: date) -> tuple[int, int]:
 def _fetch_sessions_by_entry_id(db_connection, user: User, entries: list) -> dict[int, list[dict]]:
     """Ebook + physical reading sessions per entry, for stat_tiles.build_collection_tiles's "Avg
     pages read". Audiobook listening sessions are excluded - they carry no real page data, only a
-    percentage-of-ebook-pages estimate, which would skew a pages-read average. One Grimmory API
-    call per entry with a grimmory_book_id (no caching), so only call this for a bounded set of
-    already-finished entries, not the full library."""
+    percentage-of-ebook-pages estimate, which would skew a pages-read average. A "finished" entry
+    with a warm cache costs no Grimmory call at all (library_check.get_or_fetch_reading_sessions);
+    only a "reading" one, or a "finished" one still cold, does - so only call this for a bounded
+    set of already-finished entries, not the full library."""
     base_url = os.environ.get(grimmory_auth.GRIMMORY_BASE_URL_ENV)
     access_token = grimmory_auth.get_valid_access_token(db_connection, user) if base_url else None
     result: dict[int, list[dict]] = {}
@@ -344,8 +348,9 @@ def _fetch_sessions_by_entry_id(db_connection, user: User, entries: list) -> dic
         sessions: list[dict] = []
         if access_token is not None and entry.book.grimmory_book_id:
             try:
-                sessions = library_check.fetch_reading_sessions_for_book(
-                    base_url, access_token, entry.book.grimmory_book_id
+                sessions = library_check.get_or_fetch_reading_sessions(
+                    db_connection, entry.id, entry.status, "EBOOK", base_url, access_token,
+                    entry.book.grimmory_book_id,
                 )
             except LibraryCheckUnavailable as exc:
                 grimmory_auth.evict_on_rejection(access_token, exc)
@@ -363,9 +368,10 @@ def _fetch_stats_page_sessions(db_connection, user: User, entries: list) -> dict
     _fetch_sessions_by_entry_id, which merges ebook+physical for build_collection_tiles's "Avg
     pages read") - powers the Stats page's Reading/Listening/Physical tab stats
     (stat_tiles.reading_session_tiles/listening_session_tiles/physical_session_tiles). Up to two
-    Grimmory API calls per entry (ebook + any paired audiobook, no caching), on top of the calls
-    _fetch_sessions_by_entry_id already makes for the same page - only call this for the bounded,
-    already-finished-this-year set, not the full library."""
+    Grimmory API calls per entry (ebook + any paired audiobook) once, on top of the calls
+    _fetch_sessions_by_entry_id already makes for the same page - a "finished" entry with a warm
+    cache costs neither (library_check.get_or_fetch_reading_sessions) - only call this for the
+    bounded, already-finished-this-year set, not the full library."""
     base_url = os.environ.get(grimmory_auth.GRIMMORY_BASE_URL_ENV)
     access_token = grimmory_auth.get_valid_access_token(db_connection, user) if base_url else None
     result: dict[int, dict[str, list[dict]]] = {}
@@ -375,8 +381,9 @@ def _fetch_stats_page_sessions(db_connection, user: User, entries: list) -> dict
         if access_token is not None:
             if entry.book.grimmory_book_id:
                 try:
-                    ebook_sessions = library_check.fetch_reading_sessions_for_book(
-                        base_url, access_token, entry.book.grimmory_book_id
+                    ebook_sessions = library_check.get_or_fetch_reading_sessions(
+                        db_connection, entry.id, entry.status, "EBOOK", base_url, access_token,
+                        entry.book.grimmory_book_id,
                     )
                 except LibraryCheckUnavailable as exc:
                     grimmory_auth.evict_on_rejection(access_token, exc)
@@ -389,8 +396,9 @@ def _fetch_stats_page_sessions(db_connection, user: User, entries: list) -> dict
                 )
             if audiobook_grimmory_id is not None:
                 try:
-                    audiobook_sessions = library_check.fetch_reading_sessions_for_book(
-                        base_url, access_token, audiobook_grimmory_id
+                    audiobook_sessions = library_check.get_or_fetch_reading_sessions(
+                        db_connection, entry.id, entry.status, "AUDIOBOOK", base_url, access_token,
+                        audiobook_grimmory_id,
                     )
                 except LibraryCheckUnavailable as exc:
                     grimmory_auth.evict_on_rejection(access_token, exc)
@@ -804,15 +812,17 @@ def api_book_detail(
     if access_token is not None:
         if entry.book.grimmory_book_id:
             try:
-                sessions = library_check.fetch_reading_sessions_for_book(
-                    base_url, access_token, entry.book.grimmory_book_id
+                sessions = library_check.get_or_fetch_reading_sessions(
+                    db_connection, entry.id, entry.status, "EBOOK", base_url, access_token,
+                    entry.book.grimmory_book_id,
                 )
             except LibraryCheckUnavailable as exc:
                 grimmory_auth.evict_on_rejection(access_token, exc)
         if audiobook_grimmory_id is not None:
             try:
-                audiobook_sessions = library_check.fetch_reading_sessions_for_book(
-                    base_url, access_token, audiobook_grimmory_id
+                audiobook_sessions = library_check.get_or_fetch_reading_sessions(
+                    db_connection, entry.id, entry.status, "AUDIOBOOK", base_url, access_token,
+                    audiobook_grimmory_id,
                 )
             except LibraryCheckUnavailable as exc:
                 grimmory_auth.evict_on_rejection(access_token, exc)
@@ -1412,6 +1422,116 @@ def api_remove_physical_reading_session(
     if session is not None and session.entry_id == entry_id:
         delete_physical_reading_session(db_connection, session_id)
     return Response(status_code=204)
+
+
+# --- session log ---
+
+
+# Function Name: _session_log_for_entry
+# Description: Merges ebook + audiobook (from cached_reading_sessions - already kept warm by
+#   library_check.get_or_fetch_reading_sessions on every book-detail/stats load, so this never
+#   calls Grimmory itself) and physical sessions into one newest-first log. `pages` uses the same
+#   estimation stat_tiles.build_collection_tiles's "Avg pages read" relies on
+#   (stat_tiles.session_page_delta) - exact for physical, an estimate for ebook, always None for
+#   audiobook (no page concept).
+# Parameters:
+# - db_connection: Database connection.
+# - entry_id (int): Local TBR entry id.
+# - page_count (Optional[int]): The book's own page count, for the ebook pages estimate.
+# Returns: Session log rows (list[schemas.SessionLogEntryOut]), newest first.
+def _session_log_for_entry(
+    db_connection, entry_id: int, page_count: Optional[int]
+) -> list[schemas.SessionLogEntryOut]:
+    rows: list[schemas.SessionLogEntryOut] = []
+    for book_type, source in (("EBOOK", "ebook"), ("AUDIOBOOK", "audiobook")):
+        for s in list_cached_reading_sessions(db_connection, entry_id, book_type):
+            pages = stat_tiles.session_page_delta(s, page_count) if source == "ebook" else None
+            rows.append(
+                schemas.SessionLogEntryOut(
+                    source=source,
+                    id=s["id"],
+                    start_time=s["startTime"],
+                    end_time=s.get("endTime"),
+                    duration_seconds=s.get("durationSeconds"),
+                    end_progress=s.get("endProgress"),
+                    progress_delta=s.get("progressDelta"),
+                    pages=round(pages) if pages is not None else None,
+                )
+            )
+    for p in list_physical_reading_sessions(db_connection, entry_id):
+        rows.append(
+            schemas.SessionLogEntryOut(
+                source="physical",
+                id=p.id,
+                start_time=p.start_time,
+                end_time=p.end_time,
+                start_page=p.start_page,
+                end_page=p.end_page,
+                pages=p.end_page - p.start_page,
+            )
+        )
+    # Grimmory instants and physical sessions' own ISO instants (frontend's .toISOString()) sort
+    # correctly as plain strings - no need to parse them first.
+    rows.sort(key=lambda r: r.start_time, reverse=True)
+    return rows
+
+
+@app.get("/api/tbr/{entry_id}/sessions", response_model=list[schemas.SessionLogEntryOut])
+def api_session_log(
+    entry_id: int,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    entry = get_tbr_entry(db_connection, entry_id)
+    if entry is None or entry.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Not found")
+    book = get_book(db_connection, entry.book_id)
+    return _session_log_for_entry(db_connection, entry_id, book.page_count if book else None)
+
+
+@app.post("/api/tbr/{entry_id}/sessions/{source}/{session_id}/remove", status_code=204)
+def api_remove_session_log_entry(
+    entry_id: int,
+    source: str,
+    session_id: int,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    entry = get_tbr_entry(db_connection, entry_id)
+    if entry is None or entry.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Not found")
+    if source == "physical":
+        session = get_physical_reading_session(db_connection, session_id)
+        if session is not None and session.entry_id == entry_id:
+            delete_physical_reading_session(db_connection, session_id)
+    elif source in ("ebook", "audiobook"):
+        # Soft-delete only - Grimmory has no session edit/delete API (confirmed empirically), so
+        # this can only exclude the session locally, never fix it upstream. Never resurrected by a
+        # future resync (models.add_cached_reading_sessions never touches an existing row).
+        soft_delete_cached_reading_session(db_connection, entry_id, session_id, source.upper())
+    else:
+        raise HTTPException(status_code=422, detail="Invalid source")
+    return Response(status_code=204)
+
+
+@app.post("/api/tbr/{entry_id}/sessions/group", response_model=list[schemas.SessionLogEntryOut])
+def api_group_duplicate_sessions(
+    entry_id: int,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    # Restricted to "finished" entries only - a still-"reading" book can have a burst split across
+    # multiple live fetches (get_or_fetch_reading_sessions keeps upserting new session ids as they
+    # arrive), so merging mid-stream risks collapsing an incomplete stretch. "Finished" never
+    # fetches again, so whatever's cached is permanently the final, complete picture.
+    entry = get_tbr_entry(db_connection, entry_id)
+    if entry is None or entry.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Not found")
+    if entry.status != "finished":
+        raise HTTPException(status_code=400, detail="Only finished books can be grouped")
+    group_duplicate_reading_sessions(db_connection, entry_id)
+    book = get_book(db_connection, entry.book_id)
+    return _session_log_for_entry(db_connection, entry_id, book.page_count if book else None)
 
 
 # --- preferences ---
