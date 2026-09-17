@@ -243,7 +243,7 @@ def test_api_home_finished_shelf_uses_client_today_not_server_utc(client, monkey
     entry = models.add_tbr_entry(conn, user.id, book.id)
     models.set_tbr_entry_status(conn, entry.id, "finished", "2027-01-01T00:30:00+00:00")
     conn.close()
-    monkeypatch.setattr(main.dates, "today_utc", lambda: date(2026, 12, 31))
+    monkeypatch.setattr(main.dates, "today_local", lambda zone=None: date(2026, 12, 31))
 
     response = client.get("/api/home", params={"today": "2027-01-01"})
 
@@ -283,7 +283,7 @@ def test_api_shelf_finished_uses_client_today_not_server_utc(client, monkeypatch
     entry = models.add_tbr_entry(conn, user.id, book.id)
     models.set_tbr_entry_status(conn, entry.id, "finished", "2027-01-01T00:30:00+00:00")
     conn.close()
-    monkeypatch.setattr(main.dates, "today_utc", lambda: date(2026, 12, 31))
+    monkeypatch.setattr(main.dates, "today_local", lambda zone=None: date(2026, 12, 31))
 
     response = client.get("/api/shelf/finished", params={"today": "2027-01-01"})
 
@@ -1046,7 +1046,7 @@ def test_api_book_detail_pages_per_day_uses_client_today_not_server_utc(client, 
 
     # No grimmory_book_id set, so the sessions fetch is skipped entirely — this exercises the
     # no-sessions Pages-per-day fallback path in app/stat_tiles.py.
-    monkeypatch.setattr(main.dates, "today_utc", lambda: date(2020, 1, 1))
+    monkeypatch.setattr(main.dates, "today_local", lambda zone=None: date(2020, 1, 1))
 
     response = client.get(f"/api/book/{entry.id}", params={"today": "2026-01-10"})
 
@@ -1143,7 +1143,7 @@ def test_api_stats_year_uses_client_today_not_server_utc(client, monkeypatch):
     entry = models.add_tbr_entry(conn, user.id, book.id)
     models.set_tbr_entry_status(conn, entry.id, "finished", "2027-01-01T00:30:00+00:00")
     conn.close()
-    monkeypatch.setattr(main.dates, "today_utc", lambda: date(2026, 12, 31))
+    monkeypatch.setattr(main.dates, "today_local", lambda zone=None: date(2026, 12, 31))
 
     response = client.get("/api/stats", params={"today": "2027-01-01"})
 
@@ -1246,7 +1246,7 @@ def test_api_calendar_month_defaults_to_client_today_not_server_utc(client, monk
     # *previous* month's calendar. Mock the server's UTC "now" into a different month than the
     # client's local today to catch that.
     _logged_in_client(client)
-    monkeypatch.setattr(main.dates, "today_utc", lambda: date(2026, 7, 31))
+    monkeypatch.setattr(main.dates, "today_local", lambda zone=None: date(2026, 7, 31))
 
     response = client.get("/api/calendar", params={"today": "2026-08-01"})
 
@@ -1257,7 +1257,7 @@ def test_api_calendar_month_defaults_to_client_today_not_server_utc(client, monk
 
 def test_api_calendar_is_today_follows_client_supplied_today(client, monkeypatch):
     _logged_in_client(client)
-    monkeypatch.setattr(main.dates, "today_utc", lambda: date(2026, 8, 20))
+    monkeypatch.setattr(main.dates, "today_local", lambda zone=None: date(2026, 8, 20))
 
     response = client.get(
         "/api/calendar", params={"month": "2026-08", "today": "2026-08-21"}
@@ -1292,7 +1292,7 @@ def test_api_settings_returns_goal_and_spice_labels(client):
 
 def test_api_settings_goal_year_uses_client_today_not_server_utc(client, monkeypatch):
     _logged_in_client(client)
-    monkeypatch.setattr(main.dates, "today_utc", lambda: date(2026, 12, 31))
+    monkeypatch.setattr(main.dates, "today_local", lambda zone=None: date(2026, 12, 31))
 
     response = client.get("/api/settings", params={"today": "2027-01-01"})
 

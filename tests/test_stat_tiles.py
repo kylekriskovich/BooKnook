@@ -314,11 +314,11 @@ def test_estimated_completion_present_with_pace_and_remaining_progress():
     assert any(t["label"] == "Estimated Completion" for t in tiles)
 
 
-def test_estimated_completion_uses_client_supplied_today_not_server_utc(monkeypatch):
-    # Regression test: the server's UTC "today" can lag a viewer's actual local day by up to many
-    # hours (see app/main.py:_resolve_client_today) - the estimate must be computed from the
-    # caller's own `today`, not whatever today_utc() says.
-    monkeypatch.setattr(stat_tiles, "today_utc", lambda: dt.date(2020, 1, 1))
+def test_estimated_completion_uses_client_supplied_today_not_server_default(monkeypatch):
+    # Regression test: the server's default "today" can lag a viewer's actual local day by up to
+    # many hours (see app/main.py:_resolve_client_today) - the estimate must be computed from the
+    # caller's own `today`, not whatever today_local() says.
+    monkeypatch.setattr(stat_tiles, "today_local", lambda zone=None: dt.date(2020, 1, 1))
     entry = _entry(status="reading")
     sessions = [
         _session("2026-01-01", 0, 10),
@@ -327,7 +327,7 @@ def test_estimated_completion_uses_client_supplied_today_not_server_utc(monkeypa
     tiles = stat_tiles.build_book_tiles(entry, sessions, today=dt.date(2026, 1, 3))
     by_label = {t["label"]: t["value"] for t in tiles}
     # pace = 10%/day, remaining = 80% -> 8 days from the client's today (Jan 3), not from
-    # today_utc()'s mocked 2020 date.
+    # today_local()'s mocked 2020 date.
     assert by_label["Estimated Completion"] == "Jan 11, 2026"
 
 
@@ -341,13 +341,13 @@ def test_estimated_completion_omitted_when_finished_status():
     assert not any(t["label"] == "Estimated Completion" for t in tiles)
 
 
-def test_pages_per_day_fallback_uses_client_supplied_today_not_server_utc(monkeypatch):
-    monkeypatch.setattr(stat_tiles, "today_utc", lambda: dt.date(2020, 1, 1))
+def test_pages_per_day_fallback_uses_client_supplied_today_not_server_default(monkeypatch):
+    monkeypatch.setattr(stat_tiles, "today_local", lambda zone=None: dt.date(2020, 1, 1))
     entry = _entry(status="reading", started_at="2026-01-01", page_count=300)
     tiles = stat_tiles.build_book_tiles(entry, [], today=dt.date(2026, 1, 10))
     by_label = {t["label"]: t["value"] for t in tiles}
     # 10 elapsed days (Jan 1 - Jan 10 inclusive) -> 300 / 10 = 30 pages/day, computed from the
-    # client's today, not today_utc()'s mocked 2020 date.
+    # client's today, not today_local()'s mocked 2020 date.
     assert by_label["Pages per day"] == "30"
 
 

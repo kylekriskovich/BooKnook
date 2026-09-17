@@ -4,8 +4,9 @@ import calendar
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
-from app.dates import longest_consecutive_run, parse_date, today_utc
+from app.dates import instant_to_local_date, longest_consecutive_run, today_local
 from app.models import TBREntryDetail
 
 
@@ -27,15 +28,17 @@ class BookSpan:
 # Parameters:
 # - entry (TBREntryDetail): the TBR entry to convert.
 # - today (date): current date, used as the end date for entries still being read.
+# - zone (Optional[ZoneInfo]): timezone to bucket started_at/finished_at into; defaults to
+#   app.dates.DEFAULT_ZONE.
 # Returns: BookSpan covering the entry's active date range, or None if it can't be placed.
-def _book_span(entry: TBREntryDetail, today: date) -> Optional[BookSpan]:
+def _book_span(entry: TBREntryDetail, today: date, zone: Optional[ZoneInfo] = None) -> Optional[BookSpan]:
     if entry.status not in ("reading", "finished") or not entry.started_at:
         return None
-    start = parse_date(entry.started_at)
+    start = instant_to_local_date(entry.started_at, zone)
     if start is None:
         return None
     if entry.status == "finished":
-        end = parse_date(entry.finished_at) if entry.finished_at else start
+        end = instant_to_local_date(entry.finished_at, zone) if entry.finished_at else start
         if end is None:
             end = start
     else:
@@ -48,11 +51,14 @@ def _book_span(entry: TBREntryDetail, today: date) -> Optional[BookSpan]:
 # Description: Converts every placeable entry into a BookSpan.
 # Parameters:
 # - entries (list[TBREntryDetail]): TBR entries to convert.
-# - today (Optional[date]): current date; defaults to today_utc() if not given.
+# - today (Optional[date]): current date; defaults to today_local(zone) if not given.
+# - zone (Optional[ZoneInfo]): timezone to bucket into; defaults to app.dates.DEFAULT_ZONE.
 # Returns: List of BookSpans for entries that could be placed on a calendar.
-def _all_spans(entries: list[TBREntryDetail], today: Optional[date] = None) -> list[BookSpan]:
-    today = today or today_utc()
-    return [span for entry in entries if (span := _book_span(entry, today)) is not None]
+def _all_spans(
+    entries: list[TBREntryDetail], today: Optional[date] = None, zone: Optional[ZoneInfo] = None
+) -> list[BookSpan]:
+    today = today or today_local(zone)
+    return [span for entry in entries if (span := _book_span(entry, today, zone)) is not None]
 
 # Function Name: _assign_lanes
 # Description: Assigns each span a stable vertical bar lane via greedy interval scheduling
@@ -79,16 +85,21 @@ def _assign_lanes(spans: list[BookSpan]) -> None:
 # - entries (list[TBREntryDetail]): TBR entries to consider.
 # - year (int): calendar year.
 # - month (int): calendar month (1-12).
-# - today (Optional[date]): current date; defaults to today_utc() if not given.
+# - today (Optional[date]): current date; defaults to today_local(zone) if not given.
+# - zone (Optional[ZoneInfo]): timezone to bucket into; defaults to app.dates.DEFAULT_ZONE.
 # Returns: Spans whose range overlaps the month, sorted by book id.
 def month_spans(
-    entries: list[TBREntryDetail], year: int, month: int, today: Optional[date] = None
+    entries: list[TBREntryDetail],
+    year: int,
+    month: int,
+    today: Optional[date] = None,
+    zone: Optional[ZoneInfo] = None,
 ) -> list[BookSpan]:
     month_start = date(year, month, 1)
     month_end = _last_day_of_month(year, month)
     spans = [
         span
-        for span in _all_spans(entries, today)
+        for span in _all_spans(entries, today, zone)
         if span.start <= month_end and span.end >= month_start
     ]
     _assign_lanes(spans)
@@ -239,12 +250,18 @@ class DayCell:
 # - year (int): calendar year.
 # - month (int): calendar month (1-12).
 # - spans (list[BookSpan]): spans to place on the grid.
-# - today (Optional[date]): current date; defaults to today_utc() if not given.
+# - today (Optional[date]): current date; defaults to today_local(zone) if not given.
+# - zone (Optional[ZoneInfo]): timezone for the "today"/"future" fallback; defaults to
+#   app.dates.DEFAULT_ZONE.
 # Returns: List of week rows, each a list of 7 DayCells.
 def calendar_grid(
-    year: int, month: int, spans: list[BookSpan], today: Optional[date] = None
+    year: int,
+    month: int,
+    spans: list[BookSpan],
+    today: Optional[date] = None,
+    zone: Optional[ZoneInfo] = None,
 ) -> list[list[DayCell]]:
-    today = today or today_utc()
+    today = today or today_local(zone)
     cal = calendar.Calendar(firstweekday=6)  # Sunday first
     all_dates = list(cal.itermonthdates(year, month))
 

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
-from app.dates import longest_consecutive_run, parse_date, parse_instant, today_utc
+from app.dates import instant_to_local_date, longest_consecutive_run, parse_instant, today_local
 from app.models import PhysicalReadingSession
 
 
-def session_date(session: dict) -> Optional[date]:
-    return parse_date(session.get("startTime"))
+def session_date(session: dict, zone: Optional[ZoneInfo] = None) -> Optional[date]:
+    return instant_to_local_date(session.get("startTime"), zone)
 
 
 def physical_session_to_grimmory_shape(
@@ -90,9 +91,9 @@ def unified_latest_progress(candidates: list[Optional[float]]) -> Optional[float
     return max(known) if known else None
 
 
-def first_meaningful_session_date(sessions: list[dict]) -> Optional[date]:
+def first_meaningful_session_date(sessions: list[dict], zone: Optional[ZoneInfo] = None) -> Optional[date]:
     dated = [
-        (started_at, started_at.date())
+        (started_at, instant_to_local_date(rec.get("startTime"), zone))
         for rec in sessions
         if _has_meaningful_progress(rec)
         and (started_at := parse_instant(rec.get("startTime"))) is not None
@@ -102,42 +103,44 @@ def first_meaningful_session_date(sessions: list[dict]) -> Optional[date]:
     return min(dated, key=lambda t: t[0])[1]
 
 
-def get_reading_dates(sessions: list[dict]) -> list[date]:
+def get_reading_dates(sessions: list[dict], zone: Optional[ZoneInfo] = None) -> list[date]:
     dates = {
         current_date
         for rec in sessions
-        if _has_meaningful_progress(rec) and (current_date := session_date(rec)) is not None
+        if _has_meaningful_progress(rec) and (current_date := session_date(rec, zone)) is not None
     }
     return sorted(dates)
 
 
-def _entry_duration_days(entry) -> Optional[int]:
+def _entry_duration_days(entry, zone: Optional[ZoneInfo] = None) -> Optional[int]:
     if entry.status != "finished" or not entry.started_at or not entry.finished_at:
         return None
-    started = parse_date(entry.started_at)
-    finished = parse_date(entry.finished_at)
+    started = instant_to_local_date(entry.started_at, zone)
+    finished = instant_to_local_date(entry.finished_at, zone)
     if started is None or finished is None:
         return None
     days = (finished - started).days + 1
     return days if days >= 1 else None
 
 
-def _days_to_complete_tile(entry) -> Optional[dict]:
-    days = _entry_duration_days(entry)
+def _days_to_complete_tile(entry, zone: Optional[ZoneInfo] = None) -> Optional[dict]:
+    days = _entry_duration_days(entry, zone)
     if days is None:
         return None
     return {"label": "Days to Complete", "value": f"{days}d"}
 
 
-def _pages_per_day_fallback_tile(entry, today: Optional[date] = None) -> Optional[dict]:
-    today = today or today_utc()
+def _pages_per_day_fallback_tile(
+    entry, today: Optional[date] = None, zone: Optional[ZoneInfo] = None
+) -> Optional[dict]:
+    today = today or today_local(zone)
     page_count = entry.book.page_count
     if not page_count or not entry.started_at:
         return None
-    started = parse_date(entry.started_at)
+    started = instant_to_local_date(entry.started_at, zone)
     if started is None:
         return None
-    end = parse_date(entry.finished_at) if entry.finished_at else today
+    end = instant_to_local_date(entry.finished_at, zone) if entry.finished_at else today
     if end is None:
         end = today
     days_elapsed = max((end - started).days + 1, 1)  # inclusive day count, floor for bad data
@@ -148,19 +151,24 @@ def _pages_per_day_fallback_tile(entry, today: Optional[date] = None) -> Optiona
 
 
 def build_book_tiles(
-    entry, sessions: list[dict], today: Optional[date] = None, is_audiobook: Optional[bool] = None
+    entry,
+    sessions: list[dict],
+    today: Optional[date] = None,
+    is_audiobook: Optional[bool] = None,
+    zone: Optional[ZoneInfo] = None,
 ) -> list[dict]:
     """Session-dependent tiles for one book (GET /book/{entry_id}) - only meaningful given a
     single book's own reading-session log, not aggregatable across many books. `today` defaults to
-    UTC for callers with no client-local date to pass (see app/main.py:_resolve_client_today).
-    `is_audiobook` picks "Listening" vs "Reading" labels and must be passed explicitly - an entry's
-    book is always the ebook, so `sessions` may belong to either it or a paired audiobook."""
-    today = today or today_utc()
+    the deployment's local timezone for callers with no client-local date to pass (see
+    app/main.py:_resolve_client_today). `is_audiobook` picks "Listening" vs "Reading" labels and
+    must be passed explicitly - an entry's book is always the ebook, so `sessions` may belong to
+    either it or a paired audiobook."""
+    today = today or today_local(zone)
     if is_audiobook is None:
         is_audiobook = entry.book.format == "AUDIOBOOK"
     tiles: list[dict] = []
     page_count = entry.book.page_count
-    reading_dates = get_reading_dates(sessions)
+    reading_dates = get_reading_dates(sessions, zone)
 
     if reading_dates:
         days_label = "Listening Days" if is_audiobook else "Reading Days"
@@ -179,7 +187,7 @@ def build_book_tiles(
         if deltas:
             best_session = max(sessions, key=lambda s: s.get("progressDelta") or 0)
             best_delta = best_session.get("progressDelta") or 0
-            best_date = session_date(best_session)
+            best_date = session_date(best_session, zone)
             # Each session's own page delta when known (physical editions), falling back to an
             # estimate via the ebook's page_count only for sessions with no raw pages of their own.
             page_deltas = [
@@ -237,26 +245,26 @@ def build_book_tiles(
                 )
     elif not is_audiobook:
         # "Pages per day" doesn't fit as a no-listening-data-yet stand-in on a Listening tab.
-        fallback = _pages_per_day_fallback_tile(entry, today)
+        fallback = _pages_per_day_fallback_tile(entry, today, zone)
         if fallback:
             tiles.append(fallback)
 
     # Book-level (started_at/finished_at), not medium-specific - included only once, on the
     # primary/Reading tile list, rather than duplicated onto the Listening tab too.
     if not is_audiobook:
-        days_to_complete = _days_to_complete_tile(entry)
+        days_to_complete = _days_to_complete_tile(entry, zone)
         if days_to_complete:
             tiles.append(days_to_complete)
 
     return tiles
 
 
-def finish_time_tiles_for_collection(entries: list) -> list[dict]:
+def finish_time_tiles_for_collection(entries: list, zone: Optional[ZoneInfo] = None) -> list[dict]:
     """Avg/Fastest/Slowest finish time across many finished entries - entries missing a
     computable duration (see _entry_duration_days) are skipped, not estimated."""
     durations = []
     for entry in entries:
-        days = _entry_duration_days(entry)
+        days = _entry_duration_days(entry, zone)
         if days is not None:
             durations.append((days, entry.book.title))
     if not durations:
@@ -271,7 +279,9 @@ def finish_time_tiles_for_collection(entries: list) -> list[dict]:
     ]
 
 
-def _prorated_pages(entry, window_start: date, window_end: date) -> Optional[float]:
+def _prorated_pages(
+    entry, window_start: date, window_end: date, zone: Optional[ZoneInfo] = None
+) -> Optional[float]:
     """Fraction of entry.book.page_count attributable to the days of its started_at->finished_at
     span that fall within [window_start, window_end] - same overlap-proration as
     reading_calendar.estimated_pages, so a book finished on the window's first day but started 9
@@ -280,8 +290,8 @@ def _prorated_pages(entry, window_start: date, window_end: date) -> Optional[flo
     page_count = entry.book.page_count
     if not page_count or not entry.started_at or not entry.finished_at:
         return None
-    started = parse_date(entry.started_at)
-    finished = parse_date(entry.finished_at)
+    started = instant_to_local_date(entry.started_at, zone)
+    finished = instant_to_local_date(entry.finished_at, zone)
     if started is None or finished is None:
         return None
     span_days = (finished - started).days + 1
@@ -300,6 +310,7 @@ def build_collection_tiles(
     window_start: date,
     window_end: date,
     sessions_by_entry_id: Optional[dict[int, list[dict]]] = None,
+    zone: Optional[ZoneInfo] = None,
 ) -> list[dict]:
     """Aggregate tiles over an arbitrary set of finished entries (e.g. a year for GET /stats, a
     month for GET /calendar). `window_start`/`window_end` prorate "Total pages read" by how much
@@ -318,7 +329,7 @@ def build_collection_tiles(
     prorated = [
         (entry, pages)
         for entry in entries
-        if (pages := _prorated_pages(entry, window_start, window_end)) is not None
+        if (pages := _prorated_pages(entry, window_start, window_end, zone)) is not None
     ]
     if prorated:
         total_pages = sum(pages for _, pages in prorated)
@@ -352,7 +363,7 @@ def build_collection_tiles(
         avg_rating = sum(e.rating for e in with_rating) / len(with_rating)
         tiles.append({"label": "Avg rating", "value": f"{avg_rating:.1f}"})
 
-    tiles += finish_time_tiles_for_collection(entries)
+    tiles += finish_time_tiles_for_collection(entries, zone)
     return tiles
 
 
@@ -360,7 +371,9 @@ def _session_hours(session: dict) -> float:
     return (session.get("durationSeconds") or 0) / 3600
 
 
-def reading_session_tiles(sessions_with_page_counts: list[tuple[dict, Optional[int]]]) -> list[dict]:
+def reading_session_tiles(
+    sessions_with_page_counts: list[tuple[dict, Optional[int]]], zone: Optional[ZoneInfo] = None
+) -> list[dict]:
     """Ebook-only session stats, spread across the Stats page's Overview/Averages/Highlights tabs
     by group_stat_tiles (kept separate from physical sessions here, unlike build_collection_tiles's
     "Avg pages read" which merges them - these are meant to read as "what Grimmory itself
@@ -380,7 +393,7 @@ def reading_session_tiles(sessions_with_page_counts: list[tuple[dict, Optional[i
     dated_pages = [
         (day, pages)
         for s, pc in meaningful
-        if (day := session_date(s)) is not None and (pages := _session_page_delta(s, pc))
+        if (day := session_date(s, zone)) is not None and (pages := _session_page_delta(s, pc))
     ]
     if dated_pages:
         active_months = {(day.year, day.month) for day, _ in dated_pages}
@@ -487,7 +500,7 @@ def group_stat_tiles(tiles: list[dict]) -> dict[str, list[dict]]:
     }
 
 
-def burndown_points(sessions: list[dict]) -> list[tuple[date, int]]:
+def burndown_points(sessions: list[dict], zone: Optional[ZoneInfo] = None) -> list[tuple[date, int]]:
     dated: list[tuple[datetime, date, float]] = []
     for session in sessions:
         if not _has_meaningful_progress(session):
@@ -496,7 +509,7 @@ def burndown_points(sessions: list[dict]) -> list[tuple[date, int]]:
         end_progress = session.get("endProgress")
         if started_at is None or end_progress is None:
             continue
-        dated.append((started_at, started_at.date(), end_progress))
+        dated.append((started_at, instant_to_local_date(session.get("startTime"), zone), end_progress))
     dated.sort(key=lambda t: t[0])
 
     by_date: dict[date, float] = {}

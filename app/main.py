@@ -309,11 +309,12 @@ def _shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
 
 
 def _resolve_client_today(raw: str) -> date:
-    """Parses a client-supplied "YYYY-MM-DD" local date, falling back to UTC today if missing/
-    malformed - the frontend sends the browser's own local date since the server's UTC clock lags
-    behind for timezones ahead of UTC, which would otherwise show stale calendar/stats/estimates."""
+    """Parses a client-supplied "YYYY-MM-DD" local date, falling back to the deployment's
+    TBR_TIMEZONE today if missing/malformed - the frontend sends the browser's own local date
+    since the server's clock can otherwise lag/lead a viewer's actual local day (see
+    app/dates.py:DEFAULT_ZONE), which would show stale calendar/stats/estimates."""
     parsed = dates.parse_date(raw) if raw else None
-    return parsed if parsed is not None else dates.today_utc()
+    return parsed if parsed is not None else dates.today_local()
 
 
 def _parse_calendar_month(raw: str, today: date) -> tuple[int, int]:

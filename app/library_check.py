@@ -574,9 +574,11 @@ def _apply_status(
         set_tbr_entry_status(db_connection, entry_id, "reading")
         if current_started_at is None:
             # Best-effort "whenever we synced" - only set when absent so a manual correction via
-            # POST /tbr/{id}/started is never clobbered.
+            # POST /tbr/{id}/started is never clobbered. Stores the full instant, not a bare UTC
+            # date - truncating here bakes in a UTC-day assumption that reading_calendar/stat_tiles
+            # can no longer correct for at read time (see app/dates.py:instant_to_local_date).
             set_tbr_entry_started_at(
-                db_connection, entry_id, datetime.now(timezone.utc).date().isoformat()
+                db_connection, entry_id, datetime.now(timezone.utc).isoformat()
             )
 
 # Function Name: fetch_book_cover

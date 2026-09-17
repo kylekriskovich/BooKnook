@@ -1,3 +1,5 @@
+import datetime as dt
+
 import httpx
 import pytest
 
@@ -601,6 +603,38 @@ def test_sync_all_user_reading_status_one_user_failure_does_not_block_others(con
     library_check._sync_all_user_reading_status(conn)
 
     assert synced == [ok_user.id]
+
+
+# --- _apply_status ---
+
+
+def test_apply_status_reading_fallback_stores_full_instant_not_bare_date(conn):
+    # Regression test: _apply_status used to store datetime.now(timezone.utc).date().isoformat()
+    # for the "reading" started_at fallback, permanently truncating away the time-of-day/offset -
+    # instant_to_local_date can no longer correct for the user's real timezone once that's gone.
+    book = models.create_book(conn, title="Dune", author="Frank Herbert")
+    user = models.get_or_create_user(conn, "alice")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="wanted")
+
+    library_check._apply_status(conn, entry.id, "wanted", None, "reading", {})
+
+    updated = models.get_tbr_entry(conn, entry.id)
+    assert updated.started_at is not None
+    assert "T" in updated.started_at  # a real instant, not a bare "YYYY-MM-DD"
+    parsed = dt.datetime.fromisoformat(updated.started_at.replace("Z", "+00:00"))
+    assert parsed.tzinfo is not None
+
+
+def test_apply_status_reading_fallback_never_clobbers_existing_started_at(conn):
+    book = models.create_book(conn, title="Dune", author="Frank Herbert")
+    user = models.get_or_create_user(conn, "alice")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="wanted")
+    models.set_tbr_entry_started_at(conn, entry.id, "2026-01-01T00:00:00+00:00", manual=True)
+
+    library_check._apply_status(conn, entry.id, "wanted", "2026-01-01T00:00:00+00:00", "reading", {})
+
+    updated = models.get_tbr_entry(conn, entry.id)
+    assert updated.started_at == "2026-01-01T00:00:00+00:00"
 
 
 # --- sync_user_reading_status ---
