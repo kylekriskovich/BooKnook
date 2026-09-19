@@ -882,7 +882,8 @@ def _wanted_entry(entry_id, sort_order, page_count=None):
 
 
 def test_average_pages_per_day_none_without_finished_books():
-    assert stat_tiles._average_pages_per_day([_wanted_entry(1, 0, page_count=200)]) is None
+    entries = [_wanted_entry(1, 0, page_count=200)]
+    assert stat_tiles._average_pages_per_day(entries, dt.date(2026, 3, 1)) is None
 
 
 def test_average_pages_per_day_excludes_audiobooks():
@@ -892,14 +893,25 @@ def test_average_pages_per_day_excludes_audiobooks():
     audiobook.book.format = "AUDIOBOOK"
     ebook = _finished_entry(2, "B", page_count=100, started_at="2026-02-01", finished_at="2026-02-11T00:00:00Z")
     # 100 pages / 11 days (inclusive) - the audiobook entry contributes nothing.
-    assert stat_tiles._average_pages_per_day([audiobook, ebook]) == 100 / 11
+    pace = stat_tiles._average_pages_per_day([audiobook, ebook], dt.date(2026, 3, 1))
+    assert pace == 100 / 11
 
 
 def test_average_pages_per_day_skips_entries_missing_duration_or_page_count():
     no_dates = _finished_entry(1, "A", page_count=100)
     no_pages = _finished_entry(2, "B", started_at="2026-01-01", finished_at="2026-01-05T00:00:00Z")
     valid = _finished_entry(3, "C", page_count=200, started_at="2026-01-01", finished_at="2026-01-05T00:00:00Z")
-    assert stat_tiles._average_pages_per_day([no_dates, no_pages, valid]) == 200 / 5
+    pace = stat_tiles._average_pages_per_day([no_dates, no_pages, valid], dt.date(2026, 1, 10))
+    assert pace == 200 / 5
+
+
+def test_average_pages_per_day_excludes_books_finished_more_than_3_months_ago():
+    # Same shape/pace as the "recent" entry, but finished well outside the 90-day window - must
+    # not dilute (or entirely replace) the recent-only estimate.
+    old = _finished_entry(1, "Old", page_count=1000, started_at="2025-01-01", finished_at="2025-01-11T00:00:00Z")
+    recent = _finished_entry(2, "Recent", page_count=100, started_at="2026-03-01", finished_at="2026-03-11T00:00:00Z")
+    pace = stat_tiles._average_pages_per_day([old, recent], dt.date(2026, 3, 20))
+    assert pace == 100 / 11
 
 
 def test_predicted_wanted_queue_months_empty_without_pace_data():
@@ -936,3 +948,72 @@ def test_predicted_wanted_queue_months_substitutes_average_for_missing_page_coun
     # unknown falls back to the average of known queued page counts (200) - same 2-day jump as
     # `known` itself, landing on the same day pace-wise (still within January either way).
     assert set(months) == {1, 2}
+
+
+def _reading_entry(entry_id, page_count=None, started_at=None, format=None):
+    book = Book(id=entry_id, title=f"Reading {entry_id}", author=None, isbn=None, cover_url=None, page_count=page_count, format=format)
+    return TBREntryDetail(id=entry_id, status="reading", added_at="2026-01-01", book=book, started_at=started_at)
+
+
+def test_predicted_wanted_queue_months_reading_book_head_start_pushes_into_next_month():
+    # Pace: 10 pages/day (finished: 10 pages in 1 day). Reading a 200-page book started 5 days
+    # ago, no session data - estimated read so far: 10*5=50, remaining 150 -> 15-day head start.
+    finished = _finished_entry(9, "Pace setter", page_count=10, started_at="2026-01-20", finished_at="2026-01-20T18:00:00Z")
+    reading = _reading_entry(10, page_count=200, started_at="2026-01-15")
+    queued = _wanted_entry(1, 0, page_count=10)
+    months = stat_tiles.predicted_wanted_queue_months([finished, reading, queued], dt.date(2026, 1, 20))
+    # Without the head start this would land Jan 21 ("2026-01") - the 15-day head start plus the
+    # queued book's own 1 day pushes it to Feb 5 instead.
+    assert months[1] == "2026-02"
+
+
+def test_reading_head_start_days_prefers_real_progress_over_elapsed_guess():
+    reading = _reading_entry(10, page_count=200, started_at="2026-01-15")
+    # Elapsed guess (5 days at pace 10/day): read so far 50, remaining 150 -> 15-day head start.
+    guessed = stat_tiles._reading_head_start_days([reading], 10.0, dt.date(2026, 1, 20))
+    assert guessed == 15.0
+    # Real tracked progress (90%) overrides the guess entirely: remaining 20 pages -> 2 days.
+    exact = stat_tiles._reading_head_start_days(
+        [reading], 10.0, dt.date(2026, 1, 20), progress_by_entry_id={10: 90}
+    )
+    assert exact == 2.0
+
+
+def test_predicted_wanted_queue_months_uses_real_progress_percent_over_elapsed_guess():
+    # Same reading book/pace as the elapsed-guess test above, but now with a real tracked
+    # progress (90% complete) passed in - the actual tracked progress wins over the guess.
+    finished = _finished_entry(9, "Pace setter", page_count=10, started_at="2026-01-20", finished_at="2026-01-20T18:00:00Z")
+    reading = _reading_entry(10, page_count=200, started_at="2026-01-15")
+    queued = _wanted_entry(1, 0, page_count=10)
+    months = stat_tiles.predicted_wanted_queue_months(
+        [finished, reading, queued], dt.date(2026, 1, 20), progress_by_entry_id={10: 90}
+    )
+    # 2-day head start + the queued book's own 1 day = 3 days out from Jan 20 -> Jan 23, still
+    # January (the elapsed-days guess pushes this into February - see the test above).
+    assert months[1] == "2026-01"
+
+
+def test_predicted_wanted_queue_months_reading_book_fully_read_at_pace_has_no_head_start():
+    # Started long enough ago that the pace estimate already covers the whole book - no
+    # remaining pages, so no head start (not a negative one).
+    finished = _finished_entry(9, "Pace setter", page_count=10, started_at="2026-01-20", finished_at="2026-01-20T18:00:00Z")
+    reading = _reading_entry(10, page_count=50, started_at="2025-01-01")
+    queued = _wanted_entry(1, 0, page_count=10)
+    months = stat_tiles.predicted_wanted_queue_months([finished, reading, queued], dt.date(2026, 1, 20))
+    assert months[1] == "2026-01"
+
+
+def test_predicted_wanted_queue_months_reading_book_missing_started_at_contributes_no_head_start():
+    finished = _finished_entry(9, "Pace setter", page_count=10, started_at="2026-01-20", finished_at="2026-01-20T18:00:00Z")
+    reading = _reading_entry(10, page_count=500)  # no started_at - can't estimate progress
+    queued = _wanted_entry(1, 0, page_count=10)
+    months = stat_tiles.predicted_wanted_queue_months([finished, reading, queued], dt.date(2026, 1, 20))
+    assert months[1] == "2026-01"
+
+
+def test_predicted_wanted_queue_months_ignores_audiobook_currently_reading():
+    finished = _finished_entry(9, "Pace setter", page_count=10, started_at="2026-01-20", finished_at="2026-01-20T18:00:00Z")
+    reading = _reading_entry(10, page_count=200, started_at="2026-01-15", format="AUDIOBOOK")
+    queued = _wanted_entry(1, 0, page_count=10)
+    months = stat_tiles.predicted_wanted_queue_months([finished, reading, queued], dt.date(2026, 1, 20))
+    assert months[1] == "2026-01"

@@ -70,6 +70,7 @@ from app.models import (
     set_tbr_entry_finished_at,
     set_tbr_entry_owns_physical,
     set_tbr_entry_physical_page_count,
+    set_tbr_entry_reading_progress_percent,
     set_tbr_entry_started_at,
     set_view_preference,
     set_wanted_order,
@@ -742,9 +743,16 @@ def _shelf_out(db_connection, user_id: int, status: str, today: date) -> schemas
     entries = _entries_for_shelf(all_entries, status, today.year)
     # Projected from the full entry list (pace comes from finished books) - only meaningful for
     # the wanted queue itself, so every other shelf/Home's own shelf previews stay marker-free.
-    predicted_months = (
-        stat_tiles.predicted_wanted_queue_months(all_entries, today) if status == "wanted" else {}
-    )
+    predicted_months = {}
+    if status == "wanted":
+        progress_by_entry_id = {
+            e.id: e.reading_progress_percent
+            for e in all_entries
+            if e.status == "reading" and e.reading_progress_percent is not None
+        }
+        predicted_months = stat_tiles.predicted_wanted_queue_months(
+            all_entries, today, progress_by_entry_id
+        )
     return schemas.ShelfOut(
         status=status,
         label=_shelf_label(status, today.year),
@@ -881,6 +889,10 @@ def api_book_detail(
         [sessions, physical_sessions, audiobook_sessions],
         [None, None, audiobook_fallback_percent],
     )
+    # Persisted so the wanted-queue projection (_shelf_out) can read a fast, no-extra-query
+    # reading_progress_percent column instead of re-deriving it - only as fresh as the last time
+    # this page was viewed (see models.py's tbr_entries.reading_progress_percent comment).
+    set_tbr_entry_reading_progress_percent(db_connection, entry.id, progress_percent)
     burndown = stat_tiles.burndown_points(sessions + physical_sessions + audiobook_sessions)
 
     return schemas.BookDetailOut(

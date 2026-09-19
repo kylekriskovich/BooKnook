@@ -78,7 +78,12 @@ CREATE TABLE IF NOT EXISTS books (
 -- tag, which is catalog-wide across every account — confirmed empirically), set via
 -- POST /tbr/{id}/physical. physical_page_count is this printing's own page count, separate from
 -- books.page_count; editing it reshapes past physical sessions' computed percentages, an accepted
--- tradeoff (stat_tiles.physical_session_to_grimmory_shape).
+-- tradeoff (stat_tiles.physical_session_to_grimmory_shape). reading_progress_percent is the
+-- unified high-water-mark progress (ebook sessions + physical + audiobook fallback, see
+-- main._unified_progress_and_estimated_page) — persisted only when GET /api/book/{id} computes it
+-- live, so it's a fast no-extra-query read for the wanted-queue's reading head start
+-- (stat_tiles._reading_head_start_days) but can go stale until that book's detail page is next
+-- viewed; NULL until first computed, or once an entry leaves "reading" status.
 CREATE TABLE IF NOT EXISTS tbr_entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id),
@@ -93,6 +98,7 @@ CREATE TABLE IF NOT EXISTS tbr_entries (
     audiobook_progress_percent REAL,
     owns_physical INTEGER NOT NULL DEFAULT 0,
     physical_page_count INTEGER,
+    reading_progress_percent REAL,
     UNIQUE(user_id, book_id)
 );
 
@@ -287,6 +293,7 @@ def init_db(db_connection: sqlite3.Connection) -> None:
         db_connection, "ALTER TABLE tbr_entries ADD COLUMN owns_physical INTEGER NOT NULL DEFAULT 0"
     )
     _add_column_if_missing(db_connection, "ALTER TABLE tbr_entries ADD COLUMN physical_page_count INTEGER")
+    _add_column_if_missing(db_connection, "ALTER TABLE tbr_entries ADD COLUMN reading_progress_percent REAL")
     # One-time backfill of linked_editions from audiobook_pairings (DESIGN-multi-edition-refactor.md
     # Phase 1) - INSERT OR IGNORE so re-running init_db never duplicates a row already backfilled or
     # since written directly to linked_editions by the Phase 1 dual-write.
@@ -368,6 +375,7 @@ class TBREntry:
     audiobook_progress_percent: Optional[float] = None
     owns_physical: bool = False
     physical_page_count: Optional[int] = None
+    reading_progress_percent: Optional[float] = None
 
 
 @dataclass
@@ -388,6 +396,7 @@ class TBREntryDetail:
     audiobook_progress_percent: Optional[float] = None
     owns_physical: bool = False
     physical_page_count: Optional[int] = None
+    reading_progress_percent: Optional[float] = None
 
 
 @dataclass
@@ -506,6 +515,7 @@ def _row_to_tbr_entry(row: sqlite3.Row) -> TBREntry:
         audiobook_progress_percent=row["audiobook_progress_percent"],
         owns_physical=bool(row["owns_physical"]),
         physical_page_count=row["physical_page_count"],
+        reading_progress_percent=row["reading_progress_percent"],
     )
 
 
@@ -681,6 +691,7 @@ def list_tbr_entries_with_books(db_connection: sqlite3.Connection, user_id: int)
                tbr_entries.finished_at, tbr_entries.started_at, tbr_entries.started_at_manual,
                tbr_entries.rating, tbr_entries.sort_order, tbr_entries.audiobook_progress_percent,
                tbr_entries.owns_physical, tbr_entries.physical_page_count,
+               tbr_entries.reading_progress_percent,
                books.id AS book_id, books.title, books.author, books.isbn, books.cover_url,
                books.published_date, books.page_count, books.grimmory_book_id, books.cover_color,
                books.manual_match_grimmory_id, books.format
@@ -704,6 +715,7 @@ def list_tbr_entries_with_books(db_connection: sqlite3.Connection, user_id: int)
             audiobook_progress_percent=row["audiobook_progress_percent"],
             owns_physical=bool(row["owns_physical"]),
             physical_page_count=row["physical_page_count"],
+            reading_progress_percent=row["reading_progress_percent"],
             book=_row_to_book(row, id_column="book_id"),
         )
         for row in rows
@@ -873,6 +885,15 @@ def set_tbr_entry_audiobook_progress_percent(
 ) -> None:
     db_connection.execute(
         "UPDATE tbr_entries SET audiobook_progress_percent = ? WHERE id = ?", (percent, entry_id)
+    )
+    db_connection.commit()
+
+
+def set_tbr_entry_reading_progress_percent(
+    db_connection: sqlite3.Connection, entry_id: int, percent: Optional[float]
+) -> None:
+    db_connection.execute(
+        "UPDATE tbr_entries SET reading_progress_percent = ? WHERE id = ?", (percent, entry_id)
     )
     db_connection.commit()
 

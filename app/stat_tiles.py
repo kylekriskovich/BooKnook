@@ -259,14 +259,26 @@ def build_book_tiles(
     return tiles
 
 
-def _average_pages_per_day(entries: list, zone: Optional[ZoneInfo] = None) -> Optional[float]:
-    """User's own historical reading pace across every finished book with a computable duration
-    (see _entry_duration_days) - audiobooks are excluded, since page_count isn't a meaningful
-    measure of their reading time. None if there's nothing to average yet."""
+# Recency window for _average_pages_per_day - long enough to smooth over a slow week, short
+# enough that a pace change (new job, holiday binge-reading) shows up within a season rather than
+# being diluted by a whole reading history.
+RECENT_PACE_WINDOW_DAYS = 90
+
+
+def _average_pages_per_day(entries: list, today: date, zone: Optional[ZoneInfo] = None) -> Optional[float]:
+    """User's own recent reading pace: total pages / total days across finished books that were
+    themselves finished within the last RECENT_PACE_WINDOW_DAYS (see _entry_duration_days for the
+    per-book day count) - keeps the estimate responsive to a changed habit instead of diluted by,
+    e.g., a fast read from a year ago. Audiobooks are excluded, since page_count isn't a
+    meaningful measure of their reading time. None if there's nothing recent to average."""
+    cutoff = today - timedelta(days=RECENT_PACE_WINDOW_DAYS)
     total_pages = 0
     total_days = 0
     for entry in entries:
         if entry.book.format == "AUDIOBOOK" or not entry.book.page_count:
+            continue
+        finished_date = instant_to_local_date(entry.finished_at, zone)
+        if finished_date is None or finished_date < cutoff:
             continue
         days = _entry_duration_days(entry, zone)
         if days is None:
@@ -276,14 +288,52 @@ def _average_pages_per_day(entries: list, zone: Optional[ZoneInfo] = None) -> Op
     return total_pages / total_days if total_days > 0 else None
 
 
+def _reading_head_start_days(
+    entries: list,
+    pace: float,
+    today: date,
+    progress_by_entry_id: Optional[dict[int, float]] = None,
+    zone: Optional[ZoneInfo] = None,
+) -> float:
+    """Estimated days before the wanted queue can start: sum, across every currently-`reading`
+    book, of its own estimated remaining pages (floored at 0) / pace. Remaining pages come from a
+    real tracked percent-complete when the caller has one (progress_by_entry_id - see
+    app/main.py's cheap, local-only cached-session lookup, no live Grimmory fetch), which needs no
+    guessing; otherwise falls back to page_count - pace * days elapsed since started_at. A book
+    missing page_count (and, on the fallback path, started_at), or an audiobook, contributes 0
+    rather than blocking the whole estimate - the queue then simply starts as if that one book
+    weren't in progress."""
+    progress_by_entry_id = progress_by_entry_id or {}
+    head_start = 0.0
+    for entry in entries:
+        if entry.status != "reading" or entry.book.format == "AUDIOBOOK" or not entry.book.page_count:
+            continue
+        percent = progress_by_entry_id.get(entry.id)
+        if percent is not None:
+            pages_read = entry.book.page_count * percent / 100
+        else:
+            started = instant_to_local_date(entry.started_at, zone)
+            if started is None:
+                continue
+            days_elapsed = max(0, (today - started).days)
+            pages_read = min(entry.book.page_count, pace * days_elapsed)
+        remaining_pages = max(0.0, entry.book.page_count - pages_read)
+        head_start += remaining_pages / pace
+    return head_start
+
+
 def predicted_wanted_queue_months(
-    entries: list, today: date, zone: Optional[ZoneInfo] = None
+    entries: list,
+    today: date,
+    progress_by_entry_id: Optional[dict[int, float]] = None,
+    zone: Optional[ZoneInfo] = None,
 ) -> dict[int, str]:
     """Predicted "YYYY-MM" each "wanted"-status entry will be reached, walked in the user's manual
-    queue order (sort_order) and projected via cumulative page_count / _average_pages_per_day.
+    queue order (sort_order) and projected via cumulative page_count / _average_pages_per_day,
+    starting after a head start for whatever's already `reading` (_reading_head_start_days).
     Entries missing a page_count fall back to the average of the other queued books' known counts.
-    Empty dict (no predictions) if there's no pace data yet to project from."""
-    pace = _average_pages_per_day(entries, zone)
+    Empty dict (no predictions) if there's no recent pace data yet to project from."""
+    pace = _average_pages_per_day(entries, today, zone)
     if not pace:
         return {}
     wanted = sorted((e for e in entries if e.status == "wanted"), key=lambda e: e.sort_order)
@@ -292,7 +342,7 @@ def predicted_wanted_queue_months(
         return {}
     avg_page_count = round(sum(known_page_counts) / len(known_page_counts))
     months: dict[int, str] = {}
-    cumulative_days = 0.0
+    cumulative_days = _reading_head_start_days(entries, pace, today, progress_by_entry_id, zone)
     for entry in wanted:
         cumulative_days += (entry.book.page_count or avg_page_count) / pace
         reached = today + timedelta(days=round(cumulative_days))

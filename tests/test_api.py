@@ -316,6 +316,53 @@ def test_api_shelf_wanted_includes_predicted_month_from_reading_pace(client):
     assert body["entries"][0]["predicted_month"] == "2026-01"
 
 
+def test_api_shelf_wanted_predicted_month_uses_book_detail_progress_not_elapsed_guess(client, monkeypatch):
+    # reading_progress_percent is only ever written by GET /api/book/{id} (see
+    # main.api_book_detail), so this needs a real login (for a cached access token) rather than
+    # _logged_in_client's cookie-only shortcut.
+    monkeypatch.setattr(
+        grimmory_auth, "login", lambda username, password: ("fresh-access", "fake-refresh", 7200)
+    )
+    user_id = client.post("/api/login", json={"username": "Alice", "password": "hunter2"}).json()["id"]
+
+    conn = models.get_connection()
+    # Pace-setting finished book: 10 pages in 1 day -> 10 pages/day.
+    pace_book = models.create_book(conn, title="Pace Setter")
+    models.set_book_page_count(conn, pace_book.id, 10)
+    pace_entry = models.add_tbr_entry(conn, user_id, pace_book.id)
+    models.set_tbr_entry_started_at(conn, pace_entry.id, "2026-01-20")
+    models.set_tbr_entry_status(conn, pace_entry.id, "finished", "2026-01-20T18:00:00Z")
+
+    # Currently reading, started 5 days ago - the elapsed-days guess (10/day * 5 = 50 read, 150
+    # remaining) would push the queue into February. Its real tracked progress (90%, only 20 pages
+    # left) must win once its book-detail page has computed and persisted it.
+    reading_book = models.create_book(conn, title="In Progress")
+    models.set_book_page_count(conn, reading_book.id, 200)
+    models.set_book_grimmory_id(conn, reading_book.id, 42)
+    reading_entry = models.add_tbr_entry(conn, user_id, reading_book.id, status="reading")
+    models.set_tbr_entry_started_at(conn, reading_entry.id, "2026-01-15")
+
+    queued_book = models.create_book(conn, title="Next Up")
+    models.set_book_page_count(conn, queued_book.id, 10)
+    models.add_tbr_entry(conn, user_id, queued_book.id, status="wanted")
+    conn.close()
+
+    monkeypatch.setattr(
+        library_check,
+        "fetch_reading_sessions_for_book",
+        lambda *a, **k: [{"startTime": "2026-01-19T00:00:00Z", "endProgress": 90.0}],
+    )
+    detail = client.get(f"/api/book/{reading_entry.id}", params={"today": "2026-01-20"})
+    assert detail.status_code == 200
+    assert detail.json()["progress_percent"] == 90.0
+
+    response = client.get("/api/shelf/wanted", params={"today": "2026-01-20"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["entries"][0]["predicted_month"] == "2026-01"
+
+
 def test_api_shelf_wanted_predicted_month_is_none_without_finished_book_history(client):
     user = _logged_in_client(client)
     conn = models.get_connection()
