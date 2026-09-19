@@ -29,12 +29,17 @@
 	let searchError = $state<string | null>(null);
 
 	let searchTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+	// Bumped on every new search and on each target switch; a resolving request only applies its
+	// results if it's still the most recent one issued (issue #14) - otherwise a slow response for
+	// an old query/target can land after a newer one and overwrite what's currently showing.
+	let searchGeneration = 0;
 
 	// Reset each time a different row is targeted; prefillQuery (if given) also runs a search.
 	// Uses a local `initial` rather than reading `query` back, so typing (which also writes
 	// `query` via bind:value) doesn't retrigger this effect and stomp what was just typed.
 	$effect(() => {
 		void targetId;
+		searchGeneration++;
 		const initial = prefillQuery ?? '';
 		query = initial;
 		results = [];
@@ -51,6 +56,7 @@
 
 	async function search(q: string) {
 		q = q.trim();
+		const generation = ++searchGeneration;
 		if (!q) {
 			results = [];
 			hasSearched = false;
@@ -63,13 +69,15 @@
 					params: { query: { q, exclude_audiobooks: true } }
 				})
 			);
+			if (generation !== searchGeneration) return;
 			results = data.results;
 			searchError = null;
 		} catch (err) {
+			if (generation !== searchGeneration) return;
 			results = [];
 			searchError = describeError(err);
 		} finally {
-			hasSearched = true;
+			if (generation === searchGeneration) hasSearched = true;
 		}
 	}
 
