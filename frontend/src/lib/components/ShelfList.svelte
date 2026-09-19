@@ -29,8 +29,34 @@
 
 	function handleFinalize(event: CustomEvent<{ items: typeof entries }>) {
 		entries = event.detail.items;
-		persistWantedOrder(entries.map((e) => e.id));
+		// Reconciles with the server's response rather than fire-and-forget, since predicted_month
+		// (see monthMarkers below) depends on order and must be refreshed post-drop.
+		persistWantedOrder(entries.map((e) => e.id)).then((fresh) => {
+			entries = fresh;
+		});
 	}
+
+	function monthLabel(yyyyMm: string): string {
+		const [year, month] = yyyyMm.split('-').map(Number);
+		return new Date(year, month - 1, 1).toLocaleDateString('en-US', { month: 'short' }).toUpperCase();
+	}
+
+	// Marks the last book still within a given projected month before the queue crosses into the
+	// next one - null entries (no pace data yet) never trigger a marker (see stat_tiles
+	// predicted_wanted_queue_months's server-side "hide entirely" behavior). Hidden entirely while
+	// reordering, since dragging changes order live but predicted_month only updates once the
+	// drop's persistWantedOrder response reconciles entries (handleFinalize above) - showing stale
+	// predictions mid-drag would be misleading.
+	const monthMarkers = $derived(
+		status === 'wanted' && !editing
+			? entries.map((entry, i) => {
+					const previous = i > 0 ? entries[i - 1].predicted_month : null;
+					return entry.predicted_month && entry.predicted_month !== previous
+						? monthLabel(entry.predicted_month)
+						: null;
+				})
+			: []
+	);
 </script>
 
 <section id="shelf-list">
@@ -73,8 +99,16 @@
 				onconsider={handleConsider}
 				onfinalize={handleFinalize}
 			>
-				{#each entries as entry (entry.id)}
-					<CoverBook {entry} />
+				{#each entries as entry, i (entry.id)}
+					<div class="cover-book-cell">
+						<CoverBook {entry} />
+						{#if monthMarkers[i]}
+							<div class="month-marker">
+								<span class="month-marker-bar"></span>
+								<span class="month-marker-label">{monthMarkers[i]}</span>
+							</div>
+						{/if}
+					</div>
 				{/each}
 			</div>
 		{:else}

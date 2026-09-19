@@ -302,6 +302,30 @@ main {
   margin-top: 3px;
 }
 
+.cover-book-cell {
+  display: flex;
+  flex-direction: column;
+}
+
+.month-marker {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+}
+
+.month-marker-bar {
+  flex: 1;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.month-marker-label {
+  font: 700 10px/1 var(--mono);
+  color: var(--accent);
+}
+
 .iconbtn {
   flex: none;
   width: 38px;

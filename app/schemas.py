@@ -46,6 +46,7 @@ class TBREntryOut(BaseModel):
     rating: Optional[int] = None
     owns_physical: bool = False
     physical_page_count: Optional[int] = None
+    predicted_month: Optional[str] = None
 
 
 class PhysicalReadingSessionOut(BaseModel):

@@ -293,6 +293,66 @@ def test_api_shelf_finished_uses_client_today_not_server_utc(client, monkeypatch
     assert [e["book"]["title"] for e in body["entries"]] == ["Dune"]
 
 
+def test_api_shelf_wanted_includes_predicted_month_from_reading_pace(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    # Pace-setting finished book: 100 pages in 1 day -> 100 pages/day.
+    pace_book = models.create_book(conn, title="Pace Setter")
+    models.set_book_page_count(conn, pace_book.id, 100)
+    pace_entry = models.add_tbr_entry(conn, user.id, pace_book.id)
+    models.set_tbr_entry_started_at(conn, pace_entry.id, "2026-01-01")
+    models.set_tbr_entry_status(conn, pace_entry.id, "finished", "2026-01-01T18:00:00Z")
+
+    queued_book = models.create_book(conn, title="Next Up")
+    models.set_book_page_count(conn, queued_book.id, 300)
+    models.add_tbr_entry(conn, user.id, queued_book.id, status="wanted")
+    conn.close()
+
+    response = client.get("/api/shelf/wanted", params={"today": "2026-01-01"})
+
+    assert response.status_code == 200
+    body = response.json()
+    # 300 pages / 100 pages-per-day = 3 days out from Jan 1, still within January.
+    assert body["entries"][0]["predicted_month"] == "2026-01"
+
+
+def test_api_shelf_wanted_predicted_month_is_none_without_finished_book_history(client):
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    book = models.create_book(conn, title="Next Up")
+    models.add_tbr_entry(conn, user.id, book.id, status="wanted")
+    conn.close()
+
+    response = client.get("/api/shelf/wanted", params={"today": "2026-01-01"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["entries"][0]["predicted_month"] is None
+
+
+def test_api_home_wanted_shelf_omits_predicted_month(client):
+    # predicted_month is only ever computed for GET /api/shelf/wanted, not the Home page's shelf
+    # previews - confirms _to_entry_out's default keeps Home's wanted preview marker-free.
+    user = _logged_in_client(client)
+    conn = models.get_connection()
+    pace_book = models.create_book(conn, title="Pace Setter")
+    models.set_book_page_count(conn, pace_book.id, 100)
+    pace_entry = models.add_tbr_entry(conn, user.id, pace_book.id)
+    models.set_tbr_entry_started_at(conn, pace_entry.id, "2026-01-01")
+    models.set_tbr_entry_status(conn, pace_entry.id, "finished", "2026-01-01T18:00:00Z")
+
+    queued_book = models.create_book(conn, title="Next Up")
+    models.set_book_page_count(conn, queued_book.id, 300)
+    models.add_tbr_entry(conn, user.id, queued_book.id, status="wanted")
+    conn.close()
+
+    response = client.get("/api/home", params={"today": "2026-01-01"})
+
+    assert response.status_code == 200
+    shelves = {shelf["status"]: shelf for shelf in response.json()["shelves"]}
+    assert shelves["wanted"]["entries"][0]["predicted_month"] is None
+
+
 # --- onboarding ---
 
 

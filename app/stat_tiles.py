@@ -259,6 +259,47 @@ def build_book_tiles(
     return tiles
 
 
+def _average_pages_per_day(entries: list, zone: Optional[ZoneInfo] = None) -> Optional[float]:
+    """User's own historical reading pace across every finished book with a computable duration
+    (see _entry_duration_days) - audiobooks are excluded, since page_count isn't a meaningful
+    measure of their reading time. None if there's nothing to average yet."""
+    total_pages = 0
+    total_days = 0
+    for entry in entries:
+        if entry.book.format == "AUDIOBOOK" or not entry.book.page_count:
+            continue
+        days = _entry_duration_days(entry, zone)
+        if days is None:
+            continue
+        total_pages += entry.book.page_count
+        total_days += days
+    return total_pages / total_days if total_days > 0 else None
+
+
+def predicted_wanted_queue_months(
+    entries: list, today: date, zone: Optional[ZoneInfo] = None
+) -> dict[int, str]:
+    """Predicted "YYYY-MM" each "wanted"-status entry will be reached, walked in the user's manual
+    queue order (sort_order) and projected via cumulative page_count / _average_pages_per_day.
+    Entries missing a page_count fall back to the average of the other queued books' known counts.
+    Empty dict (no predictions) if there's no pace data yet to project from."""
+    pace = _average_pages_per_day(entries, zone)
+    if not pace:
+        return {}
+    wanted = sorted((e for e in entries if e.status == "wanted"), key=lambda e: e.sort_order)
+    known_page_counts = [e.book.page_count for e in wanted if e.book.page_count]
+    if not known_page_counts:
+        return {}
+    avg_page_count = round(sum(known_page_counts) / len(known_page_counts))
+    months: dict[int, str] = {}
+    cumulative_days = 0.0
+    for entry in wanted:
+        cumulative_days += (entry.book.page_count or avg_page_count) / pace
+        reached = today + timedelta(days=round(cumulative_days))
+        months[entry.id] = f"{reached.year:04d}-{reached.month:02d}"
+    return months
+
+
 def finish_time_tiles_for_collection(entries: list, zone: Optional[ZoneInfo] = None) -> list[dict]:
     """Avg/Fastest/Slowest finish time across many finished entries - entries missing a
     computable duration (see _entry_duration_days) are skipped, not estimated."""

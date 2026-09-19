@@ -566,7 +566,7 @@ def _to_book_out(book) -> schemas.BookOut:
     )
 
 
-def _to_entry_out(entry) -> schemas.TBREntryOut:
+def _to_entry_out(entry, predicted_month: Optional[str] = None) -> schemas.TBREntryOut:
     return schemas.TBREntryOut(
         id=entry.id,
         status=entry.status,
@@ -580,6 +580,7 @@ def _to_entry_out(entry) -> schemas.TBREntryOut:
         rating=entry.rating,
         owns_physical=entry.owns_physical,
         physical_page_count=entry.physical_page_count,
+        predicted_month=predicted_month,
     )
 
 
@@ -736,10 +737,18 @@ def api_home(
     )
 
 
-def _shelf_out(db_connection, user_id: int, status: str, year: int) -> schemas.ShelfOut:
-    entries = _entries_for_shelf(_tbr_entries_for_user(db_connection, user_id), status, year)
+def _shelf_out(db_connection, user_id: int, status: str, today: date) -> schemas.ShelfOut:
+    all_entries = _tbr_entries_for_user(db_connection, user_id)
+    entries = _entries_for_shelf(all_entries, status, today.year)
+    # Projected from the full entry list (pace comes from finished books) - only meaningful for
+    # the wanted queue itself, so every other shelf/Home's own shelf previews stay marker-free.
+    predicted_months = (
+        stat_tiles.predicted_wanted_queue_months(all_entries, today) if status == "wanted" else {}
+    )
     return schemas.ShelfOut(
-        status=status, label=_shelf_label(status, year), entries=[_to_entry_out(e) for e in entries]
+        status=status,
+        label=_shelf_label(status, today.year),
+        entries=[_to_entry_out(e, predicted_months.get(e.id)) for e in entries],
     )
 
 
@@ -752,7 +761,7 @@ def api_shelf(
 ):
     if status not in SHELF_STATUSES:
         raise HTTPException(status_code=404, detail="Unknown shelf")
-    return _shelf_out(db_connection, user.id, status, _resolve_client_today(today).year)
+    return _shelf_out(db_connection, user.id, status, _resolve_client_today(today))
 
 
 @app.post("/api/shelf/wanted/reorder", response_model=schemas.ShelfOut)
@@ -762,8 +771,7 @@ def api_reorder_wanted_shelf(
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
     set_wanted_order(db_connection, user.id, payload.entry_ids)
-    # year is inert for the "wanted" shelf.
-    return _shelf_out(db_connection, user.id, "wanted", datetime.now(timezone.utc).year)
+    return _shelf_out(db_connection, user.id, "wanted", dates.today_local())
 
 
 @app.post("/api/onboarding", response_model=schemas.MeOut)

@@ -1294,6 +1294,8 @@ export interface components {
             owns_physical: boolean;
             /** Physical Page Count */
             physical_page_count?: number | null;
+            /** Predicted Month */
+            predicted_month?: string | null;
         };
         /** TBRPhysicalIn */
         TBRPhysicalIn: {

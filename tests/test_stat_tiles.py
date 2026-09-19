@@ -871,3 +871,68 @@ def test_group_stat_tiles_covers_every_label_every_builder_can_produce():
     }
     grouped_labels = {label for labels in stat_tiles.STAT_TILE_GROUPS.values() for label in labels}
     assert reading_labels | listening_labels | physical_labels | collection_labels == grouped_labels
+
+
+# --- _average_pages_per_day / predicted_wanted_queue_months ---
+
+
+def _wanted_entry(entry_id, sort_order, page_count=None):
+    book = Book(id=entry_id, title=f"Book {entry_id}", author=None, isbn=None, cover_url=None, page_count=page_count)
+    return TBREntryDetail(id=entry_id, status="wanted", added_at="2026-01-01", book=book, sort_order=sort_order)
+
+
+def test_average_pages_per_day_none_without_finished_books():
+    assert stat_tiles._average_pages_per_day([_wanted_entry(1, 0, page_count=200)]) is None
+
+
+def test_average_pages_per_day_excludes_audiobooks():
+    # Same page_count/duration as a real finished ebook below, but format=AUDIOBOOK - page_count
+    # isn't a meaningful reading-time measure for audiobooks, so it must not skew the pace.
+    audiobook = _finished_entry(1, "A", page_count=1000, started_at="2026-01-01", finished_at="2026-01-11T00:00:00Z")
+    audiobook.book.format = "AUDIOBOOK"
+    ebook = _finished_entry(2, "B", page_count=100, started_at="2026-02-01", finished_at="2026-02-11T00:00:00Z")
+    # 100 pages / 11 days (inclusive) - the audiobook entry contributes nothing.
+    assert stat_tiles._average_pages_per_day([audiobook, ebook]) == 100 / 11
+
+
+def test_average_pages_per_day_skips_entries_missing_duration_or_page_count():
+    no_dates = _finished_entry(1, "A", page_count=100)
+    no_pages = _finished_entry(2, "B", started_at="2026-01-01", finished_at="2026-01-05T00:00:00Z")
+    valid = _finished_entry(3, "C", page_count=200, started_at="2026-01-01", finished_at="2026-01-05T00:00:00Z")
+    assert stat_tiles._average_pages_per_day([no_dates, no_pages, valid]) == 200 / 5
+
+
+def test_predicted_wanted_queue_months_empty_without_pace_data():
+    entries = [_wanted_entry(1, 0, page_count=200)]
+    assert stat_tiles.predicted_wanted_queue_months(entries, dt.date(2026, 1, 1)) == {}
+
+
+def test_predicted_wanted_queue_months_walks_sort_order_by_cumulative_pages():
+    # Pace: 100 pages/day. Queue (in sort_order, not id, order): book 2 (100p) then book 1 (200p).
+    finished = _finished_entry(9, "Pace setter", page_count=100, started_at="2026-01-01", finished_at="2026-01-01T18:00:00Z")
+    first = _wanted_entry(1, sort_order=1, page_count=200)
+    second = _wanted_entry(2, sort_order=0, page_count=100)
+    months = stat_tiles.predicted_wanted_queue_months([finished, first, second], dt.date(2026, 1, 1))
+    # second (sort_order 0): 100/100 = 1 day out -> Jan 2. first (sort_order 1): +200/100 = 2 more
+    # days -> Jan 4. Both land in January.
+    assert months == {2: "2026-01", 1: "2026-01"}
+
+
+def test_predicted_wanted_queue_months_crosses_a_month_boundary():
+    finished = _finished_entry(9, "Pace setter", page_count=10, started_at="2026-01-01", finished_at="2026-01-01T18:00:00Z")
+    # Pace: 10 pages/day. A 300-page book takes 30 days from Jan 1 -> Jan 31 (still January); a
+    # second identical book pushes another 30 days to Mar 2 (crossing into March).
+    entries = [finished, _wanted_entry(1, 0, page_count=300), _wanted_entry(2, 1, page_count=300)]
+    months = stat_tiles.predicted_wanted_queue_months(entries, dt.date(2026, 1, 1))
+    assert months[1] == "2026-01"
+    assert months[2] == "2026-03"
+
+
+def test_predicted_wanted_queue_months_substitutes_average_for_missing_page_count():
+    finished = _finished_entry(9, "Pace setter", page_count=100, started_at="2026-01-01", finished_at="2026-01-01T18:00:00Z")
+    known = _wanted_entry(1, 0, page_count=200)
+    unknown = _wanted_entry(2, 1, page_count=None)
+    months = stat_tiles.predicted_wanted_queue_months([finished, known, unknown], dt.date(2026, 1, 1))
+    # unknown falls back to the average of known queued page counts (200) - same 2-day jump as
+    # `known` itself, landing on the same day pace-wise (still within January either way).
+    assert set(months) == {1, 2}
