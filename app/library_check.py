@@ -803,9 +803,42 @@ def download_cover_for_book_now(book_id: int, grimmory_book_id: int) -> None:
     finally:
         db_connection.close()
 
+# Function Name: _ensure_shelf
+# Description: Resolves a user's shelf id, lazily get-or-creating it in Grimmory by name the first
+#   time and persisting it thereafter. Shared by _ensure_want_to_read_shelf and
+#   _ensure_sync_to_device_shelf (issue #19), which differ only in which shelf-id field/default
+#   name/setter they use.
+# Parameters:
+# - db_connection: Database connection.
+# - user (User): The user whose shelf id to resolve.
+# - base_url (str): Grimmory base URL.
+# - access_token (str): The user's own access token.
+# - current_id (Optional[int]): The already-resolved shelf id, if any (short-circuits if set).
+# - default_name (str): Shelf name to get-or-create when not yet resolved.
+# - setter (Callable[[db_connection, int, int], None]): Persists the resolved shelf id for user.id.
+# Returns: Grimmory shelf id (int)
+def _ensure_shelf(
+    db_connection,
+    user,
+    base_url: str,
+    access_token: str,
+    *,
+    current_id: Optional[int],
+    default_name: str,
+    setter,
+) -> int:
+    if current_id is not None:
+        return current_id
+    from app import grimmory_auth  # local import: grimmory_auth imports LOGIN_PATH from this
+
+    own_id = grimmory_auth.get_own_grimmory_user_id(base_url, access_token)
+    shelf_id = get_or_create_shelf_by_name(base_url, access_token, own_id, default_name)
+    setter(db_connection, user.id, shelf_id)
+    return shelf_id
+
 # Function Name: _ensure_want_to_read_shelf
-# Description: Resolves this user's Want to Read shelf id, lazily get-or-creating it in Grimmory
-#   by name the first time (see DEFAULT_WANT_TO_READ_SHELF_NAME) and persisting it thereafter.
+# Description: Resolves this user's Want to Read shelf id (see _ensure_shelf), mutating user in
+#   place on first resolution.
 # Parameters:
 # - db_connection: Database connection.
 # - user (User): The user whose shelf id to resolve (mutated in place on first resolution).
@@ -813,21 +846,21 @@ def download_cover_for_book_now(book_id: int, grimmory_book_id: int) -> None:
 # - access_token (str): The user's own access token.
 # Returns: Grimmory shelf id (int)
 def _ensure_want_to_read_shelf(db_connection, user, base_url: str, access_token: str) -> int:
-    if user.want_to_read_shelf_id is not None:
-        return user.want_to_read_shelf_id
-    from app import grimmory_auth  # local import: grimmory_auth imports LOGIN_PATH from this
-
-    own_id = grimmory_auth.get_own_grimmory_user_id(base_url, access_token)
-    shelf_id = get_or_create_shelf_by_name(
-        base_url, access_token, own_id, DEFAULT_WANT_TO_READ_SHELF_NAME
+    shelf_id = _ensure_shelf(
+        db_connection,
+        user,
+        base_url,
+        access_token,
+        current_id=user.want_to_read_shelf_id,
+        default_name=DEFAULT_WANT_TO_READ_SHELF_NAME,
+        setter=set_want_to_read_shelf_id,
     )
-    set_want_to_read_shelf_id(db_connection, user.id, shelf_id)
     user.want_to_read_shelf_id = shelf_id
     return shelf_id
 
 # Function Name: _ensure_sync_to_device_shelf
-# Description: Resolves this user's Sync to Device shelf id, lazily get-or-creating it in Grimmory
-#   by name the first time (see DEFAULT_SYNC_TO_DEVICE_SHELF_NAME) and persisting it thereafter.
+# Description: Resolves this user's Sync to Device shelf id (see _ensure_shelf), mutating user in
+#   place on first resolution.
 # Parameters:
 # - db_connection: Database connection.
 # - user (User): The user whose shelf id to resolve (mutated in place on first resolution).
@@ -835,15 +868,15 @@ def _ensure_want_to_read_shelf(db_connection, user, base_url: str, access_token:
 # - access_token (str): The user's own access token.
 # Returns: Grimmory shelf id (int)
 def _ensure_sync_to_device_shelf(db_connection, user, base_url: str, access_token: str) -> int:
-    if user.sync_to_device_shelf_id is not None:
-        return user.sync_to_device_shelf_id
-    from app import grimmory_auth  # local import: grimmory_auth imports LOGIN_PATH from this
-
-    own_id = grimmory_auth.get_own_grimmory_user_id(base_url, access_token)
-    shelf_id = get_or_create_shelf_by_name(
-        base_url, access_token, own_id, DEFAULT_SYNC_TO_DEVICE_SHELF_NAME
+    shelf_id = _ensure_shelf(
+        db_connection,
+        user,
+        base_url,
+        access_token,
+        current_id=user.sync_to_device_shelf_id,
+        default_name=DEFAULT_SYNC_TO_DEVICE_SHELF_NAME,
+        setter=set_sync_to_device_shelf_id,
     )
-    set_sync_to_device_shelf_id(db_connection, user.id, shelf_id)
     user.sync_to_device_shelf_id = shelf_id
     return shelf_id
 

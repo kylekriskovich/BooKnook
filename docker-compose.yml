@@ -24,6 +24,10 @@ services:
       - TBR_ADMIN_USERNAME=${TBR_ADMIN_USERNAME}
       # Log level, including every Grimmory API call/response (see app/grimmory_http.py).
       - TBR_LOG_LEVEL=${TBR_LOG_LEVEL:-INFO}
+      # IANA timezone for bucketing Grimmory instants into calendar days (see .env.example and
+      # app/dates.py:DEFAULT_ZONE) — resolved once at process start, so a plain container restart
+      # won't pick up a change to this, only a recreate (docker compose up -d).
+      - TBR_TIMEZONE=${TBR_TIMEZONE:-UTC}
     volumes:
       - booknook-data:/data
 
