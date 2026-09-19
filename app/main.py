@@ -1140,20 +1140,37 @@ def api_settings_spice(
 # --- search ---
 
 
+def _library_search_results(
+    db_connection: sqlite3.Connection,
+    query: str,
+    *,
+    exclude_audiobooks: bool = False,
+    exclude_paired_ebooks: bool = False,
+) -> schemas.SearchOut:
+    # Shared by api_search_library and api_admin_library_search (issue #16), which need different
+    # Depends() (household login vs. reverse-proxy-gated admin) but otherwise shape results
+    # identically.
+    catalog_matches = search_library_catalog(db_connection, query)
+    if exclude_audiobooks:
+        catalog_matches = [entry for entry in catalog_matches if entry.format != "AUDIOBOOK"]
+    if exclude_paired_ebooks:
+        already_paired_ebook_ids = set(get_audiobook_pairings(db_connection).values())
+        catalog_matches = [
+            entry for entry in catalog_matches if entry.grimmory_id not in already_paired_ebook_ids
+        ]
+    return schemas.SearchOut(query=query, results=_catalog_matches_to_search_results(catalog_matches))
+
+
 @app.get("/api/search/library", response_model=schemas.SearchOut)
 def api_search_library(
     q: str = "",
     user: User = Depends(require_user),
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
-    query = q.strip()
     # Audiobooks are never a valid search-to-add result for a regular user - only the paired ebook
     # (if any) is listable/searchable in BooKnook. See find_catalog_match's own audiobook guard for
     # the parallel rule on the owned-check side.
-    catalog_matches = [
-        entry for entry in search_library_catalog(db_connection, query) if entry.format != "AUDIOBOOK"
-    ]
-    return schemas.SearchOut(query=query, results=_catalog_matches_to_search_results(catalog_matches))
+    return _library_search_results(db_connection, q.strip(), exclude_audiobooks=True)
 
 
 @app.get("/api/search", response_model=schemas.SearchOut)
@@ -1644,16 +1661,12 @@ def api_admin_library_search(
 ):
     # Ungated sibling of GET /api/search/library, for an admin not logged into the app itself.
     # exclude_audiobooks (used by the pairing picker) also excludes ebooks already paired.
-    query = q.strip()
-    catalog_matches = search_library_catalog(db_connection, query)
-    if exclude_audiobooks:
-        already_paired_ebook_ids = set(get_audiobook_pairings(db_connection).values())
-        catalog_matches = [
-            entry
-            for entry in catalog_matches
-            if entry.format != "AUDIOBOOK" and entry.grimmory_id not in already_paired_ebook_ids
-        ]
-    return schemas.SearchOut(query=query, results=_catalog_matches_to_search_results(catalog_matches))
+    return _library_search_results(
+        db_connection,
+        q.strip(),
+        exclude_audiobooks=exclude_audiobooks,
+        exclude_paired_ebooks=exclude_audiobooks,
+    )
 
 
 @app.post("/api/admin/books/{book_id}/match", status_code=204)
