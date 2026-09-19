@@ -616,6 +616,24 @@ def list_books(db_connection: sqlite3.Connection) -> list[Book]:
     return [_row_to_book(r) for r in rows]
 
 
+def find_book_id_claiming_grimmory_id(
+    db_connection: sqlite3.Connection, grimmory_id: int, exclude_book_id: Optional[int] = None
+) -> Optional[int]:
+    # Indexed WHERE query in place of a full-table Python scan (issue #17). A book's claim is its
+    # manual pin if set, else its auto-matched grimmory_book_id - mirrors find_owning_book_id's
+    # old per-row logic.
+    row = db_connection.execute(
+        """
+        SELECT id FROM books
+        WHERE (manual_match_grimmory_id = ? OR (manual_match_grimmory_id IS NULL AND grimmory_book_id = ?))
+          AND (? IS NULL OR id != ?)
+        LIMIT 1
+        """,
+        (grimmory_id, grimmory_id, exclude_book_id, exclude_book_id),
+    ).fetchone()
+    return row["id"] if row else None
+
+
 def create_book(
     db_connection: sqlite3.Connection,
     title: str,

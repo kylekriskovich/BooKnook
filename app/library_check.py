@@ -17,6 +17,7 @@ from app.models import (
     add_tbr_entry,
     covers_dir,
     create_book,
+    find_book_id_claiming_grimmory_id,
     get_audiobook_pairings,
     get_connection,
     get_library_settings,
@@ -329,17 +330,10 @@ def resolve_catalog_match(book: Book, catalog: list[LibraryCatalogEntry]) -> Opt
 def find_owning_book_id(
     db_connection, grimmory_id: int, exclude_book_id: Optional[int] = None
 ) -> Optional[int]:
-    # Compares against each book's own persisted claim (manual pin, else grimmory_book_id) - the
-    # source of truth, rather than a possibly-stale freshly-loaded catalog list.
-    for book in list_books(db_connection):
-        if book.id == exclude_book_id:
-            continue
-        claimed_id = book.manual_match_grimmory_id
-        if claimed_id is None:
-            claimed_id = book.grimmory_book_id
-        if claimed_id == grimmory_id:
-            return book.id
-    return None
+    # Indexed WHERE query (models.find_book_id_claiming_grimmory_id) rather than a full-table scan
+    # (issue #17) - the source of truth is each book's own persisted claim (manual pin, else
+    # grimmory_book_id), not a possibly-stale freshly-loaded catalog list.
+    return find_book_id_claiming_grimmory_id(db_connection, grimmory_id, exclude_book_id)
 
 # Function Name: fetch_user_books
 # Description: Fetches a user's own Grimmory book list using their own access token.
