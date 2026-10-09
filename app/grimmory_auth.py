@@ -1,23 +1,25 @@
-# Everything that authenticates against Grimmory on behalf of a *person* rather than the
-# dedicated read-only sync account: TBR's user-facing sign-in, the shared per-user session helper
-# that keeps a user's Grimmory refresh token usable without re-prompting for their password on
-# every action (see get_valid_access_token), and the separate *admin*-privileged actions (content
-# restrictions for the spice scale) that need Grimmory admin rights on a user's behalf.
-# Separate from app/library_check.py, which authenticates as its own dedicated read-only user for
-# the admin catalog sync - that's a third, distinct account type from the two here.
+# Auth against Grimmory on behalf of a real person: sign-in, the per-user refresh-token session
+# helper (get_valid_access_token), and admin-privileged content-restriction actions. Distinct from
+# app/library_check.py's dedicated read-only sync account.
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import os
 import threading
+import time
 from collections import defaultdict
 from datetime import date
 from typing import Optional
 
 import httpx
 
-from app.library_check import LOGIN_PATH, LibraryCheckUnavailable
+from app import grimmory_http
+from app.library_check import LOGIN_PATH, LibraryCheckUnavailable, raise_for_grimmory_error
 from app.models import User, get_grimmory_admin_settings, get_user, set_grimmory_refresh_token
+
+logger = logging.getLogger(__name__)
 
 GRIMMORY_BASE_URL_ENV = "GRIMMORY_BASE_URL"
 REFRESH_PATH = "/api/v1/auth/refresh"
@@ -26,21 +28,118 @@ USERS_PATH = "/api/v1/users"
 USERS_ME_PATH = "/api/v1/users/me"
 CONTENT_RESTRICTIONS_PATH = "/api/v1/users/{user_id}/content-restrictions"
 
-# ApiError.INVALID_CREDENTIALS maps to 400 in Grimmory's own source, but a bad username/password
-# never reaches that app-level handler in practice - Spring Security's authentication filter chain
-# rejects it first and its default entry point returns 401 instead. Confirmed against a live
-# instance. Treat both as "bad credentials" in case a future Grimmory version's filter chain
-# changes it back.
+# Grimmory's ApiError.INVALID_CREDENTIALS maps to 400, but Spring Security's filter chain usually
+# rejects bad credentials first and returns 401 instead - treat both as "bad credentials".
 INVALID_CREDENTIALS_STATUSES = {400, 401}
 
-# Index = chili count (0-5); RESTRICTION_TIERS[level + 1] is the ageRating threshold to exclude
-# for levels 0-4. Level 5 removes the restriction entirely rather than using a threshold.
+# Index = chili count (0-5); RESTRICTION_TIERS[level + 1] is the ageRating threshold to exclude.
+# Level 5 removes the restriction entirely.
 RESTRICTION_TIERS = [6, 10, 13, 16, 18, 21]
 
-# One lock per user_id, guarding get_valid_access_token below - Grimmory's refresh tokens rotate
-# and are revoked on use, so two concurrent refresh attempts for the same user would otherwise
-# race. Plain threading.Lock (not asyncio) since every route here runs in FastAPI's threadpool.
+# Per-user lock guarding get_valid_access_token - Grimmory's refresh tokens rotate on use, so
+# concurrent refreshes for the same user would otherwise race.
 _refresh_locks: "defaultdict[int, threading.Lock]" = defaultdict(threading.Lock)
+
+
+# Function Name: refresh_lock
+# Description: The same per-user lock get_valid_access_token uses internally, exposed so callers
+#   writing a refresh/access token directly (see app/main.py) can hold it too. Not reentrant.
+# Parameters:
+# - user_id (int): Local user id to lock.
+# Returns: threading.Lock
+def refresh_lock(user_id: int) -> threading.Lock:
+    return _refresh_locks[user_id]
+
+# In-memory access-token cache, keyed by local user_id: (access_token, monotonic deadline). Avoids
+# calling refresh() on every request when the existing token is still good for up to two hours.
+_access_token_cache: "dict[int, tuple[str, float]]" = {}
+
+# Guards _access_token_cache writes across FastAPI's threadpool and the sync loop. Separate from
+# _refresh_locks so one user's refresh never blocks another's cache write.
+_cache_lock = threading.Lock()
+
+# Refreshed this long before Grimmory's own expiry, not right up against it.
+_ACCESS_TOKEN_SAFETY_MARGIN_SECONDS = 5 * 60
+
+
+# Function Name: cache_access_token
+# Description: Caches a freshly-issued access token so the next get_valid_access_token call can
+#   reuse it instead of calling refresh() again.
+# Parameters:
+# - user_id (int): Local user id.
+# - access_token (str): The access token to cache.
+# - expires_in (Optional[int]): Seconds until Grimmory considers this token expired - None skips
+#   caching.
+# Returns: None
+def cache_access_token(user_id: int, access_token: str, expires_in: Optional[int]) -> None:
+    with _cache_lock:
+        if not expires_in or expires_in <= _ACCESS_TOKEN_SAFETY_MARGIN_SECONDS:
+            _access_token_cache.pop(user_id, None)
+            return
+        _access_token_cache[user_id] = (
+            access_token, time.monotonic() + expires_in - _ACCESS_TOKEN_SAFETY_MARGIN_SECONDS
+        )
+
+
+# Function Name: evict_access_token
+# Description: Evicts a cached access token if Grimmory rejected it early (before our cached
+#   deadline). Matches by token value since callers several layers down don't know which user it
+#   belongs to.
+# Parameters:
+# - access_token (str): The access token that was rejected.
+# Returns: None
+def evict_access_token(access_token: str) -> None:
+    with _cache_lock:
+        stale_user_ids = [
+            user_id
+            for user_id, (cached_token, _deadline) in _access_token_cache.items()
+            if cached_token == access_token
+        ]
+        for user_id in stale_user_ids:
+            _access_token_cache.pop(user_id, None)
+
+
+# Function Name: evict_on_rejection
+# Description: Evicts access_token if exc is a Grimmory auth rejection (401/403) - the
+#   "should I evict" check repeated in every except LibraryCheckUnavailable block that has an
+#   access_token in hand.
+# Parameters:
+# - access_token (str): The access token that was in use when exc was raised.
+# - exc (LibraryCheckUnavailable): The caught exception.
+# Returns: None
+def evict_on_rejection(access_token: str, exc: LibraryCheckUnavailable) -> None:
+    if exc.is_auth_rejection:
+        evict_access_token(access_token)
+
+
+# TEMPORARY diagnostic for the 2026-08-21 force-logout investigation - lets logs confirm which
+# refresh token was written/read by which code path. Remove once the root cause is confirmed.
+
+
+# Function Name: _token_fingerprint
+# Description: Short, non-reversible identifier for a refresh token, safe to log.
+# Parameters:
+# - token (Optional[str]): Refresh token value, or None.
+# Returns: 12-char hex fingerprint (str), or "none" if token is falsy.
+def _token_fingerprint(token: Optional[str]) -> str:
+    if not token:
+        return "none"
+    return hashlib.sha256(token.encode()).hexdigest()[:12]
+
+
+# Function Name: log_token_write
+# Description: Logs a fingerprint of a refresh token every time one is written to the DB, tagged
+#   with which code path wrote it and for which local user.
+# Parameters:
+# - user_id (int): Local user id the token belongs to.
+# - token (Optional[str]): The refresh token being written (None when clearing a rejected one).
+# - source (str): Which code path performed the write, e.g. "api_login".
+# Returns: None
+def log_token_write(user_id: int, token: Optional[str], source: str) -> None:
+    logger.info(
+        "Grimmory refresh token WRITE user_id=%s source=%s fingerprint=%s",
+        user_id, source, _token_fingerprint(token),
+    )
 
 
 class GrimmoryLoginError(Exception):
@@ -54,22 +153,25 @@ class GrimmoryLoginError(Exception):
 # Parameters:
 # - username (str): Grimmory username.
 # - password (str): Grimmory password.
-# Returns: Tuple of (access_token, refresh_token) on success.
-def login(username: str, password: str) -> tuple[str, str]:
-    # Password itself is never stored; the refresh token is persisted so later actions can reuse
-    # it via get_valid_access_token instead of asking for the password again.
+# Returns: Tuple of (access_token, refresh_token, expires_in_seconds) on success. expires_in_seconds
+#   is None if Grimmory's response didn't include one (older/customized instance) - callers should
+#   treat that as "don't cache" (see cache_access_token).
+def login(username: str, password: str) -> tuple[str, str, Optional[int]]:
+    # Password itself is never stored, only the refresh token.
     base_url = os.environ.get(GRIMMORY_BASE_URL_ENV)
     if not base_url:
         raise GrimmoryLoginError("Grimmory login is not configured")
 
+    url = f"{base_url.rstrip('/')}{LOGIN_PATH}"
+    start = time.monotonic()
     try:
         response = httpx.post(
-            f"{base_url.rstrip('/')}{LOGIN_PATH}",
-            json={"username": username, "password": password},
-            timeout=10.0,
+            url, json={"username": username, "password": password}, timeout=10.0
         )
     except httpx.HTTPError as exc:
+        logger.warning("Grimmory login request failed for user %r: %s", username, exc)
         raise GrimmoryLoginError("Couldn't reach Grimmory — try again shortly") from exc
+    grimmory_http.log_call("POST", url, response, time.monotonic() - start)
 
     if response.status_code in INVALID_CREDENTIALS_STATUSES:
         raise GrimmoryLoginError("Invalid username or password")
@@ -77,31 +179,31 @@ def login(username: str, password: str) -> tuple[str, str]:
         raise GrimmoryLoginError("Couldn't reach Grimmory — try again shortly")
 
     body = response.json()
-    return body["accessToken"], body["refreshToken"]
+    return body["accessToken"], body["refreshToken"], body.get("expires")
 
 # Function Name: refresh
 # Description: Exchanges a refresh token for a new access/refresh token pair.
 # Parameters:
 # - base_url (str): Grimmory base URL.
 # - refresh_token (str): Current refresh token.
-# Returns: Tuple of (access_token, refresh_token).
-def refresh(base_url: str, refresh_token: str) -> tuple[str, str]:
-    # Grimmory rotates and revokes the old refresh token on every call - the returned refresh
-    # token must replace the stored one immediately (see get_valid_access_token).
+# Returns: Tuple of (access_token, refresh_token, expires_in_seconds) - see login() for
+#   expires_in_seconds' meaning.
+def refresh(base_url: str, refresh_token: str) -> tuple[str, str, Optional[int]]:
+    # Grimmory rotates and revokes the old refresh token on every call.
+    url = f"{base_url.rstrip('/')}{REFRESH_PATH}"
+    start = time.monotonic()
     try:
-        response = httpx.post(
-            f"{base_url.rstrip('/')}{REFRESH_PATH}",
-            json={"refreshToken": refresh_token},
-            timeout=10.0,
-        )
+        response = httpx.post(url, json={"refreshToken": refresh_token}, timeout=10.0)
     except httpx.HTTPError as exc:
+        logger.warning("Grimmory refresh request failed: %s", exc)
         raise GrimmoryLoginError("Couldn't reach Grimmory — try again shortly") from exc
+    grimmory_http.log_call("POST", url, response, time.monotonic() - start)
 
     if response.status_code >= 400:
         raise GrimmoryLoginError("Grimmory session expired")
 
     body = response.json()
-    return body["accessToken"], body["refreshToken"]
+    return body["accessToken"], body["refreshToken"], body.get("expires")
 
 # Function Name: get_valid_access_token
 # Description: Returns a fresh Grimmory access token for a user using their stored refresh token.
@@ -110,29 +212,49 @@ def refresh(base_url: str, refresh_token: str) -> tuple[str, str]:
 # - user (User): The user to get an access token for.
 # Returns: Access token string, or None if there's no stored session or it's no longer valid.
 def get_valid_access_token(db_connection, user: User) -> Optional[str]:
-    # Re-reads the token from the DB after acquiring the lock rather than trusting the caller's
-    # possibly-stale `user.grimmory_refresh_token` - two concurrent requests for the same user
-    # could otherwise race against Grimmory's token rotation and wrongly clear a still-valid
-    # session.
     if not user.grimmory_refresh_token:
         return None
     base_url = os.environ.get(GRIMMORY_BASE_URL_ENV)
     if not base_url:
         return None
 
+    # Cache check outside the lock so the common case never contends with it.
+    cached = _access_token_cache.get(user.id)
+    if cached is not None and time.monotonic() < cached[1]:
+        return cached[0]
+
+    # Re-reads from the DB after acquiring the lock rather than trusting the caller's possibly
+    # stale user.grimmory_refresh_token.
     with _refresh_locks[user.id]:
+        # Re-check now that we hold the lock - another thread may have already refreshed.
+        cached = _access_token_cache.get(user.id)
+        if cached is not None and time.monotonic() < cached[1]:
+            return cached[0]
+
         current = get_user(db_connection, user.id)
         if current is None or not current.grimmory_refresh_token:
             return None
+        # TEMPORARY diagnostic - see log_token_write above.
+        logger.info(
+            "Grimmory refresh token READ user_id=%s fingerprint=%s",
+            user.id, _token_fingerprint(current.grimmory_refresh_token),
+        )
         try:
-            access_token, new_refresh_token = refresh(base_url, current.grimmory_refresh_token)
+            access_token, new_refresh_token, expires_in = refresh(
+                base_url, current.grimmory_refresh_token
+            )
         except GrimmoryLoginError:
             set_grimmory_refresh_token(db_connection, user.id, None)
+            log_token_write(user.id, None, "get_valid_access_token(rejected)")
             user.grimmory_refresh_token = None
+            with _cache_lock:
+                _access_token_cache.pop(user.id, None)
             return None
 
         set_grimmory_refresh_token(db_connection, user.id, new_refresh_token)
+        log_token_write(user.id, new_refresh_token, "get_valid_access_token")
         user.grimmory_refresh_token = new_refresh_token
+        cache_access_token(user.id, access_token, expires_in)
         return access_token
 
 # Function Name: update_book_finished_date
@@ -146,11 +268,12 @@ def get_valid_access_token(db_connection, user: User) -> Optional[str]:
 def update_book_finished_date(
     base_url: str, access_token: str, grimmory_book_id: int, finished_at: date
 ) -> None:
-    # Callers are expected to swallow LibraryCheckUnavailable and keep the local edit regardless -
-    # the local save must never depend on this succeeding.
+    # Callers must swallow LibraryCheckUnavailable and keep the local edit regardless.
+    url = f"{base_url.rstrip('/')}{BOOK_PROGRESS_PATH}"
+    start = time.monotonic()
     try:
         response = httpx.post(
-            f"{base_url.rstrip('/')}{BOOK_PROGRESS_PATH}",
+            url,
             json={
                 "bookId": grimmory_book_id,
                 "dateFinished": f"{finished_at.isoformat()}T00:00:00Z",
@@ -158,9 +281,45 @@ def update_book_finished_date(
             headers={"Authorization": f"Bearer {access_token}"},
             timeout=10.0,
         )
+        grimmory_http.log_call("POST", url, response, time.monotonic() - start)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+        raise_for_grimmory_error(exc, f"book-progress update for book {grimmory_book_id}")
+
+# Function Name: update_book_progress_percent
+# Description: Best-effort write-back that sets a book's read progress to a percentage. Grimmory
+#   derives readStatus from this itself (ReadingProgressService.calculateReadStatus) and
+#   auto-sets dateFinished the moment it crosses into READ - there's no separate "mark as read"
+#   field to set. Used to push a paired edition to 100%/READ when its sibling finishes (they're
+#   the same underlying book, split into two Grimmory records only because Grimmory's own
+#   audiobook/ebook pairing is broken - see app.models.audiobook_pairings).
+# Parameters:
+# - base_url (str): Grimmory base URL.
+# - access_token (str): Calling user's own Grimmory access token.
+# - grimmory_book_id (int): Grimmory's numeric id for the book.
+# - book_file_id (int): Grimmory's id for that book's primary file (book.primaryFile.id).
+# - percent (float): Progress percentage to set (0-100).
+# Returns: None
+def update_book_progress_percent(
+    base_url: str, access_token: str, grimmory_book_id: int, book_file_id: int, percent: float
+) -> None:
+    # Callers must swallow LibraryCheckUnavailable and keep the local edit regardless.
+    url = f"{base_url.rstrip('/')}{BOOK_PROGRESS_PATH}"
+    start = time.monotonic()
+    try:
+        response = httpx.post(
+            url,
+            json={
+                "bookId": grimmory_book_id,
+                "fileProgress": {"bookFileId": book_file_id, "progressPercent": percent},
+            },
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10.0,
+        )
+        grimmory_http.log_call("POST", url, response, time.monotonic() - start)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise_for_grimmory_error(exc, f"book-progress-percent update for book {grimmory_book_id}")
 
 # Function Name: get_own_grimmory_user_id
 # Description: Returns the calling user's own Grimmory numeric user id.
@@ -169,22 +328,18 @@ def update_book_finished_date(
 # - access_token (str): Calling user's own Grimmory access token.
 # Returns: Grimmory user id (int)
 def get_own_grimmory_user_id(base_url: str, access_token: str) -> int:
-    # Needed because GET /api/v1/shelves returns own + public shelves mixed with no server-side
-    # owner filter - filtering a shelf list down to "shelves I own" requires knowing this first
-    # (see app/library_check.py:list_own_shelves).
+    # Needed because GET /api/v1/shelves returns own + public shelves mixed, with no owner filter.
+    url = f"{base_url.rstrip('/')}{USERS_ME_PATH}"
+    start = time.monotonic()
     try:
-        response = httpx.get(
-            f"{base_url.rstrip('/')}{USERS_ME_PATH}",
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=10.0,
-        )
+        response = httpx.get(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=10.0)
+        grimmory_http.log_call("GET", url, response, time.monotonic() - start)
         response.raise_for_status()
         body = response.json()
     except httpx.HTTPError as exc:
-        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+        raise_for_grimmory_error(exc, "/users/me request")
     except ValueError as exc:
-        # response.json() raises json.JSONDecodeError (a ValueError subclass) on a non-JSON body
-        # (e.g. an HTML error page from a proxy in front of Grimmory).
+        # A non-JSON body, e.g. an HTML error page from a proxy in front of Grimmory.
         raise LibraryCheckUnavailable(f"Grimmory API returned an invalid response: {exc}") from exc
     user_id = body.get("id") if isinstance(body, dict) else None
     if user_id is None:
@@ -234,15 +389,16 @@ def get_admin_session(db_connection) -> Optional[tuple[str, str]]:
 # Returns: Admin access token (str)
 def _admin_login(base_url: str, username: str, password: str) -> str:
     # Refresh token is deliberately never persisted - this account only ever makes one call.
+    url = f"{base_url.rstrip('/')}{LOGIN_PATH}"
+    start = time.monotonic()
     try:
         response = httpx.post(
-            f"{base_url.rstrip('/')}{LOGIN_PATH}",
-            json={"username": username, "password": password},
-            timeout=10.0,
+            url, json={"username": username, "password": password}, timeout=10.0
         )
+        grimmory_http.log_call("POST", url, response, time.monotonic() - start)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        raise LibraryCheckUnavailable(f"Grimmory admin login failed: {exc}") from exc
+        raise_for_grimmory_error(exc, "admin login")
     return response.json()["accessToken"]
 
 # Function Name: find_grimmory_user_id
@@ -253,13 +409,14 @@ def _admin_login(base_url: str, username: str, password: str) -> str:
 # - username (str): Username of the user.
 # Returns: User ID (int) or None if not found.
 def find_grimmory_user_id(base_url: str, admin_token: str, username: str) -> Optional[int]:
+    url = f"{base_url.rstrip('/')}{USERS_PATH}"
+    start = time.monotonic()
     try:
-        response = httpx.get(
-            f"{base_url.rstrip('/')}{USERS_PATH}", headers=_auth_header(admin_token), timeout=10.0
-        )
+        response = httpx.get(url, headers=_auth_header(admin_token), timeout=10.0)
+        grimmory_http.log_call("GET", url, response, time.monotonic() - start)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+        raise_for_grimmory_error(exc, "users list request")
 
     for user in response.json():
         if user.get("username") == username:
@@ -274,15 +431,14 @@ def find_grimmory_user_id(base_url: str, admin_token: str, username: str) -> Opt
 # - user_id (int): Current user's id.
 # Returns: List of content restrictions (list[dict])
 def get_content_restrictions(base_url: str, admin_token: str, user_id: int) -> list[dict]:
+    url = f"{base_url.rstrip('/')}{CONTENT_RESTRICTIONS_PATH.format(user_id=user_id)}"
+    start = time.monotonic()
     try:
-        response = httpx.get(
-            f"{base_url.rstrip('/')}{CONTENT_RESTRICTIONS_PATH.format(user_id=user_id)}",
-            headers=_auth_header(admin_token),
-            timeout=10.0,
-        )
+        response = httpx.get(url, headers=_auth_header(admin_token), timeout=10.0)
+        grimmory_http.log_call("GET", url, response, time.monotonic() - start)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+        raise_for_grimmory_error(exc, f"content-restrictions GET for user {user_id}")
     return response.json()
 
 # Function Name: put_content_restrictions
@@ -296,16 +452,16 @@ def get_content_restrictions(base_url: str, admin_token: str, user_id: int) -> l
 def put_content_restrictions(
     base_url: str, admin_token: str, user_id: int, restrictions: list[dict]
 ) -> None:
+    url = f"{base_url.rstrip('/')}{CONTENT_RESTRICTIONS_PATH.format(user_id=user_id)}"
+    start = time.monotonic()
     try:
         response = httpx.put(
-            f"{base_url.rstrip('/')}{CONTENT_RESTRICTIONS_PATH.format(user_id=user_id)}",
-            json=restrictions,
-            headers=_auth_header(admin_token),
-            timeout=10.0,
+            url, json=restrictions, headers=_auth_header(admin_token), timeout=10.0
         )
+        grimmory_http.log_call("PUT", url, response, time.monotonic() - start)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        raise LibraryCheckUnavailable(f"Grimmory API request failed: {exc}") from exc
+        raise_for_grimmory_error(exc, f"content-restrictions PUT for user {user_id}")
 
 # Function Name: sync_restriction_level
 # Description: Updates a user's content restrictions based on their preferred "spice" level.
@@ -318,8 +474,7 @@ def put_content_restrictions(
 def sync_restriction_level(
     base_url: str, admin_token: str, user_id: int, restriction_level: int
 ) -> None:
-    # GET-merge-PUT: every other restriction type/mode is left untouched, since Grimmory's PUT
-    # replaces a user's entire restriction list wholesale.
+    # GET-merge-PUT: Grimmory's PUT replaces a user's entire restriction list wholesale.
     user_restrictions = get_content_restrictions(base_url, admin_token, user_id)
     kept = [
         rec

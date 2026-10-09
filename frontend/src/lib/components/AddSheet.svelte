@@ -20,10 +20,8 @@
 	let libraryTimer: ReturnType<typeof setTimeout>;
 	let searchTimer: ReturnType<typeof setTimeout>;
 
-	// Two independent debounces mirroring app/templates/_add_sheet.html's two htmx triggers: the
-	// local catalog match (GET /api/search/library) is instant/no-network and fires fast (150ms),
-	// while the external metadata search (GET /api/search) is slower and fires on a longer pause
-	// (1200ms) or on submit.
+	// Two independent debounces: the local catalog match is instant/no-network (150ms), while the
+	// external metadata search is slower (1200ms).
 	function onInput() {
 		clearTimeout(libraryTimer);
 		libraryTimer = setTimeout(fetchLibrary, 150);

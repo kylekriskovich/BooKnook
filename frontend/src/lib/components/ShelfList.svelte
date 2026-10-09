@@ -12,16 +12,16 @@
 	let { status, label, entries: initialEntries }: { status: string; label: string; entries: TBREntry[] } =
 		$props();
 
-	// Local, draggable copy — see ShelfRow.svelte's identical comment for why this needs its own
-	// state instead of reordering the `entries` prop directly, and why it resyncs on prop change
-	// but not after this component's own persistWantedOrder() call.
+	// Local, draggable copy of `entries` — resyncs on prop change, but not after this component's
+	// own persistWantedOrder() call, so a drag reorder doesn't visually snap back mid round-trip.
 	// svelte-ignore state_referenced_locally
 	let entries = $state(initialEntries);
 	$effect(() => {
 		entries = initialEntries;
 	});
 
-	const draggable = $derived(status === 'wanted');
+	let editing = $state(false);
+	const draggable = $derived(status === 'wanted' && editing);
 
 	function handleConsider(event: CustomEvent<{ items: typeof entries }>) {
 		entries = event.detail.items;
@@ -29,8 +29,34 @@
 
 	function handleFinalize(event: CustomEvent<{ items: typeof entries }>) {
 		entries = event.detail.items;
-		persistWantedOrder(entries.map((e) => e.id));
+		// Reconciles with the server's response rather than fire-and-forget, since predicted_month
+		// (see monthMarkers below) depends on order and must be refreshed post-drop.
+		persistWantedOrder(entries.map((e) => e.id)).then((fresh) => {
+			entries = fresh;
+		});
 	}
+
+	function monthLabel(yyyyMm: string): string {
+		const [year, month] = yyyyMm.split('-').map(Number);
+		return new Date(year, month - 1, 1).toLocaleDateString('en-US', { month: 'short' }).toUpperCase();
+	}
+
+	// Marks the last book still within a given projected month before the queue crosses into the
+	// next one - null entries (no pace data yet) never trigger a marker (see stat_tiles
+	// predicted_wanted_queue_months's server-side "hide entirely" behavior). Hidden entirely while
+	// reordering, since dragging changes order live but predicted_month only updates once the
+	// drop's persistWantedOrder response reconciles entries (handleFinalize above) - showing stale
+	// predictions mid-drag would be misleading.
+	const monthMarkers = $derived(
+		status === 'wanted' && !editing
+			? entries.map((entry, i) => {
+					const previous = i > 0 ? entries[i - 1].predicted_month : null;
+					return entry.predicted_month && entry.predicted_month !== previous
+						? monthLabel(entry.predicted_month)
+						: null;
+				})
+			: []
+	);
 </script>
 
 <section id="shelf-list">
@@ -42,12 +68,30 @@
 		</a>
 		<span class="list-title">{label}</span>
 		<span class="list-count">{entries.length}</span>
+		{#if status === 'wanted' && entries.length > 1}
+			<button
+				type="button"
+				class="iconbtn"
+				aria-label={editing ? 'Done reordering' : 'Reorder books'}
+				onclick={() => (editing = !editing)}
+			>
+				{#if editing}
+					<svg viewBox="0 -960 960 960" fill="currentColor" aria-hidden="true">
+						<path d="M382-240 154-468l57-57 171 171 356-356 57 57-413 413Z" />
+					</svg>
+				{:else}
+					<svg viewBox="0 -960 960 960" fill="currentColor" aria-hidden="true">
+						<path
+							d="M200-200h57l391-391-57-57-391 391v57Zm-80 80v-170l528-527q11-12 26-18t31-6q16 0 30.5 6t25.5 18l55 56q12 11 18 25.5t6 30.5q0 16-6 31t-18 26L293-120H120Zm640-584-56-56 56 56Z"
+						/>
+					</svg>
+				{/if}
+			</button>
+		{/if}
 	</div>
 
 	{#if entries.length}
-		<!-- Full shelf page has no toggle radios — view_preference picks one branch here, same as
-		     app/templates/_shelf_books.html; app.css's #shelf-list .shelf-spine/.shelf-cover rules
-		     always show whichever one renders. -->
+		<!-- Full shelf page has no toggle radios — view_preference picks one branch here directly. -->
 		{#if auth.user?.view_preference === 'cover'}
 			<div
 				class="shelf-cover"
@@ -55,8 +99,16 @@
 				onconsider={handleConsider}
 				onfinalize={handleFinalize}
 			>
-				{#each entries as entry (entry.id)}
-					<CoverBook {entry} />
+				{#each entries as entry, i (entry.id)}
+					<div class="cover-book-cell">
+						<CoverBook {entry} />
+						{#if monthMarkers[i]}
+							<div class="month-marker">
+								<span class="month-marker-bar"></span>
+								<span class="month-marker-label">{monthMarkers[i]}</span>
+							</div>
+						{/if}
+					</div>
 				{/each}
 			</div>
 		{:else}

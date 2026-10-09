@@ -1,14 +1,25 @@
 import datetime as dt
 
 from app import stat_tiles
-from app.models import Book, TBREntryDetail
+from app.models import Book, PhysicalReadingSession, TBREntryDetail
 
 
-def _entry(status="reading", started_at=None, finished_at=None, page_count=None):
-    book = Book(id=1, title="Dune", author="Frank Herbert", isbn="111", cover_url=None, page_count=page_count)
+def _entry(
+    status="reading",
+    started_at=None,
+    finished_at=None,
+    page_count=None,
+    format=None,
+    audiobook_progress_percent=None,
+):
+    book = Book(
+        id=1, title="Dune", author="Frank Herbert", isbn="111", cover_url=None,
+        page_count=page_count, format=format,
+    )
     return TBREntryDetail(
         id=1, status=status, added_at="2026-01-01", book=book,
         started_at=started_at, finished_at=finished_at,
+        audiobook_progress_percent=audiobook_progress_percent,
     )
 
 
@@ -24,6 +35,22 @@ def _session(day, start_progress, end_progress, duration_seconds=1800, hour="10"
         "startProgress": start_progress,
         "endProgress": end_progress,
         "progressDelta": delta,
+    }
+
+
+def _audiobook_session(day, duration_seconds=1800, hour="10"):
+    """Shaped like a real Grimmory AUDIOBOOK reading-session payload: bookType is set, but
+    startProgress/endProgress/progressDelta are always null - Grimmory's own audiobook player
+    never populates them (confirmed against its frontend source, 2026-08-21), unlike a normal
+    ebook session's _session() above."""
+    return {
+        "bookType": "AUDIOBOOK",
+        "startTime": f"{day}T{hour}:00:00Z",
+        "endTime": f"{day}T{hour}:30:00Z",
+        "durationSeconds": duration_seconds,
+        "startProgress": None,
+        "endProgress": None,
+        "progressDelta": None,
     }
 
 
@@ -54,6 +81,17 @@ def test_no_sessions_finished_with_finished_before_started_is_guarded():
     entry = _entry(status="finished", started_at="2026-01-11", finished_at="2026-01-01T00:00:00Z")
     tiles = stat_tiles.build_book_tiles(entry, [])
     assert not any(t["label"] == "Days to Complete" for t in tiles)
+
+
+def test_days_to_complete_is_not_duplicated_onto_the_listening_tab():
+    # DESIGN-multi-edition-refactor.md Decision 6/Phase 2: Days to Complete is a book-level fact
+    # (started_at/finished_at), not medium-specific — it must appear once, on the Reading tiles,
+    # never duplicated onto the paired audiobook's Listening tiles.
+    entry = _entry(status="finished", started_at="2026-01-01", finished_at="2026-01-11T00:00:00Z")
+    reading_tiles = stat_tiles.build_book_tiles(entry, [], is_audiobook=False)
+    listening_tiles = stat_tiles.build_book_tiles(entry, [], is_audiobook=True)
+    assert {"label": "Days to Complete", "value": "11d"} in reading_tiles
+    assert not any(t["label"] == "Days to Complete" for t in listening_tiles)
 
 
 def test_no_sessions_reading_with_page_count_falls_back_to_pages_per_day():
@@ -117,6 +155,115 @@ def test_consecutive_days_yield_best_streak():
     assert by_label["Best Streak"] == "3 days"
 
 
+# --- audiobook sessions: progressDelta/endProgress always null, durationSeconds is the only
+# reliable activity signal Grimmory provides for these (see _audiobook_session above) ---
+
+
+def test_audiobook_sessions_with_no_progress_still_count_as_activity():
+    entry = _entry(status="reading", format="AUDIOBOOK")
+    sessions = [
+        _audiobook_session("2026-01-01", duration_seconds=1800),
+        _audiobook_session("2026-01-02", duration_seconds=1800),
+    ]
+    tiles = stat_tiles.build_book_tiles(entry, sessions)
+    by_label = {t["label"]: t["value"] for t in tiles}
+    assert by_label["Listening Days"] == "2"
+    assert by_label["Best Streak"] == "2 days"
+    assert by_label["Time Spent Listening"] == "1h"
+
+
+def test_audiobook_tiles_use_generic_labels_when_book_format_unknown():
+    # entry.book.format (synced from Grimmory's primaryFile.bookType) is the source of truth for
+    # which labels to use, not a session's own bookType - a book that hasn't been format-synced
+    # yet must not show mislabeled "Listening" tiles just because its sessions happen to be
+    # AUDIOBOOK-typed.
+    entry = _entry(status="reading", format=None)
+    sessions = [_audiobook_session("2026-01-01", duration_seconds=1800)]
+    tiles = stat_tiles.build_book_tiles(entry, sessions)
+    by_label = {t["label"]: t["value"] for t in tiles}
+    assert by_label["Reading Days"] == "1"
+    assert by_label["Time Spent Reading"] == "30m"
+
+
+def test_is_audiobook_param_overrides_book_format():
+    # Under the audiobook-pairing model an entry's own book is always the ebook - callers showing
+    # a paired audiobook's own stats (e.g. the Listening tab) pass is_audiobook explicitly rather
+    # than relying on entry.book.format, which is never "AUDIOBOOK" in that case.
+    entry = _entry(status="reading", format="EPUB")
+    sessions = [_audiobook_session("2026-01-01", duration_seconds=1800)]
+    tiles = stat_tiles.build_book_tiles(entry, sessions, is_audiobook=True)
+    by_label = {t["label"]: t["value"] for t in tiles}
+    assert by_label["Listening Days"] == "1"
+    assert by_label["Time Spent Listening"] == "30m"
+
+
+def test_is_audiobook_true_suppresses_pages_per_day_fallback_with_no_sessions():
+    # "Pages per day" is ebook-specific wording and shouldn't appear as a no-data stand-in on a
+    # Listening tab, even though page_count/started_at are set (see test_no_sessions_reading_with_
+    # page_count_falls_back_to_pages_per_day for the is_audiobook=False/default behavior this must
+    # not disturb).
+    entry = _entry(status="reading", started_at="2026-01-01", page_count=300)
+    tiles = stat_tiles.build_book_tiles(entry, [], today=dt.date(2026, 1, 11), is_audiobook=True)
+    assert not any(t["label"] == "Pages per day" for t in tiles)
+
+
+def test_audiobook_session_with_zero_duration_is_not_meaningful():
+    entry = _entry(status="reading")
+    sessions = [_audiobook_session("2026-01-01", duration_seconds=0)]
+    tiles = stat_tiles.build_book_tiles(entry, sessions)
+    assert tiles == []
+
+
+def test_non_audiobook_session_with_null_progress_still_excluded():
+    # A null-progress session for a non-audiobook type must not get swept in by the AUDIOBOOK
+    # carve-out - _has_meaningful_progress's duration fallback is keyed specifically on
+    # bookType == "AUDIOBOOK", not "no progress data at all".
+    entry = _entry(status="reading")
+    sessions = [
+        {
+            "startTime": "2026-01-01T10:00:00Z",
+            "endTime": "2026-01-01T10:30:00Z",
+            "durationSeconds": 1800,
+            "startProgress": None,
+            "endProgress": None,
+            "progressDelta": None,
+        }
+    ]
+    tiles = stat_tiles.build_book_tiles(entry, sessions)
+    assert tiles == []
+
+
+def test_burndown_still_empty_for_audiobook_sessions():
+    # burndown_points needs a real endProgress time series, which Grimmory never provides for
+    # audiobooks - the duration-based activity fix must not fabricate one.
+    sessions = [_audiobook_session("2026-01-01"), _audiobook_session("2026-01-02")]
+    assert stat_tiles.burndown_points(sessions) == []
+
+
+def test_estimated_completion_falls_back_to_audiobook_progress_percent():
+    # Session-level progressDelta/endProgress are always null for audiobooks, so the pace/latest-
+    # progress used to have no way to compute Estimated Completion here at all even though the
+    # exact number it needs (tbr_entries.audiobook_progress_percent) already exists on the entry.
+    entry = _entry(status="reading", format="AUDIOBOOK", audiobook_progress_percent=20.0)
+    sessions = [
+        _audiobook_session("2026-01-01"),
+        _audiobook_session("2026-01-02"),
+    ]
+    tiles = stat_tiles.build_book_tiles(entry, sessions, today=dt.date(2026, 1, 2))
+    by_label = {t["label"]: t["value"] for t in tiles}
+    # pace = 20% / 2 listening days = 10%/day, remaining = 80% -> 8 days from today (Jan 2) -> Jan 10.
+    assert by_label["Estimated Completion"] == "Jan 10, 2026"
+
+
+def test_estimated_completion_omitted_without_audiobook_progress_percent():
+    # No fallback value stored yet (not synced, or a non-audiobook with no session deltas either)
+    # - must not fabricate a pace out of nothing.
+    entry = _entry(status="reading", format="AUDIOBOOK", audiobook_progress_percent=None)
+    sessions = [_audiobook_session("2026-01-01"), _audiobook_session("2026-01-02")]
+    tiles = stat_tiles.build_book_tiles(entry, sessions, today=dt.date(2026, 1, 2))
+    assert not any(t["label"] == "Estimated Completion" for t in tiles)
+
+
 def test_pages_per_session_and_best_session_use_page_count():
     entry = _entry(status="reading", page_count=300)
     sessions = [
@@ -138,6 +285,19 @@ def test_best_session_falls_back_to_percent_without_page_count():
     assert by_label["Best Session"]["value"] == "25%"
 
 
+def test_pages_per_session_uses_physical_edition_own_page_count_not_ebook_page_count():
+    # A physical session's pageDelta is exact (from its own raw page numbers) and must win over
+    # estimating pages from the ebook's page_count, which can be a genuinely different edition.
+    entry = _entry(status="reading", page_count=300)  # ebook's own page_count
+    physical = _physical_session("2026-01-01T10:00:00Z", "2026-01-01T11:00:00Z", 0, 140, session_id=1)
+    shape = stat_tiles.physical_session_to_grimmory_shape(physical, physical_page_count=400)
+    tiles = stat_tiles.build_book_tiles(entry, [shape])
+    by_label = {t["label"]: t for t in tiles}
+    # 140 raw pages (physical), not 35% of 300 = 105 (what the old ebook-page_count math gave).
+    assert by_label["Pages per session"]["value"] == "140"
+    assert by_label["Best Session"]["value"] == "140 pages"
+
+
 def test_estimated_completion_requires_two_reading_days():
     entry = _entry(status="reading")
     tiles = stat_tiles.build_book_tiles(entry, [_session("2026-01-01", 0, 10)])
@@ -154,6 +314,23 @@ def test_estimated_completion_present_with_pace_and_remaining_progress():
     assert any(t["label"] == "Estimated Completion" for t in tiles)
 
 
+def test_estimated_completion_uses_client_supplied_today_not_server_default(monkeypatch):
+    # Regression test: the server's default "today" can lag a viewer's actual local day by up to
+    # many hours (see app/main.py:_resolve_client_today) - the estimate must be computed from the
+    # caller's own `today`, not whatever today_local() says.
+    monkeypatch.setattr(stat_tiles, "today_local", lambda zone=None: dt.date(2020, 1, 1))
+    entry = _entry(status="reading")
+    sessions = [
+        _session("2026-01-01", 0, 10),
+        _session("2026-01-02", 10, 20),
+    ]
+    tiles = stat_tiles.build_book_tiles(entry, sessions, today=dt.date(2026, 1, 3))
+    by_label = {t["label"]: t["value"] for t in tiles}
+    # pace = 10%/day, remaining = 80% -> 8 days from the client's today (Jan 3), not from
+    # today_local()'s mocked 2020 date.
+    assert by_label["Estimated Completion"] == "Jan 11, 2026"
+
+
 def test_estimated_completion_omitted_when_finished_status():
     entry = _entry(status="finished")
     sessions = [
@@ -162,6 +339,16 @@ def test_estimated_completion_omitted_when_finished_status():
     ]
     tiles = stat_tiles.build_book_tiles(entry, sessions)
     assert not any(t["label"] == "Estimated Completion" for t in tiles)
+
+
+def test_pages_per_day_fallback_uses_client_supplied_today_not_server_default(monkeypatch):
+    monkeypatch.setattr(stat_tiles, "today_local", lambda zone=None: dt.date(2020, 1, 1))
+    entry = _entry(status="reading", started_at="2026-01-01", page_count=300)
+    tiles = stat_tiles.build_book_tiles(entry, [], today=dt.date(2026, 1, 10))
+    by_label = {t["label"]: t["value"] for t in tiles}
+    # 10 elapsed days (Jan 1 - Jan 10 inclusive) -> 300 / 10 = 30 pages/day, computed from the
+    # client's today, not today_local()'s mocked 2020 date.
+    assert by_label["Pages per day"] == "30"
 
 
 def test_sessions_present_skip_pages_per_day_fallback():
@@ -205,6 +392,68 @@ def test_latest_progress_ignores_sessions_missing_end_progress():
     assert stat_tiles.latest_progress(sessions) == 10
 
 
+# --- unified_latest_progress ---
+
+
+def test_unified_latest_progress_all_none():
+    assert stat_tiles.unified_latest_progress([None, None]) is None
+
+
+def test_unified_latest_progress_takes_the_max_not_a_specific_edition():
+    # DESIGN-multi-edition-refactor.md Decision 5: a high-water mark across editions, not whichever
+    # one happens to be listed/used most recently — an audiobook further along than the ebook must
+    # win even though it's passed second here.
+    assert stat_tiles.unified_latest_progress([40.0, 55.0]) == 55.0
+
+
+# --- physical_session_to_grimmory_shape ---
+
+
+def _physical_session(start_time, end_time, start_page, end_page, session_id=1, entry_id=1):
+    return PhysicalReadingSession(
+        id=session_id, entry_id=entry_id, start_time=start_time, end_time=end_time,
+        start_page=start_page, end_page=end_page,
+    )
+
+
+def test_physical_session_to_grimmory_shape_computes_progress_from_physical_page_count():
+    # DESIGN-multi-edition-refactor.md Decision 9: percentages come from the physical edition's own
+    # page count, not books.page_count — a different printing can have a different total.
+    session = _physical_session("2026-08-21T10:00:00Z", "2026-08-21T11:00:00Z", 0, 140)
+    shape = stat_tiles.physical_session_to_grimmory_shape(session, physical_page_count=400)
+    assert shape["startProgress"] == 0.0
+    assert shape["endProgress"] == 35.0
+    assert shape["progressDelta"] == 35.0
+    assert shape["durationSeconds"] == 3600
+
+
+def test_physical_session_to_grimmory_shape_no_page_count_still_counts_as_meaningful():
+    # No percentage without a page count, but pageDelta is known from the raw page numbers alone -
+    # a session logged before physical_page_count is set must still count as real reading.
+    session = _physical_session("2026-08-21T10:00:00Z", "2026-08-21T11:00:00Z", 0, 140)
+    shape = stat_tiles.physical_session_to_grimmory_shape(session, physical_page_count=None)
+    assert shape["startProgress"] is None
+    assert shape["endProgress"] is None
+    assert shape["progressDelta"] is None
+    assert shape["durationSeconds"] == 3600
+    assert shape["pageDelta"] == 140
+    assert stat_tiles._has_meaningful_progress(shape) is True
+
+
+def test_physical_session_to_grimmory_shape_feeds_existing_pipeline_unchanged():
+    # The whole point of Decision 7: once converted, it's indistinguishable from a real Grimmory
+    # session to every other function in this module.
+    session = _physical_session("2026-08-21T10:00:00Z", "2026-08-21T11:00:00Z", 0, 140)
+    shape = stat_tiles.physical_session_to_grimmory_shape(session, physical_page_count=400)
+    assert stat_tiles._has_meaningful_progress(shape) is True
+    assert stat_tiles.get_reading_dates([shape]) == [dt.date(2026, 8, 21)]
+    assert stat_tiles.latest_progress([shape]) == 35.0
+
+
+def test_unified_latest_progress_skips_missing_editions():
+    assert stat_tiles.unified_latest_progress([None, 63.2]) == 63.2
+
+
 # --- first_meaningful_session_date ---
 
 
@@ -226,6 +475,13 @@ def test_first_meaningful_session_date_ignores_zero_delta_sessions_before_and_af
         _session("2026-01-02", 0, 0),  # zero-delta, out of order, still before Jan 3
         _session("2026-01-04", 5, 10),  # later real reading
     ]
+    assert stat_tiles.first_meaningful_session_date(sessions) == dt.date(2026, 1, 3)
+
+
+def test_first_meaningful_session_date_counts_audiobook_sessions():
+    import datetime as dt
+
+    sessions = [_audiobook_session("2026-01-01", duration_seconds=0), _audiobook_session("2026-01-03")]
     assert stat_tiles.first_meaningful_session_date(sessions) == dt.date(2026, 1, 3)
 
 
@@ -352,11 +608,35 @@ def test_build_collection_tiles_pages_and_longest_shortest():
     tiles = stat_tiles.build_collection_tiles(entries, *_YEAR_WINDOW)
     by_label = {t["label"]: t for t in tiles}
     assert by_label["Total pages read"]["value"] == "400"
-    assert by_label["Avg pages read"]["value"] == "200"
+    assert by_label["Avg book length"]["value"] == "200"
     assert by_label["Longest book"]["value"] == "300"
     assert by_label["Longest book"]["sub"] == "Long Book"
     assert by_label["Shortest book"]["value"] == "100"
     assert by_label["Shortest book"]["sub"] == "Short Book"
+
+
+def test_build_collection_tiles_avg_pages_read_omitted_without_session_data():
+    # No sessions_by_entry_id passed - the caller has no session data (e.g. no Grimmory base URL
+    # configured), so "Avg pages read" is skipped rather than shown as 0 or reusing "Avg book length".
+    entries = [_finished_entry(1, "A", page_count=100, started_at="2026-01-01", finished_at="2026-01-05T00:00:00Z")]
+    tiles = stat_tiles.build_collection_tiles(entries, *_YEAR_WINDOW)
+    assert not any(t["label"] == "Avg pages read" for t in tiles)
+
+
+def test_build_collection_tiles_avg_pages_read_averages_every_session_across_entries():
+    # A true per-session average, not per-book: 3 sessions total (2 from entry 1, 1 from entry 2)
+    # averaging (40 + 60 + 100) / 3 = 66.67 -> 67, not an average of each book's own per-book average.
+    entries = [
+        _finished_entry(1, "A", page_count=200, started_at="2026-01-01", finished_at="2026-01-05T00:00:00Z"),
+        _finished_entry(2, "B", page_count=200, started_at="2026-01-10", finished_at="2026-01-15T00:00:00Z"),
+    ]
+    sessions_by_entry_id = {
+        1: [{"progressDelta": 20, "pageDelta": 40}, {"progressDelta": 30, "pageDelta": 60}],
+        2: [{"progressDelta": 50, "pageDelta": 100}],
+    }
+    tiles = stat_tiles.build_collection_tiles(entries, *_YEAR_WINDOW, sessions_by_entry_id)
+    by_label = {t["label"]: t["value"] for t in tiles}
+    assert by_label["Avg pages read"] == "67"
 
 
 def test_build_collection_tiles_prorates_pages_for_span_crossing_window_boundary():
@@ -435,3 +715,305 @@ def test_finish_time_and_days_to_complete_use_the_same_duration_math():
         t["value"] for t in stat_tiles.build_book_tiles(entry, []) if t["label"] == "Days to Complete"
     )
     assert collection_days == "11d" == book_days
+
+
+# --- reading_session_tiles ---
+
+
+def test_reading_session_tiles_empty_without_sessions():
+    assert stat_tiles.reading_session_tiles([]) == []
+
+
+def test_reading_session_tiles_counts_and_sums_minutes():
+    sessions = [
+        (_session("2026-01-01", 0, 10, duration_seconds=1800), 200),
+        (_session("2026-01-02", 10, 25, duration_seconds=1800), 200),
+    ]
+    tiles = stat_tiles.reading_session_tiles(sessions)
+    by_label = {t["label"]: t["value"] for t in tiles}
+    assert by_label["Total sessions"] == "2"
+    assert by_label["Total reading time"] == "1h"
+
+
+def test_reading_session_tiles_avg_per_month_counts_only_active_months():
+    # Two sessions in January (20 + 20 = 40 pages), one in March (30 pages) - average is over the
+    # 2 active months (40+30)/2 = 35, not divided by a fixed 12 or by the number of sessions.
+    sessions = [
+        (_session("2026-01-01", 0, 10, duration_seconds=0), 200),
+        (_session("2026-01-15", 10, 20, duration_seconds=0), 200),
+        (_session("2026-03-01", 20, 35, duration_seconds=0), 200),
+    ]
+    tiles = stat_tiles.reading_session_tiles(sessions)
+    by_label = {t["label"]: t["value"] for t in tiles}
+    assert by_label["Avg pages per month"] == "35"
+
+
+def test_reading_session_tiles_best_day_sums_same_day_sessions():
+    # Two sessions on the same day (10 + 15 = 25 pages) should outrank a single 20-page day.
+    sessions = [
+        (_session("2026-01-01", 0, 5, duration_seconds=0), 200),
+        (_session("2026-01-01", 5, 12.5, duration_seconds=0), 200),
+        (_session("2026-01-02", 0, 10, duration_seconds=0), 200),
+    ]
+    tiles = stat_tiles.reading_session_tiles(sessions)
+    by_label = {t["label"]: t for t in tiles}
+    assert by_label["Best day"]["value"] == "25 pages"
+    assert by_label["Best day"]["sub"] == "2026-01-01"
+
+
+def test_reading_session_tiles_largest_session_is_a_single_session_not_a_day_total():
+    # Contrast with the best-day test above: this is the single biggest session, so the combined
+    # same-day pair (5 + 7.5 = 12.5 each) loses to the one 20-page session on a different day.
+    sessions = [
+        (_session("2026-01-01", 0, 2.5, duration_seconds=0), 200),
+        (_session("2026-01-01", 2.5, 6.25, duration_seconds=0), 200),
+        (_session("2026-01-02", 0, 10, duration_seconds=0), 200),
+    ]
+    tiles = stat_tiles.reading_session_tiles(sessions)
+    by_label = {t["label"]: t for t in tiles}
+    assert by_label["Largest session"]["value"] == "20 pages"
+    assert by_label["Largest session"]["sub"] == "2026-01-02"
+
+
+def test_reading_session_tiles_reading_speed_only_uses_timed_sessions():
+    # 20 pages in 0.5h -> 40 pages/hr; a same-size session with no duration recorded is excluded
+    # from both the page and hour totals, not treated as 0 hours (which would divide by zero/skew).
+    sessions = [
+        (_session("2026-01-01", 0, 10, duration_seconds=1800), 200),
+        (_session("2026-01-02", 0, 10, duration_seconds=0), 200),
+    ]
+    tiles = stat_tiles.reading_session_tiles(sessions)
+    by_label = {t["label"]: t["value"] for t in tiles}
+    assert by_label["Reading speed"] == "40 pages/hr"
+
+
+# --- listening_session_tiles ---
+
+
+def test_listening_session_tiles_empty_without_sessions():
+    assert stat_tiles.listening_session_tiles([]) == []
+
+
+def test_listening_session_tiles_counts_and_averages_duration():
+    sessions = [
+        _audiobook_session("2026-01-01", duration_seconds=1800),
+        _audiobook_session("2026-01-02", duration_seconds=3600),
+    ]
+    tiles = stat_tiles.listening_session_tiles(sessions)
+    by_label = {t["label"]: t["value"] for t in tiles}
+    assert by_label["Audio session count"] == "2"
+    assert by_label["Total listening time"] == "1h 30m"
+    assert by_label["Avg listening session"] == "45 min"
+
+
+# --- physical_session_tiles ---
+
+
+def test_physical_session_tiles_empty_without_sessions():
+    assert stat_tiles.physical_session_tiles([]) == []
+
+
+def test_physical_session_tiles_counts_every_logged_session():
+    sessions = [{"pageDelta": 10}, {"pageDelta": 0}]
+    tiles = stat_tiles.physical_session_tiles(sessions)
+    assert tiles == [{"label": "Physical session count", "value": "2"}]
+
+
+# --- group_stat_tiles ---
+
+
+def test_group_stat_tiles_buckets_by_fixed_group_regardless_of_input_order():
+    tiles = [
+        {"label": "Best day", "value": "10 pages"},
+        {"label": "Books finished", "value": "5"},
+        {"label": "Avg rating", "value": "4.0"},
+        {"label": "Total pages read", "value": "500"},
+    ]
+    grouped = stat_tiles.group_stat_tiles(tiles)
+    assert grouped["overview"] == [
+        {"label": "Books finished", "value": "5"},
+        {"label": "Total pages read", "value": "500"},
+    ]
+    assert grouped["averages"] == [{"label": "Avg rating", "value": "4.0"}]
+    assert grouped["highlights"] == [{"label": "Best day", "value": "10 pages"}]
+
+
+def test_group_stat_tiles_omits_missing_labels_without_erroring():
+    grouped = stat_tiles.group_stat_tiles([])
+    assert grouped == {"overview": [], "averages": [], "highlights": []}
+
+
+def test_group_stat_tiles_covers_every_label_every_builder_can_produce():
+    # Every label reading_session_tiles/listening_session_tiles/physical_session_tiles/
+    # build_collection_tiles can emit must have a home in STAT_TILE_GROUPS, or it would silently
+    # vanish from the Stats page instead of erroring.
+    reading_labels = {
+        "Total sessions",
+        "Total reading time",
+        "Avg pages per month",
+        "Best day",
+        "Largest session",
+        "Reading speed",
+    }
+    listening_labels = {"Avg listening session", "Total listening time", "Audio session count"}
+    physical_labels = {"Physical session count"}
+    collection_labels = {
+        "Books finished",
+        "Total pages read",
+        "Avg pages read",
+        "Avg book length",
+        "Longest book",
+        "Shortest book",
+        "Avg rating",
+        "Avg finish time",
+        "Fastest finish",
+        "Slowest finish",
+    }
+    grouped_labels = {label for labels in stat_tiles.STAT_TILE_GROUPS.values() for label in labels}
+    assert reading_labels | listening_labels | physical_labels | collection_labels == grouped_labels
+
+
+# --- _average_pages_per_day / predicted_wanted_queue_months ---
+
+
+def _wanted_entry(entry_id, sort_order, page_count=None):
+    book = Book(id=entry_id, title=f"Book {entry_id}", author=None, isbn=None, cover_url=None, page_count=page_count)
+    return TBREntryDetail(id=entry_id, status="wanted", added_at="2026-01-01", book=book, sort_order=sort_order)
+
+
+def test_average_pages_per_day_none_without_finished_books():
+    entries = [_wanted_entry(1, 0, page_count=200)]
+    assert stat_tiles._average_pages_per_day(entries, dt.date(2026, 3, 1)) is None
+
+
+def test_average_pages_per_day_excludes_audiobooks():
+    # Same page_count/duration as a real finished ebook below, but format=AUDIOBOOK - page_count
+    # isn't a meaningful reading-time measure for audiobooks, so it must not skew the pace.
+    audiobook = _finished_entry(1, "A", page_count=1000, started_at="2026-01-01", finished_at="2026-01-11T00:00:00Z")
+    audiobook.book.format = "AUDIOBOOK"
+    ebook = _finished_entry(2, "B", page_count=100, started_at="2026-02-01", finished_at="2026-02-11T00:00:00Z")
+    # 100 pages / 11 days (inclusive) - the audiobook entry contributes nothing.
+    pace = stat_tiles._average_pages_per_day([audiobook, ebook], dt.date(2026, 3, 1))
+    assert pace == 100 / 11
+
+
+def test_average_pages_per_day_skips_entries_missing_duration_or_page_count():
+    no_dates = _finished_entry(1, "A", page_count=100)
+    no_pages = _finished_entry(2, "B", started_at="2026-01-01", finished_at="2026-01-05T00:00:00Z")
+    valid = _finished_entry(3, "C", page_count=200, started_at="2026-01-01", finished_at="2026-01-05T00:00:00Z")
+    pace = stat_tiles._average_pages_per_day([no_dates, no_pages, valid], dt.date(2026, 1, 10))
+    assert pace == 200 / 5
+
+
+def test_average_pages_per_day_excludes_books_finished_more_than_3_months_ago():
+    # Same shape/pace as the "recent" entry, but finished well outside the 90-day window - must
+    # not dilute (or entirely replace) the recent-only estimate.
+    old = _finished_entry(1, "Old", page_count=1000, started_at="2025-01-01", finished_at="2025-01-11T00:00:00Z")
+    recent = _finished_entry(2, "Recent", page_count=100, started_at="2026-03-01", finished_at="2026-03-11T00:00:00Z")
+    pace = stat_tiles._average_pages_per_day([old, recent], dt.date(2026, 3, 20))
+    assert pace == 100 / 11
+
+
+def test_predicted_wanted_queue_months_empty_without_pace_data():
+    entries = [_wanted_entry(1, 0, page_count=200)]
+    assert stat_tiles.predicted_wanted_queue_months(entries, dt.date(2026, 1, 1)) == {}
+
+
+def test_predicted_wanted_queue_months_walks_sort_order_by_cumulative_pages():
+    # Pace: 100 pages/day. Queue (in sort_order, not id, order): book 2 (100p) then book 1 (200p).
+    finished = _finished_entry(9, "Pace setter", page_count=100, started_at="2026-01-01", finished_at="2026-01-01T18:00:00Z")
+    first = _wanted_entry(1, sort_order=1, page_count=200)
+    second = _wanted_entry(2, sort_order=0, page_count=100)
+    months = stat_tiles.predicted_wanted_queue_months([finished, first, second], dt.date(2026, 1, 1))
+    # second (sort_order 0): 100/100 = 1 day out -> Jan 2. first (sort_order 1): +200/100 = 2 more
+    # days -> Jan 4. Both land in January.
+    assert months == {2: "2026-01", 1: "2026-01"}
+
+
+def test_predicted_wanted_queue_months_crosses_a_month_boundary():
+    finished = _finished_entry(9, "Pace setter", page_count=10, started_at="2026-01-01", finished_at="2026-01-01T18:00:00Z")
+    # Pace: 10 pages/day. A 300-page book takes 30 days from Jan 1 -> Jan 31 (still January); a
+    # second identical book pushes another 30 days to Mar 2 (crossing into March).
+    entries = [finished, _wanted_entry(1, 0, page_count=300), _wanted_entry(2, 1, page_count=300)]
+    months = stat_tiles.predicted_wanted_queue_months(entries, dt.date(2026, 1, 1))
+    assert months[1] == "2026-01"
+    assert months[2] == "2026-03"
+
+
+def test_predicted_wanted_queue_months_substitutes_average_for_missing_page_count():
+    finished = _finished_entry(9, "Pace setter", page_count=100, started_at="2026-01-01", finished_at="2026-01-01T18:00:00Z")
+    known = _wanted_entry(1, 0, page_count=200)
+    unknown = _wanted_entry(2, 1, page_count=None)
+    months = stat_tiles.predicted_wanted_queue_months([finished, known, unknown], dt.date(2026, 1, 1))
+    # unknown falls back to the average of known queued page counts (200) - same 2-day jump as
+    # `known` itself, landing on the same day pace-wise (still within January either way).
+    assert set(months) == {1, 2}
+
+
+def _reading_entry(entry_id, page_count=None, started_at=None, format=None):
+    book = Book(id=entry_id, title=f"Reading {entry_id}", author=None, isbn=None, cover_url=None, page_count=page_count, format=format)
+    return TBREntryDetail(id=entry_id, status="reading", added_at="2026-01-01", book=book, started_at=started_at)
+
+
+def test_predicted_wanted_queue_months_reading_book_head_start_pushes_into_next_month():
+    # Pace: 10 pages/day (finished: 10 pages in 1 day). Reading a 200-page book started 5 days
+    # ago, no session data - estimated read so far: 10*5=50, remaining 150 -> 15-day head start.
+    finished = _finished_entry(9, "Pace setter", page_count=10, started_at="2026-01-20", finished_at="2026-01-20T18:00:00Z")
+    reading = _reading_entry(10, page_count=200, started_at="2026-01-15")
+    queued = _wanted_entry(1, 0, page_count=10)
+    months = stat_tiles.predicted_wanted_queue_months([finished, reading, queued], dt.date(2026, 1, 20))
+    # Without the head start this would land Jan 21 ("2026-01") - the 15-day head start plus the
+    # queued book's own 1 day pushes it to Feb 5 instead.
+    assert months[1] == "2026-02"
+
+
+def test_reading_head_start_days_prefers_real_progress_over_elapsed_guess():
+    reading = _reading_entry(10, page_count=200, started_at="2026-01-15")
+    # Elapsed guess (5 days at pace 10/day): read so far 50, remaining 150 -> 15-day head start.
+    guessed = stat_tiles._reading_head_start_days([reading], 10.0, dt.date(2026, 1, 20))
+    assert guessed == 15.0
+    # Real tracked progress (90%) overrides the guess entirely: remaining 20 pages -> 2 days.
+    exact = stat_tiles._reading_head_start_days(
+        [reading], 10.0, dt.date(2026, 1, 20), progress_by_entry_id={10: 90}
+    )
+    assert exact == 2.0
+
+
+def test_predicted_wanted_queue_months_uses_real_progress_percent_over_elapsed_guess():
+    # Same reading book/pace as the elapsed-guess test above, but now with a real tracked
+    # progress (90% complete) passed in - the actual tracked progress wins over the guess.
+    finished = _finished_entry(9, "Pace setter", page_count=10, started_at="2026-01-20", finished_at="2026-01-20T18:00:00Z")
+    reading = _reading_entry(10, page_count=200, started_at="2026-01-15")
+    queued = _wanted_entry(1, 0, page_count=10)
+    months = stat_tiles.predicted_wanted_queue_months(
+        [finished, reading, queued], dt.date(2026, 1, 20), progress_by_entry_id={10: 90}
+    )
+    # 2-day head start + the queued book's own 1 day = 3 days out from Jan 20 -> Jan 23, still
+    # January (the elapsed-days guess pushes this into February - see the test above).
+    assert months[1] == "2026-01"
+
+
+def test_predicted_wanted_queue_months_reading_book_fully_read_at_pace_has_no_head_start():
+    # Started long enough ago that the pace estimate already covers the whole book - no
+    # remaining pages, so no head start (not a negative one).
+    finished = _finished_entry(9, "Pace setter", page_count=10, started_at="2026-01-20", finished_at="2026-01-20T18:00:00Z")
+    reading = _reading_entry(10, page_count=50, started_at="2025-01-01")
+    queued = _wanted_entry(1, 0, page_count=10)
+    months = stat_tiles.predicted_wanted_queue_months([finished, reading, queued], dt.date(2026, 1, 20))
+    assert months[1] == "2026-01"
+
+
+def test_predicted_wanted_queue_months_reading_book_missing_started_at_contributes_no_head_start():
+    finished = _finished_entry(9, "Pace setter", page_count=10, started_at="2026-01-20", finished_at="2026-01-20T18:00:00Z")
+    reading = _reading_entry(10, page_count=500)  # no started_at - can't estimate progress
+    queued = _wanted_entry(1, 0, page_count=10)
+    months = stat_tiles.predicted_wanted_queue_months([finished, reading, queued], dt.date(2026, 1, 20))
+    assert months[1] == "2026-01"
+
+
+def test_predicted_wanted_queue_months_ignores_audiobook_currently_reading():
+    finished = _finished_entry(9, "Pace setter", page_count=10, started_at="2026-01-20", finished_at="2026-01-20T18:00:00Z")
+    reading = _reading_entry(10, page_count=200, started_at="2026-01-15", format="AUDIOBOOK")
+    queued = _wanted_entry(1, 0, page_count=10)
+    months = stat_tiles.predicted_wanted_queue_months([finished, reading, queued], dt.date(2026, 1, 20))
+    assert months[1] == "2026-01"

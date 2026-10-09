@@ -20,3 +20,7 @@ frontend-dist/
 
 # OS
 .DS_Store
+
+# Local planning docs — not meant to be published
+/ISSUES-TO-REVIEW.md
+/DESIGN-multi-edition-refactor.md

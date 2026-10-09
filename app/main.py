@@ -26,8 +26,13 @@ from app.library_check import LibraryCheckUnavailable
 from app.metadata import SearchResult, search_books
 from app.models import (
     User,
+    add_physical_reading_session,
     add_tbr_entry,
+    clear_audiobook_pairing,
+    clear_linked_edition,
     create_book,
+    delete_physical_reading_session,
+    get_audiobook_pairings,
     get_book,
     get_connection,
     get_goal,
@@ -35,50 +40,71 @@ from app.models import (
     get_library_catalog,
     get_library_settings,
     get_library_sync_state,
+    get_linked_editions,
+    get_linked_editions_for_ebook,
     get_or_create_user,
+    get_physical_reading_session,
     get_search_settings,
     get_tbr_entry,
     get_user,
+    group_duplicate_reading_sessions,
     init_db,
     list_aggregate_tbr,
+    list_cached_reading_sessions,
+    list_physical_reading_sessions,
     list_tbr_entries_with_books,
     remove_tbr_entry,
     search_library_catalog,
+    set_audiobook_pairing,
     set_book_manual_match_and_grimmory_id,
     set_calendar_view_preference,
     set_grimmory_admin_settings,
     set_grimmory_refresh_token,
     set_library_settings,
+    set_linked_edition,
     set_onboarded,
     set_search_settings,
     set_spice_level,
     set_sync_to_device_enabled,
     set_sync_to_device_shelf_id,
     set_tbr_entry_finished_at,
+    set_tbr_entry_owns_physical,
+    set_tbr_entry_physical_page_count,
+    set_tbr_entry_reading_progress_percent,
     set_tbr_entry_started_at,
     set_view_preference,
     set_wanted_order,
     set_want_to_read_shelf_id,
+    soft_delete_cached_reading_session,
+    update_physical_reading_session,
     upsert_goal,
 )
 
+# Function Name: _resolve_log_level_name
+# Description: Validates a TBR_LOG_LEVEL value against logging's level names, falling back to
+#   INFO so a typo'd env var doesn't crash the app at import time.
+# Parameters:
+# - raw (str): Raw TBR_LOG_LEVEL env var value, already uppercased.
+# Returns: A valid logging level name (str)
+def _resolve_log_level_name(raw: str) -> str:
+    return raw if raw in logging.getLevelNamesMapping() else "INFO"
+
+
+# Configured explicitly so app.* loggers (see app/grimmory_http.py) show INFO by default.
+logging.basicConfig(
+    level=_resolve_log_level_name(os.environ.get("TBR_LOG_LEVEL", "INFO").upper()),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 APP_DIR = os.path.dirname(__file__)
-# frontend-dist/ is the SvelteKit adapter-static build output — COPY'd there by the Dockerfile's
-# frontend-build stage. Absent in local backend-only dev (`uvicorn app.main:app --reload` without
-# ever running `npm run build`); see frontend/README.md, which runs its own Vite dev server
-# against this backend instead of hitting the routes below.
+# SvelteKit adapter-static build output, COPY'd here by the Dockerfile. Absent in backend-only dev.
 FRONTEND_DIST = os.path.join(os.path.dirname(APP_DIR), "frontend-dist")
 COOKIE_NAME = "tbr_user_id"
 SECRET_KEY_ENV = "TBR_SECRET_KEY"
 ADMIN_USERNAME_ENV = "TBR_ADMIN_USERNAME"
 
-# 30 days — matches Grimmory's own refresh-token lifetime (see app/grimmory_auth.py), so a TBR
-# session lasts about as long as Grimmory would keep the user's own stored refresh token valid.
-# Reading-status sync no longer depends on this cookie's lifetime for freshness — it now runs in
-# the background on Grimmory's own account, independent of login frequency (see
-# library_check.run_periodic_sync and SPEC.md > Reading-status auto-detection).
+# 30 days — matches Grimmory's own refresh-token lifetime (see app/grimmory_auth.py).
 SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 30
 
 
@@ -90,10 +116,8 @@ def _secret_key() -> bytes:
 
 
 def sign_session_cookie(user_id: int, issued_at: "int | None" = None) -> str:
-    """Cookie holds "<user_id>.<issued_at>.<hmac>". issued_at is covered by the signature (not
-    just appended after it) so it can't be tampered with to extend a session, and lets
-    _verify_session_cookie enforce SESSION_MAX_AGE_SECONDS server-side rather than relying solely
-    on the browser honoring the cookie's max_age."""
+    """Cookie is "<user_id>.<issued_at>.<hmac>"; issued_at is signed so it can't be extended,
+    letting _verify_session_cookie enforce SESSION_MAX_AGE_SECONDS server-side."""
     if issued_at is None:
         issued_at = int(time.time())
     payload = f"{user_id}.{issued_at}"
@@ -121,29 +145,19 @@ def _verify_session_cookie(value: str) -> "int | None":
 
 
 async def spa_fallback(full_path: str) -> FileResponse:
-    """Serves a real file from the SvelteKit build (the content-hashed workbox-*.js,
-    manifest.webmanifest, robots.txt, ...) when `full_path` matches one; otherwise falls back to
-    index.html so the client-side router can resolve the route itself — deep links like
-    /book/42, or a hard refresh on /calendar, have no server-side route of their own. Pairs with
-    frontend/vite.config.ts's adapter({ fallback: 'index.html' }), which assumes exactly this.
-    Registered from inside lifespan() (see below), not as a module-level decorator — see the
-    comment there for why that ordering matters.
-    """
+    """Serves a real build file if `full_path` matches one, else index.html for client-side
+    routing. Registered from lifespan(), not as a module decorator — see that comment for why."""
     if full_path.startswith("api/") or full_path.startswith("covers/"):
         raise HTTPException(status_code=404, detail="Not found")
 
     if full_path:
         candidate = os.path.abspath(os.path.join(FRONTEND_DIST, full_path))
-        # Path-traversal guard (e.g. "/../../etc/passwd") — only ever serve a real file that
-        # resolves to somewhere inside the build output.
+        # Path-traversal guard - only serve a file inside the build output.
         if candidate.startswith(os.path.abspath(FRONTEND_DIST) + os.sep) and os.path.isfile(candidate):
             return FileResponse(candidate)
 
     response = FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
-    # index.html is the one URL that never changes across deploys and must always point at
-    # whichever content-hashed JS/CSS bundle is current — no-cache forces revalidation on every
-    # load. Everything else under frontend-dist/ is content-hashed and safe to let the browser
-    # cache indefinitely, unlike this file.
+    # index.html must always revalidate so it picks up the current content-hashed bundle.
     response.headers["Cache-Control"] = "no-cache"
     return response
 
@@ -156,18 +170,11 @@ async def lifespan(app: FastAPI):
     finally:
         db_connection.close()
 
-    # Mounted here rather than at module import time so it picks up whatever TBR_DB_PATH is
-    # actually configured at real startup (covers_dir() creates the directory relative to it) —
-    # importing this module alone must not create directories as a side effect (e.g. under
-    # pytest, before a test fixture gets a chance to set TBR_DB_PATH to a tmp path).
+    # Mounted here, not at import time, so it picks up TBR_DB_PATH as configured at real startup.
     app.mount("/covers", StaticFiles(directory=library_check.covers_dir()), name="covers")
 
-    # Also registered here rather than as module-level decorators/mounts, and specifically *after*
-    # /covers above: Starlette matches routes in registration order, and spa_fallback's
-    # /{full_path:path} matches literally everything (including /covers/*) — decorator-based
-    # routes register at import time, which would put spa_fallback *before* /covers in the list
-    # and let it shadow every cover image request. Skipped entirely if frontend-dist/ doesn't
-    # exist (local backend-only dev — see FRONTEND_DIST's comment above).
+    # Registered after /covers - Starlette matches routes in registration order, and
+    # spa_fallback's /{full_path:path} would otherwise shadow /covers/* if registered first.
     if os.path.isdir(FRONTEND_DIST):
         app.mount("/_app", StaticFiles(directory=os.path.join(FRONTEND_DIST, "_app")), name="frontend-app")
         icons_dir = os.path.join(FRONTEND_DIST, "icons")
@@ -175,8 +182,6 @@ async def lifespan(app: FastAPI):
             app.mount("/icons", StaticFiles(directory=icons_dir), name="frontend-icons")
         app.add_api_route("/{full_path:path}", spa_fallback, methods=["GET"], include_in_schema=False)
 
-    # Always runs — the loop itself checks library_settings each cycle, so settings saved via
-    # /admin/settings take effect without an app restart.
     sync_task = asyncio.create_task(library_check.run_periodic_sync())
 
     yield
@@ -200,10 +205,8 @@ def _user_from_cookie(request: Request, db_connection: sqlite3.Connection) -> Op
 
 
 def get_db():
-    """FastAPI dependency yielding one connection per request, closed once the request finishes.
-    Cached by FastAPI across every `Depends(get_db)` in a single request (including indirectly via
-    get_current_user/require_user below), so a request only ever opens one connection no matter
-    how many routes/dependencies ask for it."""
+    """One DB connection per request, closed when it finishes. FastAPI caches this across every
+    `Depends(get_db)` in the request, so multiple dependencies never open a second connection."""
     db_connection = get_connection()
     try:
         yield db_connection
@@ -240,16 +243,21 @@ def health():
 
 
 def _tbr_entries_for_user(db_connection, user_id: int):
-    """TBR entries with books, enriched with the library "owned" flag and, where the library
-    match has one, its publishedDate — when the Grimmory cross-check is configured."""
+    """TBR entries with books, enriched with the library "owned" flag, whether the matched book has
+    a paired audiobook edition, and, where the library match has one, its publishedDate — when the
+    Grimmory cross-check is configured."""
     entries = list_tbr_entries_with_books(db_connection, user_id)
     if library_check.is_configured(db_connection):
         catalog = get_library_catalog(db_connection)
+        paired_ebook_ids = {
+            le.ebook_grimmory_id for le in get_linked_editions(db_connection) if le.format == "AUDIOBOOK"
+        }
         for entry in entries:
-            match = library_check.find_catalog_match(
-                entry.book.title, entry.book.isbn, entry.book.author, catalog
-            )
+            # resolve_catalog_match, not find_catalog_match - must honor an admin's manual match
+            # (POST /api/admin/books/{id}/match), same as the admin "In Library" view does.
+            match = library_check.resolve_catalog_match(entry.book, catalog)
             entry.owned = match is not None
+            entry.has_paired_audiobook = match is not None and match.grimmory_id in paired_ebook_ids
             if match and match.published_date:
                 entry.book.published_date = match.published_date
     return entries
@@ -274,12 +282,9 @@ def _finished_at_sort_key(entry) -> datetime:
 
 
 def _entries_for_shelf(entries, status: str, year: int):
-    """Entries for one shelf — for "finished", also restricted to finished_at falling within
-    the given year, matching the "Finished in {year}" label (status alone isn't enough; a
-    'finished' entry from a prior year shouldn't show up here), and sorted most-recently-finished
-    first rather than the default added_at-DESC ordering. "wanted" sorts by the user's own manual
-    order instead (see models.py:set_wanted_order) — sort_order is never None for a live wanted
-    entry once init_db's backfill has run, so this doesn't need a None-safe fallback."""
+    """Entries for one shelf — "finished" is further restricted to finished_at falling within
+    `year` (matching the "Finished in {year}" label) and sorted most-recently-finished first.
+    "wanted" sorts by the user's own manual order instead (see models.py:set_wanted_order)."""
     matching = [e for e in entries if e.status == status]
     if status == "finished":
         matching = [e for e in matching if e.finished_at and e.finished_at.startswith(str(year))]
@@ -307,8 +312,17 @@ def _shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
     return index // 12, index % 12 + 1
 
 
-def _parse_calendar_month(raw: str) -> tuple[int, int]:
-    """Parses a "YYYY-MM" query param, falling back to the current UTC month for anything
+def _resolve_client_today(raw: str) -> date:
+    """Parses a client-supplied "YYYY-MM-DD" local date, falling back to the deployment's
+    TBR_TIMEZONE today if missing/malformed - the frontend sends the browser's own local date
+    since the server's clock can otherwise lag/lead a viewer's actual local day (see
+    app/dates.py:DEFAULT_ZONE), which would show stale calendar/stats/estimates."""
+    parsed = dates.parse_date(raw) if raw else None
+    return parsed if parsed is not None else dates.today_local()
+
+
+def _parse_calendar_month(raw: str, today: date) -> tuple[int, int]:
+    """Parses a "YYYY-MM" query param, falling back to the given "today"'s month for anything
     missing/malformed rather than erroring — a bad/stale query param shouldn't break the page."""
     if raw:
         try:
@@ -318,25 +332,103 @@ def _parse_calendar_month(raw: str) -> tuple[int, int]:
                 return year, month
         except ValueError:
             pass
-    today = dates.today_utc()
     return today.year, today.month
 
 
-def _calendar_context(db_connection, user_id: int, year: int, month: int) -> dict:
+def _fetch_sessions_by_entry_id(db_connection, user: User, entries: list) -> dict[int, list[dict]]:
+    """Ebook + physical reading sessions per entry, for stat_tiles.build_collection_tiles's "Avg
+    pages read". Audiobook listening sessions are excluded - they carry no real page data, only a
+    percentage-of-ebook-pages estimate, which would skew a pages-read average. A "finished" entry
+    with a warm cache costs no Grimmory call at all (library_check.get_or_fetch_reading_sessions);
+    only a "reading" one, or a "finished" one still cold, does - so only call this for a bounded
+    set of already-finished entries, not the full library."""
+    base_url = os.environ.get(grimmory_auth.GRIMMORY_BASE_URL_ENV)
+    access_token = grimmory_auth.get_valid_access_token(db_connection, user) if base_url else None
+    result: dict[int, list[dict]] = {}
+    for entry in entries:
+        sessions: list[dict] = []
+        if access_token is not None and entry.book.grimmory_book_id:
+            try:
+                sessions = library_check.get_or_fetch_reading_sessions(
+                    db_connection, entry.id, entry.status, "EBOOK", base_url, access_token,
+                    entry.book.grimmory_book_id,
+                )
+            except LibraryCheckUnavailable as exc:
+                grimmory_auth.evict_on_rejection(access_token, exc)
+        if entry.owns_physical:
+            sessions = sessions + [
+                stat_tiles.physical_session_to_grimmory_shape(s, entry.physical_page_count)
+                for s in list_physical_reading_sessions(db_connection, entry.id)
+            ]
+        result[entry.id] = sessions
+    return result
+
+
+def _fetch_stats_page_sessions(db_connection, user: User, entries: list) -> dict[int, dict[str, list[dict]]]:
+    """Ebook, audiobook, and physical sessions per entry, kept separate by source (unlike
+    _fetch_sessions_by_entry_id, which merges ebook+physical for build_collection_tiles's "Avg
+    pages read") - powers the Stats page's Reading/Listening/Physical tab stats
+    (stat_tiles.reading_session_tiles/listening_session_tiles/physical_session_tiles). Up to two
+    Grimmory API calls per entry (ebook + any paired audiobook) once, on top of the calls
+    _fetch_sessions_by_entry_id already makes for the same page - a "finished" entry with a warm
+    cache costs neither (library_check.get_or_fetch_reading_sessions) - only call this for the
+    bounded, already-finished-this-year set, not the full library."""
+    base_url = os.environ.get(grimmory_auth.GRIMMORY_BASE_URL_ENV)
+    access_token = grimmory_auth.get_valid_access_token(db_connection, user) if base_url else None
+    result: dict[int, dict[str, list[dict]]] = {}
+    for entry in entries:
+        ebook_sessions: list[dict] = []
+        audiobook_sessions: list[dict] = []
+        if access_token is not None:
+            if entry.book.grimmory_book_id:
+                try:
+                    ebook_sessions = library_check.get_or_fetch_reading_sessions(
+                        db_connection, entry.id, entry.status, "EBOOK", base_url, access_token,
+                        entry.book.grimmory_book_id,
+                    )
+                except LibraryCheckUnavailable as exc:
+                    grimmory_auth.evict_on_rejection(access_token, exc)
+            audiobook_grimmory_id = None
+            if entry.book.grimmory_book_id is not None:
+                linked = get_linked_editions_for_ebook(db_connection, entry.book.grimmory_book_id)
+                audiobook_edition = next((le for le in linked if le.format == "AUDIOBOOK"), None)
+                audiobook_grimmory_id = (
+                    audiobook_edition.edition_grimmory_id if audiobook_edition else None
+                )
+            if audiobook_grimmory_id is not None:
+                try:
+                    audiobook_sessions = library_check.get_or_fetch_reading_sessions(
+                        db_connection, entry.id, entry.status, "AUDIOBOOK", base_url, access_token,
+                        audiobook_grimmory_id,
+                    )
+                except LibraryCheckUnavailable as exc:
+                    grimmory_auth.evict_on_rejection(access_token, exc)
+        physical_sessions = (
+            [
+                stat_tiles.physical_session_to_grimmory_shape(s, entry.physical_page_count)
+                for s in list_physical_reading_sessions(db_connection, entry.id)
+            ]
+            if entry.owns_physical
+            else []
+        )
+        result[entry.id] = {
+            "ebook": ebook_sessions,
+            "audiobook": audiobook_sessions,
+            "physical": physical_sessions,
+        }
+    return result
+
+
+def _calendar_context(db_connection, user: User, year: int, month: int, today: date) -> dict:
     """Shared aggregation behind GET /api/calendar."""
-    entries = list_tbr_entries_with_books(db_connection, user_id)
-    spans = reading_calendar.month_spans(entries, year, month)
+    entries = list_tbr_entries_with_books(db_connection, user.id)
+    spans = reading_calendar.month_spans(entries, year, month, today)
     for span in spans:
         cover_color.ensure_cover_color(db_connection, span.entry.book)
     days = reading_calendar.days_active(spans, year, month)
     prev_year, prev_month = _shift_month(year, month, -1)
     next_year, next_month = _shift_month(year, month, 1)
 
-    # Calendar-specific tiles (session-approximate, computed from month_spans/days_active — not
-    # derivable from a plain entry collection) first, then the same session-independent collection
-    # tiles /api/stats uses, scoped to books finished in this month instead of this year — the
-    # whole point of stat_tiles.build_collection_tiles taking a plain entry list is that a
-    # different timeframe is just a different filter here, not new tile logic.
     calendar_tiles = [
         {"label": "Best Streak", "value": f"{reading_calendar.best_streak(days)}d"},
         {"label": "Days Read", "value": str(len(days))},
@@ -355,7 +447,10 @@ def _calendar_context(db_connection, user_id: int, year: int, month: int) -> dic
     ]
     month_start = date(year, month, 1)
     month_end = date(year, month, calendar.monthrange(year, month)[1])
-    calendar_tiles += stat_tiles.build_collection_tiles(finished_this_month, month_start, month_end)
+    sessions_by_entry_id = _fetch_sessions_by_entry_id(db_connection, user, finished_this_month)
+    calendar_tiles += stat_tiles.build_collection_tiles(
+        finished_this_month, month_start, month_end, sessions_by_entry_id
+    )
 
     return {
         "calendar_year": year,
@@ -363,10 +458,18 @@ def _calendar_context(db_connection, user_id: int, year: int, month: int) -> dic
         "calendar_month_label": f"{calendar.month_name[month]} {year}",
         "calendar_prev": f"{prev_year:04d}-{prev_month:02d}",
         "calendar_next": f"{next_year:04d}-{next_month:02d}",
-        "calendar_grid": reading_calendar.calendar_grid(year, month, spans),
+        "calendar_grid": reading_calendar.calendar_grid(year, month, spans, today),
         "calendar_spans": spans,
         "calendar_tiles": calendar_tiles,
     }
+
+
+def _open_library_results(query: str) -> "tuple[list[SearchResult], bool]":
+    """Runs an Open Library search - (results, error), error=True on any network failure."""
+    try:
+        return search_books(query), False
+    except httpx.HTTPError:
+        return [], True
 
 
 def _spice_labels() -> list[str]:
@@ -392,6 +495,24 @@ def _requested_row(entry) -> dict:
     }
 
 
+def _catalog_matches_to_search_results(catalog_matches) -> list[schemas.SearchResultOut]:
+    return [
+        schemas.SearchResultOut(
+            title=entry.title,
+            author=", ".join(entry.authors) if entry.authors else None,
+            isbn=entry.isbn13 or entry.isbn10,
+            cover_url=None,
+            published_date=entry.published_date,
+            grimmory_id=entry.grimmory_id,
+        )
+        for entry in catalog_matches
+    ]
+
+
+def _catalog_by_grimmory_id(db_connection) -> dict:
+    return {c.grimmory_id: c for c in get_library_catalog(db_connection) if c.grimmory_id is not None}
+
+
 def _catalog_row(catalog_entry, wanted_by: list[str]) -> dict:
     return {
         "title": catalog_entry.title,
@@ -405,11 +526,13 @@ def _catalog_row(catalog_entry, wanted_by: list[str]) -> dict:
 # ---------------------------------------------------------------------------
 # JSON API
 # ---------------------------------------------------------------------------
-# Consumed by the SvelteKit frontend in frontend/ (built to frontend-dist/ and served by
-# spa_fallback above in production) — see the root CLAUDE.md for the overall architecture.
-#
-# /admin* routes have no in-app auth, gated at the reverse proxy instead (NPM Access List / Basic
-# Auth on /admin — see SPEC.md's access-control section). That's intentional, not an oversight.
+# /admin* routes have no in-app auth, intentionally - gated at the reverse proxy instead.
+
+
+def _keep_if_blank(new: str, existing: Optional[str]) -> Optional[str]:
+    """A blank submitted secret means "leave unchanged" (schemas.py documents this convention) -
+    falls back to the existing stored value rather than overwriting it with blank."""
+    return new or existing
 
 
 def _is_admin(user: User) -> bool:
@@ -444,17 +567,21 @@ def _to_book_out(book) -> schemas.BookOut:
     )
 
 
-def _to_entry_out(entry) -> schemas.TBREntryOut:
+def _to_entry_out(entry, predicted_month: Optional[str] = None) -> schemas.TBREntryOut:
     return schemas.TBREntryOut(
         id=entry.id,
         status=entry.status,
         added_at=entry.added_at,
         book=_to_book_out(entry.book),
         owned=entry.owned,
+        has_paired_audiobook=entry.has_paired_audiobook,
         finished_at=entry.finished_at,
         started_at=entry.started_at,
         started_at_manual=entry.started_at_manual,
         rating=entry.rating,
+        owns_physical=entry.owns_physical,
+        physical_page_count=entry.physical_page_count,
+        predicted_month=predicted_month,
     )
 
 
@@ -475,6 +602,27 @@ def _find_entry_detail(db_connection, user_id: int, entry_id: int):
     return next(
         (e for e in list_tbr_entries_with_books(db_connection, user_id) if e.id == entry_id), None
     )
+
+
+def _unified_progress_and_estimated_page(
+    entry, session_lists: list[list[dict]], fallback_percents: list["float | None"]
+):
+    """Max of each linked edition's latest tracked progress, falling back to its synced percentage
+    when session data is empty (Decision 5). `session_lists`/`fallback_percents` are parallel
+    per-edition lists."""
+    if entry.status != "reading":
+        return None, None
+    candidates = []
+    for sessions, fallback in zip(session_lists, fallback_percents):
+        progress = stat_tiles.latest_progress(sessions)
+        candidates.append(progress if progress is not None else fallback)
+    progress_percent = stat_tiles.unified_latest_progress(candidates)
+    estimated_page = (
+        round(progress_percent / 100 * entry.book.page_count)
+        if progress_percent is not None and entry.book.page_count
+        else None
+    )
+    return progress_percent, estimated_page
 
 
 def _to_book_span_out(span) -> schemas.BookSpanOut:
@@ -524,22 +672,25 @@ def _to_calendar_out(calendar_context: dict, calendar_view: str) -> schemas.Cale
 
 @app.post("/api/login", response_model=schemas.MeOut)
 def api_login(payload: schemas.LoginIn, db_connection: sqlite3.Connection = Depends(get_db)):
-    # response_model is declared for OpenAPI's benefit (see frontend/src/lib/api/schema.d.ts) —
-    # returning a raw JSONResponse below (needed to also set the session cookie) bypasses
-    # FastAPI's automatic response_model serialization/filtering, but the documented schema still
-    # comes from this declaration regardless of what the handler actually returns at runtime.
+    # response_model is for OpenAPI's benefit - the raw JSONResponse below (needed to also set
+    # the session cookie) bypasses FastAPI's automatic response_model serialization.
     try:
-        access_token, refresh_token = grimmory_auth.login(payload.username, payload.password)
+        access_token, refresh_token, expires_in = grimmory_auth.login(payload.username, payload.password)
     except GrimmoryLoginError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
     user = get_or_create_user(db_connection, payload.username)
-    set_grimmory_refresh_token(db_connection, user.id, refresh_token)
+    # Locked so a concurrent get_valid_access_token/refresh() can't clobber this fresh login.
+    with grimmory_auth.refresh_lock(user.id):
+        set_grimmory_refresh_token(db_connection, user.id, refresh_token)
+        grimmory_auth.log_token_write(user.id, refresh_token, "api_login")  # TEMPORARY diagnostic
+        grimmory_auth.cache_access_token(user.id, access_token, expires_in)
     base_url = os.environ.get(grimmory_auth.GRIMMORY_BASE_URL_ENV)
     if base_url:
         try:
             library_check.sync_user_reading_status(db_connection, user.id, base_url, access_token)
-        except LibraryCheckUnavailable:
+        except LibraryCheckUnavailable as exc:
+            grimmory_auth.evict_on_rejection(access_token, exc)
             logger.exception("Grimmory reading-status sync failed")
 
     response = JSONResponse(_to_me_out(user).model_dump(mode="json"))
@@ -569,8 +720,12 @@ def api_me(user: Optional[User] = Depends(get_current_user)) -> "schemas.MeOut |
 
 
 @app.get("/api/home", response_model=schemas.HomeOut)
-def api_home(user: User = Depends(require_user), db_connection: sqlite3.Connection = Depends(get_db)):
-    shelves = _shelves_for_user(db_connection, user.id, datetime.now(timezone.utc).year)
+def api_home(
+    today: str = "",
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    shelves = _shelves_for_user(db_connection, user.id, _resolve_client_today(today).year)
     return schemas.HomeOut(
         shelves=[
             schemas.ShelfOut(
@@ -583,22 +738,38 @@ def api_home(user: User = Depends(require_user), db_connection: sqlite3.Connecti
     )
 
 
-def _shelf_out(db_connection, user_id: int, status: str, year: int) -> schemas.ShelfOut:
-    entries = _entries_for_shelf(_tbr_entries_for_user(db_connection, user_id), status, year)
+def _shelf_out(db_connection, user_id: int, status: str, today: date) -> schemas.ShelfOut:
+    all_entries = _tbr_entries_for_user(db_connection, user_id)
+    entries = _entries_for_shelf(all_entries, status, today.year)
+    # Projected from the full entry list (pace comes from finished books) - only meaningful for
+    # the wanted queue itself, so every other shelf/Home's own shelf previews stay marker-free.
+    predicted_months = {}
+    if status == "wanted":
+        progress_by_entry_id = {
+            e.id: e.reading_progress_percent
+            for e in all_entries
+            if e.status == "reading" and e.reading_progress_percent is not None
+        }
+        predicted_months = stat_tiles.predicted_wanted_queue_months(
+            all_entries, today, progress_by_entry_id
+        )
     return schemas.ShelfOut(
-        status=status, label=_shelf_label(status, year), entries=[_to_entry_out(e) for e in entries]
+        status=status,
+        label=_shelf_label(status, today.year),
+        entries=[_to_entry_out(e, predicted_months.get(e.id)) for e in entries],
     )
 
 
 @app.get("/api/shelf/{status}", response_model=schemas.ShelfOut)
 def api_shelf(
     status: str,
+    today: str = "",
     user: User = Depends(require_user),
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
     if status not in SHELF_STATUSES:
         raise HTTPException(status_code=404, detail="Unknown shelf")
-    return _shelf_out(db_connection, user.id, status, datetime.now(timezone.utc).year)
+    return _shelf_out(db_connection, user.id, status, _resolve_client_today(today))
 
 
 @app.post("/api/shelf/wanted/reorder", response_model=schemas.ShelfOut)
@@ -608,7 +779,7 @@ def api_reorder_wanted_shelf(
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
     set_wanted_order(db_connection, user.id, payload.entry_ids)
-    return _shelf_out(db_connection, user.id, "wanted", datetime.now(timezone.utc).year)
+    return _shelf_out(db_connection, user.id, "wanted", dates.today_local())
 
 
 @app.post("/api/onboarding", response_model=schemas.MeOut)
@@ -629,41 +800,105 @@ def api_onboarding(
 @app.get("/api/book/{entry_id}", response_model=schemas.BookDetailOut)
 def api_book_detail(
     entry_id: int,
+    today: str = "",
     user: User = Depends(require_user),
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
+    resolved_today = _resolve_client_today(today)
     entry = _find_entry_detail(db_connection, user.id, entry_id)
     if entry is None:
         raise HTTPException(status_code=404, detail="Not found")
 
-    sessions = []
-    base_url = os.environ.get(grimmory_auth.GRIMMORY_BASE_URL_ENV)
-    if base_url and entry.book.grimmory_book_id:
-        access_token = grimmory_auth.get_valid_access_token(db_connection, user)
-        if access_token is not None:
-            with contextlib.suppress(LibraryCheckUnavailable):
-                sessions = library_check.fetch_reading_sessions_for_book(
-                    base_url, access_token, entry.book.grimmory_book_id
-                )
+    # Paired audiobook id, keyed off grimmory_book_id. Reads linked_editions rather than
+    # get_audiobook_pairings's reverse dict, whose UNIQUE constraint rules out two audiobooks
+    # ever colliding on the same ebook.
+    audiobook_grimmory_id = None
+    if entry.book.grimmory_book_id is not None:
+        linked = get_linked_editions_for_ebook(db_connection, entry.book.grimmory_book_id)
+        audiobook_edition = next((le for le in linked if le.format == "AUDIOBOOK"), None)
+        audiobook_grimmory_id = audiobook_edition.edition_grimmory_id if audiobook_edition else None
+    entry.has_paired_audiobook = audiobook_grimmory_id is not None
 
-    if sessions and not entry.started_at_manual:
-        derived = stat_tiles.first_meaningful_session_date(sessions)
+    sessions = []
+    audiobook_sessions = []
+    access_token = None
+    base_url = os.environ.get(grimmory_auth.GRIMMORY_BASE_URL_ENV)
+    if base_url and (entry.book.grimmory_book_id or audiobook_grimmory_id is not None):
+        access_token = grimmory_auth.get_valid_access_token(db_connection, user)
+    if access_token is not None:
+        if entry.book.grimmory_book_id:
+            try:
+                sessions = library_check.get_or_fetch_reading_sessions(
+                    db_connection, entry.id, entry.status, "EBOOK", base_url, access_token,
+                    entry.book.grimmory_book_id,
+                )
+            except LibraryCheckUnavailable as exc:
+                grimmory_auth.evict_on_rejection(access_token, exc)
+        if audiobook_grimmory_id is not None:
+            try:
+                audiobook_sessions = library_check.get_or_fetch_reading_sessions(
+                    db_connection, entry.id, entry.status, "AUDIOBOOK", base_url, access_token,
+                    audiobook_grimmory_id,
+                )
+            except LibraryCheckUnavailable as exc:
+                grimmory_auth.evict_on_rejection(access_token, exc)
+
+    # Manually-logged physical sessions (Decisions 7-9), converted to the same Grimmory-shaped
+    # dict so nothing downstream needs to know they didn't come from Grimmory.
+    physical_sessions = (
+        [
+            stat_tiles.physical_session_to_grimmory_shape(s, entry.physical_page_count)
+            for s in list_physical_reading_sessions(db_connection, entry.id)
+        ]
+        if entry.owns_physical
+        else []
+    )
+
+    if (sessions or audiobook_sessions or physical_sessions) and not entry.started_at_manual:
+        # Earliest across every linked edition, not just the ebook - a book started via a paired
+        # audiobook or a physical stretch before the ebook was ever opened must derive started_at
+        # from that earlier date (Decision 2).
+        candidates = [
+            d
+            for d in (
+                stat_tiles.first_meaningful_session_date(sessions),
+                stat_tiles.first_meaningful_session_date(audiobook_sessions),
+                stat_tiles.first_meaningful_session_date(physical_sessions),
+            )
+            if d is not None
+        ]
+        derived = min(candidates) if candidates else None
         if derived is not None and derived.isoformat() != entry.started_at:
             set_tbr_entry_started_at(db_connection, entry.id, derived.isoformat(), manual=False)
             entry.started_at = derived.isoformat()
 
-    tiles = stat_tiles.build_book_tiles(entry, sessions)
-    burndown = stat_tiles.burndown_points(sessions)
-    progress_percent = stat_tiles.latest_progress(sessions) if entry.status == "reading" else None
-    estimated_page = (
-        round(progress_percent / 100 * entry.book.page_count)
-        if progress_percent is not None and entry.book.page_count
-        else None
+    # Time-spent-by-medium tiles stay split (Decision 6); physical merges into Reading rather than
+    # a third tab (Decision 8) - it's the same activity, just untracked by Grimmory.
+    tiles = stat_tiles.build_book_tiles(
+        entry, sessions + physical_sessions, resolved_today, is_audiobook=False
     )
+    audiobook_tiles = stat_tiles.build_book_tiles(
+        entry, audiobook_sessions, resolved_today, is_audiobook=True
+    )
+
+    # Progress is a per-source high-water mark, not merged (Decision 5); burndown/started_at do
+    # flatten sources. audiobook_progress_percent is trusted only while actually paired.
+    audiobook_fallback_percent = entry.audiobook_progress_percent if audiobook_grimmory_id is not None else None
+    progress_percent, estimated_page = _unified_progress_and_estimated_page(
+        entry,
+        [sessions, physical_sessions, audiobook_sessions],
+        [None, None, audiobook_fallback_percent],
+    )
+    # Persisted so the wanted-queue projection (_shelf_out) can read a fast, no-extra-query
+    # reading_progress_percent column instead of re-deriving it - only as fresh as the last time
+    # this page was viewed (see models.py's tbr_entries.reading_progress_percent comment).
+    set_tbr_entry_reading_progress_percent(db_connection, entry.id, progress_percent)
+    burndown = stat_tiles.burndown_points(sessions + physical_sessions + audiobook_sessions)
 
     return schemas.BookDetailOut(
         entry=_to_entry_out(entry),
         tiles=[_to_tile_out(t) for t in tiles],
+        audiobook_tiles=[_to_tile_out(t) for t in audiobook_tiles],
         burndown=[schemas.BurndownPointOut(date=d, remaining_percent=r) for d, r in burndown],
         burndown_day_span=stat_tiles.burndown_day_span(burndown),
         progress_percent=progress_percent,
@@ -673,33 +908,101 @@ def api_book_detail(
 
 # --- stats / calendar ---
 
+# Session-derived stat tiles (build_collection_tiles's "Avg pages read"/"Avg book length" plus
+# every *_session_tiles tile, together forming the Stats page's single Overview/Averages/
+# Highlights tab group) cost up to 2 Grimmory API calls per finished book with no caching
+# upstream, so the grouped result is cached here per (user, year) for a short TTL rather than
+# recomputed on every page view. Everything else in StatsOut (goal, finished_count) is a cheap
+# local DB read and stays uncached, so editing a goal shows up immediately rather than waiting out
+# the TTL. Plain in-process dict, not a DB table - deliberately kept lightweight (see
+# conversation) rather than persisting raw session data, which would need its own invalidation/
+# sync story.
+_STATS_SESSION_CACHE_TTL_SECONDS = 900
+_stats_session_cache: dict[tuple[int, int], tuple[float, schemas.StatTileGroupsOut]] = {}
+
+
+def _cached_stats_tile_groups(
+    db_connection, user: User, year: int, finished_this_year: list
+) -> schemas.StatTileGroupsOut:
+    cache_key = (user.id, year)
+    cached = _stats_session_cache.get(cache_key)
+    if cached is not None:
+        cached_at, cached_groups = cached
+        if time.monotonic() - cached_at < _STATS_SESSION_CACHE_TTL_SECONDS:
+            return cached_groups
+
+    sessions_by_source = _fetch_stats_page_sessions(db_connection, user, finished_this_year)
+    # "Avg pages read"/"Avg book length" (build_collection_tiles) still want ebook+physical merged
+    # per Decision 8; derived here rather than fetched a second time via _fetch_sessions_by_entry_id.
+    reading_plus_physical_by_entry_id = {
+        entry_id: sessions["ebook"] + sessions["physical"] for entry_id, sessions in sessions_by_source.items()
+    }
+    collection_tiles = stat_tiles.build_collection_tiles(
+        finished_this_year, date(year, 1, 1), date(year, 12, 31), reading_plus_physical_by_entry_id
+    )
+
+    page_count_by_entry_id = {entry.id: entry.book.page_count for entry in finished_this_year}
+    reading_sessions_with_page_counts = [
+        (session, page_count_by_entry_id[entry_id])
+        for entry_id, sessions in sessions_by_source.items()
+        for session in sessions["ebook"]
+    ]
+    listening_sessions = [
+        session for sessions in sessions_by_source.values() for session in sessions["audiobook"]
+    ]
+    physical_sessions = [
+        session for sessions in sessions_by_source.values() for session in sessions["physical"]
+    ]
+    all_tiles = (
+        collection_tiles
+        + stat_tiles.reading_session_tiles(reading_sessions_with_page_counts)
+        + stat_tiles.listening_session_tiles(listening_sessions)
+        + stat_tiles.physical_session_tiles(physical_sessions)
+    )
+    grouped = stat_tiles.group_stat_tiles(all_tiles)
+    tile_groups = schemas.StatTileGroupsOut(
+        overview=[_to_tile_out(t) for t in grouped["overview"]],
+        averages=[_to_tile_out(t) for t in grouped["averages"]],
+        highlights=[_to_tile_out(t) for t in grouped["highlights"]],
+    )
+
+    _stats_session_cache[cache_key] = (time.monotonic(), tile_groups)
+    return tile_groups
+
 
 @app.get("/api/stats", response_model=schemas.StatsOut)
-def api_stats(user: User = Depends(require_user), db_connection: sqlite3.Connection = Depends(get_db)):
-    year = datetime.now(timezone.utc).year
+def api_stats(
+    today: str = "",
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    year = _resolve_client_today(today).year
     goal = get_goal(db_connection, user.id, "year")
     finished_this_year = [
         entry
         for entry in list_tbr_entries_with_books(db_connection, user.id)
         if entry.status == "finished" and entry.finished_at and entry.finished_at.startswith(str(year))
     ]
-    tiles = stat_tiles.build_collection_tiles(finished_this_year, date(year, 1, 1), date(year, 12, 31))
+    tile_groups = _cached_stats_tile_groups(db_connection, user, year, finished_this_year)
+
     return schemas.StatsOut(
         year=year,
         goal=_to_goal_out(goal),
         finished_count=len(finished_this_year),
-        tiles=[_to_tile_out(t) for t in tiles],
+        tile_groups=tile_groups,
     )
 
 
 @app.get("/api/calendar", response_model=schemas.CalendarOut)
 def api_calendar(
     month: str = "",
+    today: str = "",
     user: User = Depends(require_user),
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
-    cal_year, cal_month = _parse_calendar_month(month)
-    calendar_context = _calendar_context(db_connection, user.id, cal_year, cal_month)
+    resolved_today = _resolve_client_today(today)
+    cal_year, cal_month = _parse_calendar_month(month, resolved_today)
+    calendar_context = _calendar_context(db_connection, user, cal_year, cal_month, resolved_today)
     return _to_calendar_out(calendar_context, user.calendar_view_preference)
 
 
@@ -707,11 +1010,15 @@ def api_calendar(
 
 
 @app.get("/api/settings", response_model=schemas.SettingsOut)
-def api_settings(user: User = Depends(require_user), db_connection: sqlite3.Connection = Depends(get_db)):
+def api_settings(
+    today: str = "",
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
     goal = get_goal(db_connection, user.id, "year")
     return schemas.SettingsOut(
         goal=_to_goal_out(goal),
-        goal_year=datetime.now(timezone.utc).year,
+        goal_year=_resolve_client_today(today).year,
         grimmory_admin_configured=grimmory_auth.is_configured(db_connection),
         spice_labels=_spice_labels(),
         spice_level=user.spice_level,
@@ -744,11 +1051,15 @@ def api_settings_sync(
         error = "Grimmory login is not configured"
     elif payload.password:
         try:
-            access_token, refresh_token = grimmory_auth.login(user.name, payload.password)
+            access_token, refresh_token, expires_in = grimmory_auth.login(user.name, payload.password)
         except GrimmoryLoginError as exc:
             error = str(exc)
         else:
-            set_grimmory_refresh_token(db_connection, user.id, refresh_token)
+            # Locked for the same reason as /api/login - see grimmory_auth.refresh_lock.
+            with grimmory_auth.refresh_lock(user.id):
+                set_grimmory_refresh_token(db_connection, user.id, refresh_token)
+                grimmory_auth.log_token_write(user.id, refresh_token, "api_settings_sync")  # TEMPORARY
+                grimmory_auth.cache_access_token(user.id, access_token, expires_in)
     else:
         access_token = grimmory_auth.get_valid_access_token(db_connection, user)
         if access_token is None:
@@ -758,6 +1069,7 @@ def api_settings_sync(
         try:
             library_check.sync_user_reading_status(db_connection, user.id, base_url, access_token)
         except LibraryCheckUnavailable as exc:
+            grimmory_auth.evict_on_rejection(access_token, exc)
             error = str(exc)
 
     return schemas.SyncResultOut(error=error)
@@ -767,9 +1079,7 @@ def api_settings_sync(
 def api_settings_shelves(
     user: User = Depends(require_user), db_connection: sqlite3.Connection = Depends(get_db)
 ):
-    # Live Grimmory shelf list for the Settings-page dropdowns — deliberately its own route rather
-    # than folded into GET /api/settings, so a slow/unreachable Grimmory only affects this section
-    # instead of the whole settings page load.
+    # Own route rather than folded into GET /api/settings, so a slow Grimmory only affects this.
     base_url = os.environ.get(grimmory_auth.GRIMMORY_BASE_URL_ENV)
     if not base_url:
         return schemas.ShelfOptionsOut(shelves=[], error="Grimmory login is not configured")
@@ -782,6 +1092,7 @@ def api_settings_shelves(
         own_id = grimmory_auth.get_own_grimmory_user_id(base_url, access_token)
         shelves = library_check.list_own_shelves(base_url, access_token, own_id)
     except LibraryCheckUnavailable as exc:
+        grimmory_auth.evict_on_rejection(access_token, exc)
         return schemas.ShelfOptionsOut(shelves=[], error=str(exc))
 
     return schemas.ShelfOptionsOut(
@@ -799,10 +1110,8 @@ def api_settings_shelves_update(
     user: User = Depends(require_user),
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
-    # Pure local write, no live Grimmory validation call here — if a stale/foreign shelf id ever
-    # got persisted, Grimmory's own POST /api/v1/books/shelves already rejects assigning to a
-    # shelf the user doesn't own, so the next sync fails loud (self-correcting once fixed) rather
-    # than needing a second live round trip on every save.
+    # Pure local write - Grimmory itself rejects assigning to a shelf the user doesn't own, so a
+    # stale/foreign shelf id self-corrects loudly on the next sync.
     set_want_to_read_shelf_id(db_connection, user.id, payload.want_to_read_shelf_id)
     set_sync_to_device_enabled(db_connection, user.id, payload.sync_to_device_enabled)
     set_sync_to_device_shelf_id(db_connection, user.id, payload.sync_to_device_shelf_id)
@@ -851,26 +1160,37 @@ def api_settings_spice(
 # --- search ---
 
 
+def _library_search_results(
+    db_connection: sqlite3.Connection,
+    query: str,
+    *,
+    exclude_audiobooks: bool = False,
+    exclude_paired_ebooks: bool = False,
+) -> schemas.SearchOut:
+    # Shared by api_search_library and api_admin_library_search (issue #16), which need different
+    # Depends() (household login vs. reverse-proxy-gated admin) but otherwise shape results
+    # identically.
+    catalog_matches = search_library_catalog(db_connection, query)
+    if exclude_audiobooks:
+        catalog_matches = [entry for entry in catalog_matches if entry.format != "AUDIOBOOK"]
+    if exclude_paired_ebooks:
+        already_paired_ebook_ids = set(get_audiobook_pairings(db_connection).values())
+        catalog_matches = [
+            entry for entry in catalog_matches if entry.grimmory_id not in already_paired_ebook_ids
+        ]
+    return schemas.SearchOut(query=query, results=_catalog_matches_to_search_results(catalog_matches))
+
+
 @app.get("/api/search/library", response_model=schemas.SearchOut)
 def api_search_library(
     q: str = "",
     user: User = Depends(require_user),
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
-    query = q.strip()
-    catalog_matches = search_library_catalog(db_connection, query)
-    results = [
-        schemas.SearchResultOut(
-            title=entry.title,
-            author=", ".join(entry.authors) if entry.authors else None,
-            isbn=entry.isbn13 or entry.isbn10,
-            cover_url=None,
-            published_date=entry.published_date,
-            grimmory_id=entry.grimmory_id,
-        )
-        for entry in catalog_matches
-    ]
-    return schemas.SearchOut(query=query, results=results)
+    # Audiobooks are never a valid search-to-add result for a regular user - only the paired ebook
+    # (if any) is listable/searchable in BooKnook. See find_catalog_match's own audiobook guard for
+    # the parallel rule on the owned-check side.
+    return _library_search_results(db_connection, q.strip(), exclude_audiobooks=True)
 
 
 @app.get("/api/search", response_model=schemas.SearchOut)
@@ -893,10 +1213,7 @@ def api_search(
             error = True
             error_message = "Hardcover search failed — try Open Library below."
     elif query:
-        try:
-            results = search_books(query)
-        except httpx.HTTPError:
-            error = True
+        results, error = _open_library_results(query)
 
     return schemas.SearchOut(
         query=query,
@@ -910,13 +1227,7 @@ def api_search(
 @app.get("/api/search/more", response_model=schemas.SearchOut)
 def api_search_more(q: str = "", user: User = Depends(require_user)):
     query = q.strip()
-    error = False
-    results = []
-    if query:
-        try:
-            results = search_books(query)
-        except httpx.HTTPError:
-            error = True
+    results, error = _open_library_results(query) if query else ([], False)
     return schemas.SearchOut(
         query=query, results=[schemas.SearchResultOut(**vars(r)) for r in results], error=error
     )
@@ -941,10 +1252,7 @@ def api_add_to_tbr(
         published_date=payload.published_date or None,
     )
     entry = add_tbr_entry(db_connection, user.id, book.id)
-    # Fetch the real Grimmory cover in the background whenever we know the grimmory_id, even if
-    # payload.cover_url already carried a search-result placeholder (e.g. an Open Library
-    # thumbnail) - the real cover should win over that placeholder rather than waiting for the
-    # next periodic sync to notice and replace it (see library_check._has_local_cover).
+    # Fetch the real Grimmory cover in the background, overriding any search-result placeholder.
     if payload.grimmory_id:
         try:
             grimmory_id_int = int(payload.grimmory_id)
@@ -965,6 +1273,22 @@ def api_remove_from_tbr(
 ):
     entry = get_tbr_entry(db_connection, entry_id)
     if entry and entry.user_id == user.id and entry.status == "wanted":
+        # Unassign from Grimmory's Want to Read shelf too, or the next sync's additive shelf-pull
+        # (library_check.sync_user_reading_status pass 3) recreates this entry from the shelf.
+        base_url = os.environ.get(grimmory_auth.GRIMMORY_BASE_URL_ENV)
+        book = get_book(db_connection, entry.book_id)
+        if base_url and user.want_to_read_shelf_id is not None and book is not None and book.grimmory_book_id is not None:
+            access_token = grimmory_auth.get_valid_access_token(db_connection, user)
+            if access_token is not None:
+                try:
+                    library_check.assign_book_shelves(
+                        base_url,
+                        access_token,
+                        {book.grimmory_book_id},
+                        shelves_to_unassign={user.want_to_read_shelf_id},
+                    )
+                except LibraryCheckUnavailable as exc:
+                    grimmory_auth.evict_on_rejection(access_token, exc)
         remove_tbr_entry(db_connection, entry_id)
     return Response(status_code=204)
 
@@ -988,10 +1312,7 @@ def api_set_tbr_dates(
 
     finished_at_value = payload.finished_at.strip() or None
     if entry.status == "finished" and finished_at_value:
-        try:
-            finished_date = date.fromisoformat(finished_at_value)
-        except ValueError:
-            finished_date = None
+        finished_date = dates.parse_date(finished_at_value)
         if finished_date is not None:
             set_tbr_entry_finished_at(
                 db_connection, entry_id, f"{finished_date.isoformat()}T00:00:00+00:00"
@@ -1001,14 +1322,253 @@ def api_set_tbr_dates(
             if base_url and book is not None and book.grimmory_book_id is not None:
                 access_token = grimmory_auth.get_valid_access_token(db_connection, user)
                 if access_token is not None:
-                    with contextlib.suppress(LibraryCheckUnavailable):
+                    try:
                         grimmory_auth.update_book_finished_date(
                             base_url, access_token, book.grimmory_book_id, finished_date
                         )
+                    except LibraryCheckUnavailable as exc:
+                        grimmory_auth.evict_on_rejection(access_token, exc)
     elif entry.status == "finished":
         set_tbr_entry_finished_at(db_connection, entry_id, None)
 
     return _to_entry_out(_find_entry_detail(db_connection, user.id, entry_id))
+
+
+@app.post("/api/tbr/{entry_id}/physical", response_model=schemas.TBREntryOut)
+def api_set_tbr_physical(
+    entry_id: int,
+    payload: schemas.TBRPhysicalIn,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    entry = get_tbr_entry(db_connection, entry_id)
+    if entry is None or entry.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Not found")
+    set_tbr_entry_owns_physical(db_connection, entry_id, payload.owns_physical)
+    return _to_entry_out(_find_entry_detail(db_connection, user.id, entry_id))
+
+
+@app.post("/api/tbr/{entry_id}/physical-page-count", response_model=schemas.TBREntryOut)
+def api_set_tbr_physical_page_count(
+    entry_id: int,
+    payload: schemas.TBRPhysicalPageCountIn,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    entry = get_tbr_entry(db_connection, entry_id)
+    if entry is None or entry.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Not found")
+    if payload.physical_page_count is not None and payload.physical_page_count <= 0:
+        raise HTTPException(status_code=422, detail="physical_page_count must be a positive integer")
+    set_tbr_entry_physical_page_count(db_connection, entry_id, payload.physical_page_count)
+    return _to_entry_out(_find_entry_detail(db_connection, user.id, entry_id))
+
+
+def _to_physical_session_out(session) -> schemas.PhysicalReadingSessionOut:
+    return schemas.PhysicalReadingSessionOut(
+        id=session.id,
+        start_time=session.start_time,
+        end_time=session.end_time,
+        start_page=session.start_page,
+        end_page=session.end_page,
+    )
+
+
+def _validate_physical_session(payload: schemas.PhysicalReadingSessionIn) -> None:
+    start = dates.parse_instant(payload.start_time)
+    end = dates.parse_instant(payload.end_time)
+    if start is None or end is None:
+        raise HTTPException(status_code=422, detail="start_time/end_time must be valid timestamps")
+    if end <= start:
+        raise HTTPException(status_code=422, detail="end_time must be after start_time")
+    if payload.start_page < 0 or payload.end_page <= payload.start_page:
+        raise HTTPException(status_code=422, detail="end_page must be > start_page >= 0")
+
+
+@app.get(
+    "/api/tbr/{entry_id}/physical-sessions",
+    response_model=list[schemas.PhysicalReadingSessionOut],
+)
+def api_list_physical_reading_sessions(
+    entry_id: int,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    entry = get_tbr_entry(db_connection, entry_id)
+    if entry is None or entry.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Not found")
+    return [_to_physical_session_out(s) for s in list_physical_reading_sessions(db_connection, entry_id)]
+
+
+@app.post(
+    "/api/tbr/{entry_id}/physical-sessions",
+    response_model=schemas.PhysicalReadingSessionOut,
+    status_code=201,
+)
+def api_add_physical_reading_session(
+    entry_id: int,
+    payload: schemas.PhysicalReadingSessionIn,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    entry = get_tbr_entry(db_connection, entry_id)
+    if entry is None or entry.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Not found")
+    _validate_physical_session(payload)
+    session = add_physical_reading_session(
+        db_connection, entry_id, payload.start_time, payload.end_time, payload.start_page, payload.end_page
+    )
+    return _to_physical_session_out(session)
+
+
+@app.post(
+    "/api/tbr/{entry_id}/physical-sessions/{session_id}",
+    response_model=schemas.PhysicalReadingSessionOut,
+)
+def api_update_physical_reading_session(
+    entry_id: int,
+    session_id: int,
+    payload: schemas.PhysicalReadingSessionIn,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    entry = get_tbr_entry(db_connection, entry_id)
+    if entry is None or entry.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Not found")
+    session = get_physical_reading_session(db_connection, session_id)
+    if session is None or session.entry_id != entry_id:
+        raise HTTPException(status_code=404, detail="Not found")
+    _validate_physical_session(payload)
+    update_physical_reading_session(
+        db_connection, session_id, payload.start_time, payload.end_time, payload.start_page, payload.end_page
+    )
+    return _to_physical_session_out(get_physical_reading_session(db_connection, session_id))
+
+
+@app.post("/api/tbr/{entry_id}/physical-sessions/{session_id}/remove", status_code=204)
+def api_remove_physical_reading_session(
+    entry_id: int,
+    session_id: int,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    entry = get_tbr_entry(db_connection, entry_id)
+    if entry is None or entry.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Not found")
+    session = get_physical_reading_session(db_connection, session_id)
+    if session is not None and session.entry_id == entry_id:
+        delete_physical_reading_session(db_connection, session_id)
+    return Response(status_code=204)
+
+
+# --- session log ---
+
+
+# Function Name: _session_log_for_entry
+# Description: Merges ebook + audiobook (from cached_reading_sessions - already kept warm by
+#   library_check.get_or_fetch_reading_sessions on every book-detail/stats load, so this never
+#   calls Grimmory itself) and physical sessions into one newest-first log. `pages` uses the same
+#   estimation stat_tiles.build_collection_tiles's "Avg pages read" relies on
+#   (stat_tiles.session_page_delta) - exact for physical, an estimate for ebook, always None for
+#   audiobook (no page concept).
+# Parameters:
+# - db_connection: Database connection.
+# - entry_id (int): Local TBR entry id.
+# - page_count (Optional[int]): The book's own page count, for the ebook pages estimate.
+# Returns: Session log rows (list[schemas.SessionLogEntryOut]), newest first.
+def _session_log_for_entry(
+    db_connection, entry_id: int, page_count: Optional[int]
+) -> list[schemas.SessionLogEntryOut]:
+    rows: list[schemas.SessionLogEntryOut] = []
+    for book_type, source in (("EBOOK", "ebook"), ("AUDIOBOOK", "audiobook")):
+        for s in list_cached_reading_sessions(db_connection, entry_id, book_type):
+            pages = stat_tiles.session_page_delta(s, page_count) if source == "ebook" else None
+            rows.append(
+                schemas.SessionLogEntryOut(
+                    source=source,
+                    id=s["id"],
+                    start_time=s["startTime"],
+                    end_time=s.get("endTime"),
+                    duration_seconds=s.get("durationSeconds"),
+                    end_progress=s.get("endProgress"),
+                    progress_delta=s.get("progressDelta"),
+                    pages=round(pages) if pages is not None else None,
+                )
+            )
+    for p in list_physical_reading_sessions(db_connection, entry_id):
+        rows.append(
+            schemas.SessionLogEntryOut(
+                source="physical",
+                id=p.id,
+                start_time=p.start_time,
+                end_time=p.end_time,
+                start_page=p.start_page,
+                end_page=p.end_page,
+                pages=p.end_page - p.start_page,
+            )
+        )
+    # Grimmory instants and physical sessions' own ISO instants (frontend's .toISOString()) sort
+    # correctly as plain strings - no need to parse them first.
+    rows.sort(key=lambda r: r.start_time, reverse=True)
+    return rows
+
+
+@app.get("/api/tbr/{entry_id}/sessions", response_model=list[schemas.SessionLogEntryOut])
+def api_session_log(
+    entry_id: int,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    entry = get_tbr_entry(db_connection, entry_id)
+    if entry is None or entry.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Not found")
+    book = get_book(db_connection, entry.book_id)
+    return _session_log_for_entry(db_connection, entry_id, book.page_count if book else None)
+
+
+@app.post("/api/tbr/{entry_id}/sessions/{source}/{session_id}/remove", status_code=204)
+def api_remove_session_log_entry(
+    entry_id: int,
+    source: str,
+    session_id: int,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    entry = get_tbr_entry(db_connection, entry_id)
+    if entry is None or entry.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Not found")
+    if source == "physical":
+        session = get_physical_reading_session(db_connection, session_id)
+        if session is not None and session.entry_id == entry_id:
+            delete_physical_reading_session(db_connection, session_id)
+    elif source in ("ebook", "audiobook"):
+        # Soft-delete only - Grimmory has no session edit/delete API (confirmed empirically), so
+        # this can only exclude the session locally, never fix it upstream. Never resurrected by a
+        # future resync (models.add_cached_reading_sessions never touches an existing row).
+        soft_delete_cached_reading_session(db_connection, entry_id, session_id, source.upper())
+    else:
+        raise HTTPException(status_code=422, detail="Invalid source")
+    return Response(status_code=204)
+
+
+@app.post("/api/tbr/{entry_id}/sessions/group", response_model=list[schemas.SessionLogEntryOut])
+def api_group_duplicate_sessions(
+    entry_id: int,
+    user: User = Depends(require_user),
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    # Restricted to "finished" entries only - a still-"reading" book can have a burst split across
+    # multiple live fetches (get_or_fetch_reading_sessions keeps upserting new session ids as they
+    # arrive), so merging mid-stream risks collapsing an incomplete stretch. "Finished" never
+    # fetches again, so whatever's cached is permanently the final, complete picture.
+    entry = get_tbr_entry(db_connection, entry_id)
+    if entry is None or entry.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Not found")
+    if entry.status != "finished":
+        raise HTTPException(status_code=400, detail="Only finished books can be grouped")
+    group_duplicate_reading_sessions(db_connection, entry_id)
+    book = get_book(db_connection, entry.book_id)
+    return _session_log_for_entry(db_connection, entry_id, book.page_count if book else None)
 
 
 # --- preferences ---
@@ -1048,32 +1608,31 @@ def api_admin(db_connection: sqlite3.Connection = Depends(get_db)):
     sync_state = None
     needed_entries = [_requested_row(e) for e in aggregate_entries]
     owned_entries = []
+    audiobook_entries = []
     if library_check_enabled:
         catalog = get_library_catalog(db_connection)
         sync_state = get_library_sync_state(db_connection)
 
-        # "In library" shows the whole catalog (not just requested-and-owned books), so
-        # browsing it doesn't depend on someone having added a book to their TBR first —
-        # carrying over wanted_by wherever a catalog entry does happen to also be requested.
+        # "In library" shows the whole catalog, not just requested-and-owned books.
         wanted_by_for_catalog: dict[int, list[str]] = {}
         needed_entries = []
         manual_owned_rows = []
-        # id(match) of catalog entries already represented via a manual-match row below, so the
-        # plain catalog pass doesn't also show them (each catalog entry appears exactly once).
+        manual_audiobook_rows = []
+        # Catalog entries already shown via a manual-match row below - skip in the plain pass.
         represented_catalog_ids: set[int] = set()
         for entry in aggregate_entries:
             match = library_check.resolve_catalog_match(entry.book, catalog)
             if match is None:
                 needed_entries.append(_requested_row(entry))
             elif entry.book.manual_match_grimmory_id is not None:
-                # Manually matched: render using the book's own stored title/author/cover — this
-                # is admin-asserted certainty, not re-derived from a possibly differently-titled
-                # catalog row (see _catalog_row for the auto-match path, which does use the
-                # catalog row's own fields).
+                # Manually matched: render using the book's own stored title/author/cover.
                 row = _requested_row(entry)
                 row["grimmory_id"] = match.grimmory_id
                 row["manually_matched"] = True
-                manual_owned_rows.append(row)
+                if match.format == "AUDIOBOOK":
+                    manual_audiobook_rows.append(row)
+                else:
+                    manual_owned_rows.append(row)
                 represented_catalog_ids.add(id(match))
             else:
                 wanted_by_for_catalog[id(match)] = entry.wanted_by
@@ -1081,14 +1640,28 @@ def api_admin(db_connection: sqlite3.Connection = Depends(get_db)):
         catalog_rows = [
             _catalog_row(c, wanted_by_for_catalog.get(id(c), []))
             for c in catalog
-            if id(c) not in represented_catalog_ids
+            if id(c) not in represented_catalog_ids and c.format != "AUDIOBOOK"
+        ]
+        audiobook_catalog_rows = [
+            _catalog_row(c, wanted_by_for_catalog.get(id(c), []))
+            for c in catalog
+            if id(c) not in represented_catalog_ids and c.format == "AUDIOBOOK"
         ]
         owned_entries = sorted(
             manual_owned_rows + catalog_rows, key=lambda row: (row["title"] or "").casefold()
         )
+        audiobook_entries = sorted(
+            manual_audiobook_rows + audiobook_catalog_rows,
+            key=lambda row: (row["title"] or "").casefold(),
+        )
+        pairings = get_audiobook_pairings(db_connection)
+        title_by_grimmory_id = {c.grimmory_id: c.title for c in catalog if c.grimmory_id is not None}
+        for row in audiobook_entries:
+            row["paired_ebook_title"] = title_by_grimmory_id.get(pairings.get(row["grimmory_id"]))
     return schemas.AdminOut(
         needed_entries=[schemas.AdminEntryOut(**row) for row in needed_entries],
         owned_entries=[schemas.AdminEntryOut(**row) for row in owned_entries],
+        audiobook_entries=[schemas.AdminEntryOut(**row) for row in audiobook_entries],
         library_check_enabled=library_check_enabled,
         last_synced_at=sync_state.last_synced_at if sync_state else None,
         last_error=sync_state.last_error if sync_state else None,
@@ -1103,24 +1676,17 @@ async def api_admin_library_sync():
 
 
 @app.get("/api/admin/library-search", response_model=schemas.SearchOut)
-def api_admin_library_search(q: str = "", db_connection: sqlite3.Connection = Depends(get_db)):
-    # Ungated sibling of GET /api/search/library (which requires a household-user login) — the
-    # match picker needs to work for an admin who isn't also logged into the app itself, matching
-    # every other /api/admin/* route's reverse-proxy-gated-not-in-app-gated posture.
-    query = q.strip()
-    catalog_matches = search_library_catalog(db_connection, query)
-    results = [
-        schemas.SearchResultOut(
-            title=entry.title,
-            author=", ".join(entry.authors) if entry.authors else None,
-            isbn=entry.isbn13 or entry.isbn10,
-            cover_url=None,
-            published_date=entry.published_date,
-            grimmory_id=entry.grimmory_id,
-        )
-        for entry in catalog_matches
-    ]
-    return schemas.SearchOut(query=query, results=results)
+def api_admin_library_search(
+    q: str = "", exclude_audiobooks: bool = False, db_connection: sqlite3.Connection = Depends(get_db)
+):
+    # Ungated sibling of GET /api/search/library, for an admin not logged into the app itself.
+    # exclude_audiobooks (used by the pairing picker) also excludes ebooks already paired.
+    return _library_search_results(
+        db_connection,
+        q.strip(),
+        exclude_audiobooks=exclude_audiobooks,
+        exclude_paired_ebooks=exclude_audiobooks,
+    )
 
 
 @app.post("/api/admin/books/{book_id}/match", status_code=204)
@@ -1134,16 +1700,20 @@ def api_admin_match_book(
         raise HTTPException(status_code=404, detail="Not found")
 
     if payload.grimmory_id is None:
-        # Unmatch: clear the pin, then recompute grimmory_book_id from whatever the fuzzy matcher
-        # says right now (or None) — never leaves a stale manually-forced id behind. Both columns
-        # are written in one UPDATE (see set_book_manual_match_and_grimmory_id) so a crash between
-        # them can't leave the pin cleared but the old forced id still in place, or vice versa.
+        # Unmatch: clear the pin and recompute grimmory_book_id from the fuzzy matcher (or None).
         catalog = get_library_catalog(db_connection)
         fallback = library_check.find_catalog_match(book.title, book.isbn, book.author, catalog)
         set_book_manual_match_and_grimmory_id(
             db_connection, book_id, None, fallback.grimmory_id if fallback else None
         )
         return Response(status_code=204)
+
+    target = _catalog_by_grimmory_id(db_connection).get(payload.grimmory_id)
+    if target is not None and target.format == "AUDIOBOOK":
+        raise HTTPException(
+            status_code=422,
+            detail="Cannot match to an audiobook edition - use the audiobook pairing screen instead",
+        )
 
     owner_id = library_check.find_owning_book_id(
         db_connection, payload.grimmory_id, exclude_book_id=book_id
@@ -1154,6 +1724,41 @@ def api_admin_match_book(
         raise HTTPException(status_code=409, detail=detail)
 
     set_book_manual_match_and_grimmory_id(db_connection, book_id, payload.grimmory_id, payload.grimmory_id)
+    return Response(status_code=204)
+
+
+@app.post("/api/admin/audiobooks/{audiobook_grimmory_id}/pair", status_code=204)
+def api_admin_pair_audiobook(
+    audiobook_grimmory_id: int,
+    payload: schemas.AdminPairAudiobookIn,
+    db_connection: sqlite3.Connection = Depends(get_db),
+):
+    catalog_by_id = _catalog_by_grimmory_id(db_connection)
+
+    audiobook_entry = catalog_by_id.get(audiobook_grimmory_id)
+    if audiobook_entry is None or audiobook_entry.format != "AUDIOBOOK":
+        raise HTTPException(status_code=404, detail="Not an audiobook in the current catalog")
+
+    if payload.ebook_grimmory_id is None:
+        clear_audiobook_pairing(db_connection, audiobook_grimmory_id)
+        # Dual-write during the DESIGN-multi-edition-refactor.md Phase 1-3 transition - see
+        # linked_editions in app/models.py. Remove once Phase 3 retires audiobook_pairings.
+        clear_linked_edition(db_connection, audiobook_grimmory_id)
+        return Response(status_code=204)
+
+    ebook_entry = catalog_by_id.get(payload.ebook_grimmory_id)
+    if ebook_entry is None:
+        raise HTTPException(status_code=404, detail="Ebook not found in the current catalog")
+    if ebook_entry.format == "AUDIOBOOK":
+        raise HTTPException(status_code=422, detail="Cannot pair to another audiobook")
+
+    # linked_editions first - its UNIQUE(ebook_grimmory_id, format) can reject this pairing;
+    # audiobook_pairings has no such constraint.
+    try:
+        set_linked_edition(db_connection, audiobook_grimmory_id, payload.ebook_grimmory_id, "AUDIOBOOK")
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=422, detail="This ebook already has a different audiobook linked")
+    set_audiobook_pairing(db_connection, audiobook_grimmory_id, payload.ebook_grimmory_id)
     return Response(status_code=204)
 
 
@@ -1188,7 +1793,7 @@ def api_admin_settings_save(
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
     existing = get_library_settings(db_connection)
-    resolved_password = payload.password or (existing.password if existing else None)
+    resolved_password = _keep_if_blank(payload.password, existing.password if existing else None)
     set_library_settings(
         db_connection,
         base_url=payload.base_url or None,
@@ -1205,7 +1810,7 @@ def api_admin_settings_save_hardcover(
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
     existing = get_search_settings(db_connection)
-    resolved_key = payload.hardcover_api_key or (existing.hardcover_api_key if existing else None)
+    resolved_key = _keep_if_blank(payload.hardcover_api_key, existing.hardcover_api_key if existing else None)
     set_search_settings(db_connection, hardcover_api_key=resolved_key)
     return api_admin_settings(db_connection)
 
@@ -1216,7 +1821,7 @@ def api_admin_settings_save_grimmory_admin(
     db_connection: sqlite3.Connection = Depends(get_db),
 ):
     existing = get_grimmory_admin_settings(db_connection)
-    resolved_password = payload.password or (existing.password if existing else None)
+    resolved_password = _keep_if_blank(payload.password, existing.password if existing else None)
     set_grimmory_admin_settings(
         db_connection, username=payload.username or None, password=resolved_password
     )

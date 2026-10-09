@@ -1,11 +1,8 @@
 """Pydantic response models for the JSON API (see the /api/* routes in app/main.py).
 
-These mirror the plain dataclasses in app/models.py and the ad hoc dicts the stat_tiles/
-reading_calendar helpers already return — the API layer's job is to give those a stable, typed
-shape for the frontend, not to change what they contain. Secrets (grimmory_refresh_token, stored
-passwords/API keys) are deliberately never included — settings responses only ever expose whether
-a secret is set, matching what the Jinja2 admin_settings.html template already showed.
-"""
+Mirrors the dataclasses in app/models.py and the ad hoc dicts stat_tiles/reading_calendar return,
+giving them a stable typed shape for the frontend. Secrets (grimmory_refresh_token, stored
+passwords/API keys) are never included — settings responses only ever expose whether one is set."""
 
 from __future__ import annotations
 
@@ -42,10 +39,42 @@ class TBREntryOut(BaseModel):
     added_at: str
     book: BookOut
     owned: Optional[bool] = None
+    has_paired_audiobook: Optional[bool] = None
     finished_at: Optional[str] = None
     started_at: Optional[str] = None
     started_at_manual: bool = False
     rating: Optional[int] = None
+    owns_physical: bool = False
+    physical_page_count: Optional[int] = None
+    predicted_month: Optional[str] = None
+
+
+class PhysicalReadingSessionOut(BaseModel):
+    id: int
+    start_time: str
+    end_time: str
+    start_page: int
+    end_page: int
+
+
+class SessionLogEntryOut(BaseModel):
+    """One row of the book detail page's merged, newest-first session log - ebook/audiobook rows
+    come from cached_reading_sessions (id is Grimmory's own session id), physical rows from
+    physical_reading_sessions (id is that table's own id). `source` disambiguates the id space for
+    the delete action, since the two are otherwise unrelated integers. `pages` is exact for
+    physical (end_page - start_page), an estimate from progress_delta * book.page_count for ebook
+    (same method as stat_tiles.session_page_delta), and always None for audiobook - Grimmory
+    never tracks audiobook position in pages."""
+    source: str  # "ebook" | "audiobook" | "physical"
+    id: int
+    start_time: str
+    end_time: Optional[str] = None
+    duration_seconds: Optional[int] = None
+    end_progress: Optional[float] = None
+    progress_delta: Optional[float] = None
+    start_page: Optional[int] = None
+    end_page: Optional[int] = None
+    pages: Optional[int] = None
 
 
 class ShelfOut(BaseModel):
@@ -70,11 +99,17 @@ class StatTileOut(BaseModel):
     sub: Optional[str] = None
 
 
+class StatTileGroupsOut(BaseModel):
+    overview: list[StatTileOut]
+    averages: list[StatTileOut]
+    highlights: list[StatTileOut]
+
+
 class StatsOut(BaseModel):
     year: int
     goal: Optional[GoalOut] = None
     finished_count: int
-    tiles: list[StatTileOut]
+    tile_groups: StatTileGroupsOut
 
 
 class BurndownPointOut(BaseModel):
@@ -84,7 +119,10 @@ class BurndownPointOut(BaseModel):
 
 class BookDetailOut(BaseModel):
     entry: TBREntryOut
+    # Time-spent-by-medium tiles stay split (Decision 6); audiobook_tiles is empty if unpaired.
     tiles: list[StatTileOut]
+    audiobook_tiles: list[StatTileOut] = []
+    # Progress and burndown are unified across every linked edition instead (Decision 5).
     burndown: list[BurndownPointOut]
     burndown_day_span: int
     progress_percent: Optional[float] = None
@@ -113,11 +151,10 @@ class BookSpanOut(BaseModel):
 
 
 class DayCellOut(BaseModel):
-    """active/cover/bar mirror reading_calendar.DayCell's active_spans/cover_spans/bar_spans —
-    same precedence (declutter, milestone ranking, lane-gap None-padding) already computed
-    server-side, just referencing spans by entry_id instead of embedding BookSpan objects.
-    bar_entry_ids preserves interior None gaps (an unoccupied lane below a higher occupied one);
-    it is never trimmed to a shorter list than the highest occupied lane + 1."""
+    """active/cover/bar mirror reading_calendar.DayCell's active_spans/cover_spans/bar_spans,
+    computed server-side and referenced here by entry_id instead of embedding BookSpan objects.
+    bar_entry_ids preserves interior None gaps — never trimmed shorter than the highest occupied
+    lane + 1."""
 
     date: date
     in_month: bool
@@ -163,13 +200,9 @@ class SettingsOut(BaseModel):
     grimmory_admin_configured: bool
     spice_labels: list[str]
     spice_level: int
-    # Whether the user has a stored Grimmory refresh token (see models.User.grimmory_refresh_token)
-    # — never the token itself. Settings.html's Jinja2 equivalent checked `user.grimmory_refresh_token`
-    # directly to decide whether /settings/sync needs a password field; this is that same check
-    # exposed as a plain boolean instead of the secret.
+    # Whether a Grimmory refresh token is stored - never the token itself.
     has_grimmory_session: bool
-    # Persisted Grimmory shelf ids only — no live Grimmory call happens for this route (see
-    # GET /api/settings/shelves for the live shelf-list fetch that powers the settings dropdowns).
+    # Persisted shelf ids only - GET /api/settings/shelves does the live shelf-list fetch.
     want_to_read_shelf_id: Optional[int] = None
     sync_to_device_enabled: bool = False
     sync_to_device_shelf_id: Optional[int] = None
@@ -186,8 +219,7 @@ class ShelfOptionOut(BaseModel):
 
 class ShelfOptionsOut(BaseModel):
     shelves: list[ShelfOptionOut]
-    # "reconnect_needed" | a not-configured message | a LibraryCheckUnavailable message — same
-    # soft-error convention as SyncResultOut/SpiceResultOut (always 200, never raised).
+    # "reconnect_needed" | not-configured | a LibraryCheckUnavailable message - always 200, never raised.
     error: Optional[str] = None
 
 
@@ -203,23 +235,24 @@ class SpiceResultOut(BaseModel):
 
 
 class AdminEntryOut(BaseModel):
-    # Book id — always set for needed_entries; set for owned_entries only when the row came from a
-    # manual match (drives the Unmatch action). None for a pure catalog row / auto-match.
+    # Set for owned_entries only when the row came from a manual match (drives Unmatch).
     id: Optional[int] = None
     title: str
     author: Optional[str] = None
     cover_url: Optional[str] = None
     wanted_by: list[str]
-    # Grimmory's own catalog id — always set for owned_entries, never set for needed_entries (a
-    # needed entry has no match yet).
+    # Grimmory's own catalog id - unset for needed_entries (no match yet).
     grimmory_id: Optional[int] = None
-    # True only for an owned_entries row sourced from an admin manual match, not an auto-match.
     manually_matched: bool = False
+    # Set only on an audiobook_entries row that's been paired to an ebook - see AdminPairAudiobookIn.
+    paired_ebook_title: Optional[str] = None
 
 
 class AdminOut(BaseModel):
     needed_entries: list[AdminEntryOut]
     owned_entries: list[AdminEntryOut]
+    # In-library audiobooks, split out from owned_entries (see library_check.AUDIOBOOKS_ENABLED).
+    audiobook_entries: list[AdminEntryOut]
     library_check_enabled: bool
     last_synced_at: Optional[str] = None
     last_error: Optional[str] = None
@@ -245,9 +278,8 @@ class AdminSettingsOut(BaseModel):
 
 
 # --- request bodies ---
-# JSON bodies for the /api/* routes, mirroring the Form(...) fields their HTML-route counterparts
-# take. A blank/omitted string on a "keep current secret unless replaced" field (password, API
-# key) means the same thing here as an empty Form field does today: leave it unchanged.
+# JSON bodies for the /api/* routes. A blank/omitted secret field (password, API key) means
+# "leave it unchanged".
 
 
 class LoginIn(BaseModel):
@@ -269,6 +301,10 @@ class SyncIn(BaseModel):
 
 class SpiceIn(BaseModel):
     level: int
+
+
+class AdminPairAudiobookIn(BaseModel):
+    ebook_grimmory_id: Optional[int] = None
 
 
 class AdminMatchIn(BaseModel):
@@ -294,6 +330,24 @@ class TBRCreateIn(BaseModel):
 class TBRDatesIn(BaseModel):
     started_at: str = ""
     finished_at: str = ""
+
+
+class TBRPhysicalIn(BaseModel):
+    owns_physical: bool
+
+
+class TBRPhysicalPageCountIn(BaseModel):
+    # None clears it - unlike the secret-settings "blank means unchanged" convention elsewhere,
+    # this field has no other way to signal "I know it and it's actually unset" vs "leave it alone",
+    # so this endpoint always overwrites with whatever's sent, no leave-unchanged semantics.
+    physical_page_count: Optional[int] = None
+
+
+class PhysicalReadingSessionIn(BaseModel):
+    start_time: str
+    end_time: str
+    start_page: int
+    end_page: int
 
 
 class ReorderIn(BaseModel):

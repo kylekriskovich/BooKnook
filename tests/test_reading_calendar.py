@@ -307,11 +307,10 @@ def test_month_spans_gives_concurrently_overlapping_spans_different_lanes():
 
 
 def test_bar_spans_keeps_a_continuing_span_in_a_stable_lane_across_a_mid_span_collision():
-    # Reported bug: book 2 runs Jul 1-5; book 1 is an unrelated same-day read on Jul 3 only. Under
-    # the old book-id-ordered slice, book 2 sat in slot 0 on Jul 1-2/4-5 but got bumped to slot 1
-    # on Jul 3 (book 1 sorts first by id) — its bridging bar segments ended up at two different
-    # heights either side of that jump, rendering as a doubled/broken line instead of one
-    # continuous one. With lane assignment, book 2 (the earlier-starting span) always owns lane 0.
+    # Reported bug: book 2 (Jul 1-5) sat in slot 0 except on Jul 3, where an unrelated same-day
+    # read (book 1) sorted first by id and bumped it to slot 1 - its bar rendered as a
+    # doubled/broken line instead of one continuous one. With lane assignment, book 2 always owns
+    # lane 0.
     entries = [
         _entry(2, "finished", started_at="2026-07-01", finished_at="2026-07-05T00:00:00Z"),
         _entry(1, "finished", started_at="2026-07-03", finished_at="2026-07-03T00:00:00Z"),
@@ -346,13 +345,10 @@ def test_bar_spans_caps_at_three_lowest_lanes():
 
 
 def test_bar_spans_pads_a_gap_so_a_higher_lane_never_shifts_row():
-    # Reported bug (real-world case): book 1 (Jul 1-5) forces book 2 (Jul 5-14, the long one) into
-    # lane 1, since they share Jul 5. Book 3 (Jul 14-16) then reuses lane 0 on Jul 14, the day
-    # book 2 ends. On Jul 6-13, book 2 is the *only* active span — without padding, it would
-    # render at index 0 (compacting up) on those lone days and index 1 (its real lane) on Jul 5
-    # and Jul 14, visually jumping row right at both ends of its own run. Index 1 must hold book 2
-    # on every single day it's active, with index 0 a None placeholder whenever nothing else
-    # shares that day.
+    # Reported bug: book 2 (Jul 5-14) is forced into lane 1 by book 1 sharing Jul 5, then book 3
+    # reuses lane 0 on Jul 14. On the lone days between (Jul 6-13), book 2 must still render at
+    # index 1 rather than compacting to index 0, or its row visually jumps at both ends of its
+    # run - index 0 stays a None placeholder whenever nothing else shares that day.
     entries = [
         _entry(1, "finished", started_at="2026-07-01", finished_at="2026-07-05T00:00:00Z"),
         _entry(2, "finished", started_at="2026-07-05", finished_at="2026-07-14T00:00:00Z"),
@@ -379,12 +375,9 @@ def test_bar_spans_pads_a_gap_so_a_higher_lane_never_shifts_row():
 
 
 def test_bar_spans_hides_a_decluttered_span_not_just_its_cover():
-    # Reported bug (real-world case): "Red Seas Under Red Skies" finishes Jul 24; "Artificial
-    # Condition" starts Jul 24 too and finishes Jul 25 (a 2-day read) — a fanned, non-winner,
-    # short start, so its *cover* is decluttered off Jul 24 by cover_spans. Its bar used to still
-    # render there anyway, appearing as an unexplained second line with no cover to justify it —
-    # reading as a stray duplicate connector rather than a second book. The bar must be hidden
-    # too, on exactly the day the cover is, and show normally from its own finish day onward.
+    # Reported bug: a fanned, non-winner, short-start book has its *cover* decluttered off its
+    # start day, but its bar used to still render there as an unexplained second line. The bar
+    # must be hidden on exactly the day the cover is, then show normally from its own finish day.
     entries = [
         _entry(1, "finished", started_at="2026-07-17", finished_at="2026-07-24T00:00:00Z"),
         _entry(2, "finished", started_at="2026-07-24", finished_at="2026-07-25T00:00:00Z"),

@@ -26,11 +26,9 @@
 		return span.start === cell.date ? 'right' : 'left';
 	}
 
-	// A bar bridges into the neighboring cell whenever that same book's bar is also rendered
-	// there — mirrors app/templates/_calendar_section.html's `span in prev_cell.bar_spans` check
-	// (membership anywhere in the neighbor's bars, not just the same lane index) — and never
-	// across a row wrap or a greyed-out (out-of-month) day on either side. See DayCellOut's
-	// docstring in app/schemas.py for why bar_entry_ids can have interior null gaps.
+	// A bar bridges into the neighboring cell whenever that book's bar also appears there, never
+	// across a row wrap or a greyed-out (out-of-month) day. See DayCellOut in app/schemas.py for
+	// why bar_entry_ids can have interior null gaps.
 	function connectsLeft(entryId: number): boolean {
 		return cell.in_month && !!prevCell?.in_month && prevCell.bar_entry_ids.includes(entryId);
 	}

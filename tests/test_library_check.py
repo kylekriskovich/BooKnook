@@ -1,3 +1,5 @@
+import datetime as dt
+
 import httpx
 import pytest
 
@@ -210,6 +212,22 @@ def test_fetch_catalog_parses_books(conn, configured_settings, monkeypatch):
     assert fake_client.get_calls[0]["headers"] == {"Authorization": "Bearer t"}
 
 
+def test_fetch_catalog_captures_format_from_primary_file(conn, configured_settings, monkeypatch):
+    books_payload = [
+        {"id": 33, "metadata": {"title": "Dune"}, "primaryFile": {"bookType": "EPUB"}},
+        {"id": 34, "metadata": {"title": "Dune (Audiobook)"}, "primaryFile": {"bookType": "AUDIOBOOK"}},
+        {"id": 35, "metadata": {"title": "No primary file"}},
+    ]
+    fake_client = FakeClient(books_payload=books_payload)
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+
+    catalog = library_check.fetch_catalog(conn)
+
+    assert catalog[0].format == "EPUB"
+    assert catalog[1].format == "AUDIOBOOK"
+    assert catalog[2].format is None
+
+
 def test_fetch_catalog_raises_on_login_failure(conn, configured_settings, monkeypatch):
     fake_client = FakeClient(login_status=401)
     monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
@@ -354,6 +372,48 @@ def test_resolve_catalog_match_pin_missing_from_catalog_returns_none():
     )
 
     assert library_check.resolve_catalog_match(book, catalog) is None
+
+
+def test_resolve_catalog_match_trusts_known_grimmory_book_id_over_fuzzy_scan():
+    catalog = [_catalog_entry(title="Dune", grimmory_id=42)]
+    # Title/author don't fuzzy-match anything in the catalog - only the known id can find it.
+    book = models.Book(
+        id=1, title="Some Totally Different Title", author="Nobody", isbn=None, cover_url=None,
+        grimmory_book_id=42,
+    )
+
+    match = library_check.resolve_catalog_match(book, catalog)
+
+    assert match is not None and match.grimmory_id == 42
+
+
+def test_resolve_catalog_match_manual_pin_wins_over_grimmory_book_id():
+    catalog = [
+        _catalog_entry(title="Dune", grimmory_id=42),
+        _catalog_entry(title="Dune Messiah", grimmory_id=43),
+    ]
+    book = models.Book(
+        id=1, title="Dune", author="Frank Herbert", isbn=None, cover_url=None,
+        grimmory_book_id=42, manual_match_grimmory_id=43,
+    )
+
+    match = library_check.resolve_catalog_match(book, catalog)
+
+    assert match is not None and match.grimmory_id == 43
+
+
+def test_resolve_catalog_match_falls_back_to_fuzzy_when_known_id_no_longer_resolves():
+    catalog = [_catalog_entry(title="Dune", grimmory_id=42)]
+    # grimmory_book_id=99 isn't in the (fresh) catalog anymore - falls through to a real re-match
+    # instead of reporting unowned, so a re-uploaded/re-ided book is still found.
+    book = models.Book(
+        id=1, title="Dune", author="Frank Herbert", isbn=None, cover_url=None,
+        grimmory_book_id=99,
+    )
+
+    match = library_check.resolve_catalog_match(book, catalog)
+
+    assert match is not None and match.grimmory_id == 42
 
 
 def test_find_owning_book_id_detects_manual_pin_conflict(conn):
@@ -545,6 +605,38 @@ def test_sync_all_user_reading_status_one_user_failure_does_not_block_others(con
     assert synced == [ok_user.id]
 
 
+# --- _apply_status ---
+
+
+def test_apply_status_reading_fallback_stores_full_instant_not_bare_date(conn):
+    # Regression test: _apply_status used to store datetime.now(timezone.utc).date().isoformat()
+    # for the "reading" started_at fallback, permanently truncating away the time-of-day/offset -
+    # instant_to_local_date can no longer correct for the user's real timezone once that's gone.
+    book = models.create_book(conn, title="Dune", author="Frank Herbert")
+    user = models.get_or_create_user(conn, "alice")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="wanted")
+
+    library_check._apply_status(conn, entry.id, "wanted", None, "reading", {})
+
+    updated = models.get_tbr_entry(conn, entry.id)
+    assert updated.started_at is not None
+    assert "T" in updated.started_at  # a real instant, not a bare "YYYY-MM-DD"
+    parsed = dt.datetime.fromisoformat(updated.started_at.replace("Z", "+00:00"))
+    assert parsed.tzinfo is not None
+
+
+def test_apply_status_reading_fallback_never_clobbers_existing_started_at(conn):
+    book = models.create_book(conn, title="Dune", author="Frank Herbert")
+    user = models.get_or_create_user(conn, "alice")
+    entry = models.add_tbr_entry(conn, user.id, book.id, status="wanted")
+    models.set_tbr_entry_started_at(conn, entry.id, "2026-01-01T00:00:00+00:00", manual=True)
+
+    library_check._apply_status(conn, entry.id, "wanted", "2026-01-01T00:00:00+00:00", "reading", {})
+
+    updated = models.get_tbr_entry(conn, entry.id)
+    assert updated.started_at == "2026-01-01T00:00:00+00:00"
+
+
 # --- sync_user_reading_status ---
 
 
@@ -587,6 +679,396 @@ def test_sync_updates_matched_entry_to_finished_with_grimmory_date(conn, monkeyp
     entry = models.list_tbr_entries_with_books(conn, user.id)[0]
     assert entry.status == "finished"
     assert entry.finished_at == "2026-03-01T00:00:00Z"
+
+
+def test_sync_captures_audiobook_progress_percent(conn, monkeypatch):
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
+    models.add_tbr_entry(conn, user.id, book.id)
+    grimmory_book = _grimmory_book(read_status="READING")
+    grimmory_book["audiobookProgress"] = {"percentage": 42.5}
+    _fake_books_client([grimmory_book], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entry = models.list_tbr_entries_with_books(conn, user.id)[0]
+    assert entry.audiobook_progress_percent == 42.5
+
+
+def test_sync_captures_book_format_from_primary_file(conn, monkeypatch):
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
+    models.add_tbr_entry(conn, user.id, book.id)
+    grimmory_book = _grimmory_book(read_status="READING")
+    grimmory_book["primaryFile"] = {"bookType": "EPUB"}
+    _fake_books_client([grimmory_book], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entry = models.list_tbr_entries_with_books(conn, user.id)[0]
+    assert entry.book.format == "EPUB"
+
+
+def test_sync_excludes_audiobook_from_new_entries(conn, monkeypatch):
+    # Audiobook support is switched off (library_check.AUDIOBOOKS_ENABLED) - a Grimmory book whose
+    # primaryFile is an audiobook must never be picked up as a new TBR entry.
+    user = models.get_or_create_user(conn, "alice")
+    grimmory_book = _grimmory_book(read_status="READING")
+    grimmory_book["primaryFile"] = {"bookType": "AUDIOBOOK"}
+    _fake_books_client([grimmory_book], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    assert models.list_tbr_entries_with_books(conn, user.id) == []
+
+
+def test_sync_removes_already_tracked_audiobook_entry(conn, monkeypatch):
+    # A book tracked before audiobook support was switched off must be dropped on the next sync
+    # rather than left stale.
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
+    models.set_book_format(conn, book.id, "AUDIOBOOK")
+    models.add_tbr_entry(conn, user.id, book.id)
+    _fake_books_client([], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    assert models.list_tbr_entries_with_books(conn, user.id) == []
+
+
+# --- find_catalog_match: audiobooks are never a valid match target ---
+
+
+def test_find_catalog_match_skips_audiobook_entries():
+    catalog = [
+        models.LibraryCatalogEntry(
+            title="Dune", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+            grimmory_id=1, format="AUDIOBOOK",
+        ),
+    ]
+    assert library_check.find_catalog_match("Dune", None, "Frank Herbert", catalog) is None
+
+
+def test_find_catalog_match_falls_back_to_non_audiobook_match():
+    catalog = [
+        models.LibraryCatalogEntry(
+            title="Dune", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+            grimmory_id=1, format="AUDIOBOOK",
+        ),
+        models.LibraryCatalogEntry(
+            title="Dune", isbn13=None, isbn10=None, authors=["Frank Herbert"],
+            grimmory_id=2, format="EPUB",
+        ),
+    ]
+    match = library_check.find_catalog_match("Dune", None, "Frank Herbert", catalog)
+    assert match is not None
+    assert match.grimmory_id == 2
+
+
+# --- sync_user_reading_status: paired audiobook status merges onto its ebook ---
+
+
+def test_sync_paired_audiobook_creates_ebook_entry_when_none_exists(conn, monkeypatch):
+    monkeypatch.setattr(library_check, "_maybe_download_cover", lambda *a, **k: None)
+    user = models.get_or_create_user(conn, "alice")
+    ebook = _grimmory_book(title="Dune", read_status="UNREAD")
+    ebook["id"] = 1
+    ebook["primaryFile"] = {"bookType": "EPUB"}
+    audiobook = _grimmory_book(title="Dune (Audiobook)", read_status="READING")
+    audiobook["id"] = 2
+    audiobook["primaryFile"] = {"bookType": "AUDIOBOOK"}
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=2, ebook_grimmory_id=1)
+    _fake_books_client([ebook, audiobook], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entries = models.list_tbr_entries_with_books(conn, user.id)
+    assert len(entries) == 1
+    assert entries[0].book.title == "Dune"
+    assert entries[0].status == "reading"
+
+
+def test_sync_paired_audiobook_captures_its_own_progress_percent_on_new_entry(conn, monkeypatch):
+    monkeypatch.setattr(library_check, "_maybe_download_cover", lambda *a, **k: None)
+    user = models.get_or_create_user(conn, "alice")
+    ebook = _grimmory_book(title="Dune", read_status="UNREAD")
+    ebook["id"] = 1
+    ebook["primaryFile"] = {"bookType": "EPUB"}
+    audiobook = _grimmory_book(title="Dune (Audiobook)", read_status="READING")
+    audiobook["id"] = 2
+    audiobook["primaryFile"] = {"bookType": "AUDIOBOOK"}
+    audiobook["audiobookProgress"] = {"percentage": 42.5}
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=2, ebook_grimmory_id=1)
+    _fake_books_client([ebook, audiobook], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entries = models.list_tbr_entries_with_books(conn, user.id)
+    assert entries[0].audiobook_progress_percent == 42.5
+
+
+def test_sync_paired_audiobook_updates_progress_percent_on_existing_entry(conn, monkeypatch):
+    monkeypatch.setattr(library_check, "_maybe_download_cover", lambda *a, **k: None)
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
+    models.set_book_grimmory_id(conn, book.id, 1)
+    entry = models.add_tbr_entry(conn, user.id, book.id)
+    models.set_tbr_entry_status(conn, entry.id, "reading")
+    ebook = _grimmory_book(title="Dune", read_status="UNREAD")
+    ebook["id"] = 1
+    ebook["primaryFile"] = {"bookType": "EPUB"}
+    audiobook = _grimmory_book(title="Dune (Audiobook)", read_status="READING")
+    audiobook["id"] = 2
+    audiobook["primaryFile"] = {"bookType": "AUDIOBOOK"}
+    audiobook["audiobookProgress"] = {"percentage": 77.0}
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=2, ebook_grimmory_id=1)
+    _fake_books_client([ebook, audiobook], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entries = models.list_tbr_entries_with_books(conn, user.id)
+    assert entries[0].audiobook_progress_percent == 77.0
+
+
+def test_sync_paired_audiobook_upgrades_existing_wanted_entry_to_finished(conn, monkeypatch):
+    monkeypatch.setattr(library_check, "_maybe_download_cover", lambda *a, **k: None)
+    # The paired-edition write-back has its own dedicated tests below; stub it out here so this
+    # test only exercises the status-sync mechanic.
+    monkeypatch.setattr(library_check, "_push_paired_edition_finished", lambda *a, **k: None)
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
+    models.set_book_grimmory_id(conn, book.id, 1)
+    models.add_tbr_entry(conn, user.id, book.id)  # starts "wanted"
+    ebook = _grimmory_book(title="Dune", read_status="UNREAD")
+    ebook["id"] = 1
+    ebook["primaryFile"] = {"bookType": "EPUB"}
+    audiobook = _grimmory_book(
+        title="Dune (Audiobook)", read_status="READ", date_finished="2026-03-01T00:00:00Z"
+    )
+    audiobook["id"] = 2
+    audiobook["primaryFile"] = {"bookType": "AUDIOBOOK"}
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=2, ebook_grimmory_id=1)
+    _fake_books_client([ebook, audiobook], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entry = models.list_tbr_entries_with_books(conn, user.id)[0]
+    assert entry.status == "finished"
+    assert entry.finished_at == "2026-03-01T00:00:00Z"
+
+
+def test_sync_paired_audiobook_does_not_downgrade_finished_entry(conn, monkeypatch):
+    monkeypatch.setattr(library_check, "_maybe_download_cover", lambda *a, **k: None)
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
+    models.set_book_grimmory_id(conn, book.id, 1)
+    entry = models.add_tbr_entry(conn, user.id, book.id)
+    models.set_tbr_entry_status(conn, entry.id, "finished", "2026-01-01T00:00:00Z")
+    ebook = _grimmory_book(title="Dune", read_status="UNREAD")
+    ebook["id"] = 1
+    ebook["primaryFile"] = {"bookType": "EPUB"}
+    audiobook = _grimmory_book(title="Dune (Audiobook)", read_status="READING")
+    audiobook["id"] = 2
+    audiobook["primaryFile"] = {"bookType": "AUDIOBOOK"}
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=2, ebook_grimmory_id=1)
+    _fake_books_client([ebook, audiobook], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entry_after = models.list_tbr_entries_with_books(conn, user.id)[0]
+    assert entry_after.status == "finished"
+    assert entry_after.finished_at == "2026-01-01T00:00:00Z"
+
+
+def test_sync_paired_audiobook_tie_keeps_ebooks_own_finished_at(conn, monkeypatch):
+    monkeypatch.setattr(library_check, "_maybe_download_cover", lambda *a, **k: None)
+    # Ebook and audiobook both READ, with different dateFinished values - the ebook's own data,
+    # applied first, must win; the audiobook's later call is a no-op since the entry is already
+    # "finished".
+    monkeypatch.setattr(library_check, "_push_paired_edition_finished", lambda *a, **k: None)
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
+    models.set_book_grimmory_id(conn, book.id, 1)
+    models.add_tbr_entry(conn, user.id, book.id)  # starts "wanted"
+    ebook = _grimmory_book(title="Dune", read_status="READ", date_finished="2026-01-01T00:00:00Z")
+    ebook["id"] = 1
+    ebook["primaryFile"] = {"bookType": "EPUB"}
+    audiobook = _grimmory_book(
+        title="Dune (Audiobook)", read_status="READ", date_finished="2026-05-01T00:00:00Z"
+    )
+    audiobook["id"] = 2
+    audiobook["primaryFile"] = {"bookType": "AUDIOBOOK"}
+    models.set_audiobook_pairing(conn, audiobook_grimmory_id=2, ebook_grimmory_id=1)
+    _fake_books_client([ebook, audiobook], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entry = models.list_tbr_entries_with_books(conn, user.id)[0]
+    assert entry.status == "finished"
+    assert entry.finished_at == "2026-01-01T00:00:00Z"
+
+
+class FullSyncFakeClient:
+    """Routes every GET Pass 1/2 + the paired-edition write-back can make during one sync:
+    the user's book list, a single-book fetch (for bookFileId), and paginated reading sessions."""
+
+    def __init__(self, books_payload, book_payloads_by_id, sessions_by_id):
+        self._books_payload = books_payload
+        self._book_payloads_by_id = book_payloads_by_id
+        self._sessions_by_id = sessions_by_id
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def get(self, path, params=None, headers=None):
+        if path == library_check.BOOKS_PATH:
+            return FakeResponse(self._books_payload)
+        if params is not None:  # paginated reading-sessions endpoint
+            book_id = int(path.rsplit("/", 1)[-1])
+            sessions = self._sessions_by_id.get(book_id, [])
+            return FakeResponse({"content": sessions, "page": {"totalPages": 1}})
+        book_id = int(path.rsplit("/", 1)[-1])  # single-book endpoint
+        return FakeResponse(self._book_payloads_by_id[book_id])
+
+
+def test_sync_ebook_finishing_pushes_paired_audiobook_to_100_percent(conn, monkeypatch):
+    # End-to-end: ebook transitions to "finished" in Pass 1 -> _push_paired_edition_finished
+    # fires for its paired audiobook (app.models.linked_editions), which the ebook<->audiobook
+    # direction reads instead of the deprecated audiobook_pairings dict.
+    monkeypatch.setattr(library_check, "_maybe_download_cover", lambda *a, **k: None)
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
+    models.set_book_grimmory_id(conn, book.id, 1)
+    models.add_tbr_entry(conn, user.id, book.id)  # starts "wanted"
+    models.set_linked_edition(conn, edition_grimmory_id=2, ebook_grimmory_id=1, format="AUDIOBOOK")
+
+    ebook = _grimmory_book(title="Dune", read_status="READ", date_finished="2026-01-01T00:00:00Z")
+    ebook["id"] = 1
+    ebook["primaryFile"] = {"bookType": "EPUB"}
+
+    fake_client = FullSyncFakeClient(
+        books_payload=[ebook],
+        book_payloads_by_id={2: {"id": 2, "primaryFile": {"id": 99}}},
+        sessions_by_id={2: [{"id": 501, "startTime": "2026-01-01T00:00:00Z"}]},
+    )
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+    posted = []
+    monkeypatch.setattr(
+        library_check.httpx, "post",
+        lambda url, json, headers, timeout: posted.append(json) or FakeResponse({}),
+    )
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entry = models.list_tbr_entries_with_books(conn, user.id)[0]
+    assert entry.status == "finished"
+    assert posted == [{"bookId": 2, "fileProgress": {"bookFileId": 99, "progressPercent": 100.0}}]
+    assert len(models.list_cached_reading_sessions(conn, entry.id, "AUDIOBOOK")) == 1
+
+
+def test_sync_unpaired_audiobook_reading_has_no_effect(conn, monkeypatch):
+    user = models.get_or_create_user(conn, "alice")
+    ebook = _grimmory_book(title="Dune", read_status="UNREAD")
+    ebook["id"] = 1
+    ebook["primaryFile"] = {"bookType": "EPUB"}
+    audiobook = _grimmory_book(title="Dune (Audiobook)", read_status="READING")
+    audiobook["id"] = 2
+    audiobook["primaryFile"] = {"bookType": "AUDIOBOOK"}
+    # No models.set_audiobook_pairing call - audiobook stays unpaired.
+    _fake_books_client([ebook, audiobook], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    assert models.list_tbr_entries_with_books(conn, user.id) == []
+
+
+def test_sync_leaves_audiobook_progress_percent_none_for_non_audiobooks(conn, monkeypatch):
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert", isbn="9780441172719")
+    models.add_tbr_entry(conn, user.id, book.id)
+    _fake_books_client([_grimmory_book(read_status="READING")], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entry = models.list_tbr_entries_with_books(conn, user.id)[0]
+    assert entry.audiobook_progress_percent is None
+
+
+def test_sync_matches_by_grimmory_book_id_despite_drifted_metadata(conn, monkeypatch):
+    # Regression test for GitHub issue #22: Pass 1's fuzzy title/isbn/author match could silently
+    # fail once Grimmory's metadata drifted, so Pass 2 treated an already-known book as new and
+    # duplicated it. A book with a known grimmory_book_id must be matched by that id directly.
+    user = models.get_or_create_user(conn, "alice")
+    # Local cover already set so Pass 1 doesn't attempt a cover download - not the point of this
+    # test (see test_shelf_sync_unassigns_book_that_transitions_off_wanted_this_sync for that path).
+    book = models.create_book(
+        conn,
+        title="Dungeon Crawler Carl",
+        author="Matt Dinniman",
+        isbn="9780000000001",
+        cover_url="/covers/existing.jpg",
+    )
+    models.set_book_grimmory_id(conn, book.id, 400)
+    models.add_tbr_entry(conn, user.id, book.id)  # starts "wanted"
+    # Not the point of this test — without the grimmory_book_id-first fix, Pass 2 would otherwise
+    # attempt a real cover download for the wrongly-created duplicate book, which isn't mocked here.
+    monkeypatch.setattr(library_check, "_maybe_download_cover", lambda *a, **k: None)
+
+    # Grimmory's response for the same book id now has a different isbn and an added author -
+    # different enough that fuzzy title+author matching alone would miss it (author_score for
+    # "Matt Dinniman" vs "Matt Dinniman, Will Staehle" falls below AUTHOR_MATCH_THRESHOLD).
+    _fake_books_client(
+        [
+            {
+                "id": 400,
+                "metadata": {
+                    "title": "Dungeon Crawler Carl",
+                    "isbn13": "9780000000002",
+                    "authors": ["Matt Dinniman", "Will Staehle"],
+                },
+                "readStatus": "READING",
+            }
+        ],
+        monkeypatch,
+    )
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entries = models.list_tbr_entries_with_books(conn, user.id)
+    assert len(entries) == 1
+    assert entries[0].status == "reading"
+    assert entries[0].book.id == book.id
+
+
+def test_sync_dedupes_grimmory_response_containing_the_same_book_id_twice(conn, monkeypatch):
+    # Regression test: Grimmory's GET /api/v1/books has been observed to repeat the same book id
+    # within one response; books_by_grimmory_id.setdefault only records the first occurrence, so
+    # the repeat looked unmatched and got duplicated. The fetched list must be deduped by
+    # grimmory id before matching runs.
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(
+        conn, title="Dungeon Crawler Carl", author="Matt Dinniman", cover_url="/covers/existing.jpg"
+    )
+    models.set_book_grimmory_id(conn, book.id, 400)
+    models.add_tbr_entry(conn, user.id, book.id)  # starts "wanted"
+    monkeypatch.setattr(library_check, "_maybe_download_cover", lambda *a, **k: None)
+
+    grimmory_book = {
+        "id": 400,
+        "metadata": {"title": "Dungeon Crawler Carl", "authors": ["Matt Dinniman"]},
+        "readStatus": "READING",
+    }
+    _fake_books_client([grimmory_book, dict(grimmory_book)], monkeypatch)
+
+    library_check.sync_user_reading_status(conn, user.id, "https://grimmory.example.com", "token")
+
+    entries = models.list_tbr_entries_with_books(conn, user.id)
+    assert len(entries) == 1
+    assert entries[0].status == "reading"
+    assert entries[0].book.id == book.id
 
 
 def test_sync_never_downgrades_finished_entry(conn, monkeypatch):
@@ -891,11 +1373,10 @@ def test_sync_skips_cover_download_when_local_cover_already_downloaded(conn, cov
 
 
 class PaginatedFakeClient:
-    """Fakes Grimmory's actual (nested) Page response shape — {"content": [...], "page":
-    {"totalPages": N, ...}} — confirmed against a real response 2026-07-29 after the flat-shape
-    assumption this fake originally used turned out to be wrong and let a real pagination bug
-    (truncating a 118-session book to 100) pass unit tests undetected. Returns a different page of
-    content depending on the requested `page` param."""
+    """Fakes Grimmory's actual nested Page response shape ({"content": [...], "page":
+    {"totalPages": N, ...}}) - a flat-shape assumption here previously let a real pagination bug
+    (truncating a 118-session book to 100) pass undetected. Returns a different page of content
+    per requested `page` param."""
 
     def __init__(self, pages: list[list[dict]]):
         self._pages = pages
@@ -977,6 +1458,165 @@ def test_fetch_reading_sessions_for_book_raises_on_http_failure(monkeypatch):
         library_check.fetch_reading_sessions_for_book("https://grimmory.example.com", "token", 42)
 
 
+# --- get_or_fetch_reading_sessions ---
+
+
+def _entry(conn):
+    user = models.get_or_create_user(conn, "alice")
+    book = models.create_book(conn, title="Dune", author="Frank Herbert")
+    return models.add_tbr_entry(conn, user.id, book.id)
+
+
+def test_get_or_fetch_reading_sessions_uses_cache_without_calling_grimmory_when_finished(conn, monkeypatch):
+    entry = _entry(conn)
+    models.add_cached_reading_sessions(
+        conn, entry.id, "EBOOK", [{"id": 1, "startTime": "2026-01-01T00:00:00Z"}]
+    )
+
+    def _boom(*a, **k):
+        raise AssertionError("must not call Grimmory when the cache is already warm")
+
+    monkeypatch.setattr(library_check, "fetch_reading_sessions_for_book", _boom)
+
+    sessions = library_check.get_or_fetch_reading_sessions(
+        conn, entry.id, "finished", "EBOOK", "https://grimmory.example.com", "token", 42
+    )
+    assert len(sessions) == 1
+    assert sessions[0]["startTime"] == "2026-01-01T00:00:00Z"
+
+
+def test_get_or_fetch_reading_sessions_backfills_once_when_finished_but_cache_empty(conn, monkeypatch):
+    entry = _entry(conn)
+    fake_client = PaginatedFakeClient([[{"id": 1, "startTime": "2026-01-01T00:00:00Z"}]])
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+
+    sessions = library_check.get_or_fetch_reading_sessions(
+        conn, entry.id, "finished", "EBOOK", "https://grimmory.example.com", "token", 42
+    )
+    assert len(sessions) == 1
+    assert len(fake_client.get_calls) == 1  # the one-time backfill
+
+    # Second read must come from the now-warm cache, no further Grimmory call.
+    monkeypatch.setattr(
+        library_check, "fetch_reading_sessions_for_book",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("cache should be warm now")),
+    )
+    again = library_check.get_or_fetch_reading_sessions(
+        conn, entry.id, "finished", "EBOOK", "https://grimmory.example.com", "token", 42
+    )
+    assert len(again) == 1
+
+
+def test_get_or_fetch_reading_sessions_always_live_fetches_and_upserts_when_reading(conn, monkeypatch):
+    entry = _entry(conn)
+    fake_client = PaginatedFakeClient([[{"id": 1, "startTime": "2026-01-01T00:00:00Z"}]])
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+
+    library_check.get_or_fetch_reading_sessions(
+        conn, entry.id, "reading", "EBOOK", "https://grimmory.example.com", "token", 42
+    )
+    library_check.get_or_fetch_reading_sessions(
+        conn, entry.id, "reading", "EBOOK", "https://grimmory.example.com", "token", 42
+    )
+
+    assert len(fake_client.get_calls) == 2  # live every time, not just the first
+    assert len(models.list_cached_reading_sessions(conn, entry.id, "EBOOK")) == 1  # deduped
+
+
+# --- fetch_book ---
+
+
+def test_fetch_book_returns_payload(monkeypatch):
+    class BookFakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, path, headers=None):
+            assert path == "/api/v1/books/42"
+            return FakeResponse({"id": 42, "primaryFile": {"id": 99}})
+
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: BookFakeClient())
+
+    book = library_check.fetch_book("https://grimmory.example.com", "token", 42)
+    assert book["primaryFile"]["id"] == 99
+
+
+# --- _push_paired_edition_finished ---
+
+
+class BookAndSessionsFakeClient:
+    """Routes GET by path prefix - the single-book fetch vs. the paginated sessions fetch."""
+
+    def __init__(self, book_payload, session_pages):
+        self._book_payload = book_payload
+        self._session_pages = session_pages
+        self.get_calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def get(self, path, params=None, headers=None):
+        self.get_calls.append({"path": path, "params": params})
+        if params is not None:  # the paginated reading-sessions endpoint
+            page_num = params["page"]
+            return FakeResponse(
+                {"content": self._session_pages[page_num], "page": {"totalPages": len(self._session_pages)}}
+            )
+        return FakeResponse(self._book_payload)
+
+
+def test_push_paired_edition_finished_pushes_progress_and_caches_sessions(conn, monkeypatch):
+    entry = _entry(conn)
+    fake_client = BookAndSessionsFakeClient(
+        book_payload={"id": 42, "primaryFile": {"id": 99}},
+        session_pages=[[{"id": 1, "startTime": "2026-01-01T00:00:00Z"}]],
+    )
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
+    posted = []
+    monkeypatch.setattr(
+        library_check.httpx, "post",
+        lambda url, json, headers, timeout: posted.append({"url": url, "json": json}) or FakeResponse({}),
+    )
+
+    library_check._push_paired_edition_finished(
+        conn, "https://grimmory.example.com", "token", entry.id, 42, "AUDIOBOOK"
+    )
+
+    assert len(posted) == 1
+    assert posted[0]["json"] == {
+        "bookId": 42,
+        "fileProgress": {"bookFileId": 99, "progressPercent": 100.0},
+    }
+    assert len(models.list_cached_reading_sessions(conn, entry.id, "AUDIOBOOK")) == 1
+
+
+def test_push_paired_edition_finished_is_best_effort_on_failure(conn, monkeypatch):
+    entry = _entry(conn)
+
+    class FailingClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, path, params=None, headers=None):
+            return FakeResponse({}, status_code=500)
+
+    monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: FailingClient())
+
+    # Must not raise - callers (sync_user_reading_status) rely on this being swallowed.
+    library_check._push_paired_edition_finished(
+        conn, "https://grimmory.example.com", "token", entry.id, 42, "AUDIOBOOK"
+    )
+
+
 # --- list_own_shelves / get_or_create_shelf_by_name / fetch_shelf_books / assign_book_shelves ---
 
 SHELF_BASE_URL = "https://grimmory.example.com"
@@ -1024,11 +1664,9 @@ def test_get_or_create_shelf_by_name_returns_existing_match_without_posting(monk
 
 
 def test_get_or_create_shelf_by_name_matches_existing_shelf_case_insensitively(monkeypatch):
-    # Regression test: a shelf named "Want To Read" (differing only in case from
-    # DEFAULT_WANT_TO_READ_SHELF_NAME's "Want to Read") must still be found by the initial GET, so
-    # a differently-cased shelf a user already has doesn't get skipped and re-created. Reproduces a
-    # production case where a Python `==` name comparison and Grimmory's own case-insensitive
-    # (MariaDB collation) duplicate-name check disagreed, permanently blocking the sync.
+    # Regression test: a differently-cased shelf ("Want To Read" vs the default "Want to Read")
+    # must still be found by the initial GET - a Python `==` name comparison and Grimmory's own
+    # case-insensitive collation used to disagree here, permanently blocking the sync.
     shelves = [{"id": 1, "name": "Want To Read", "userId": 7}]
     fake_client = ShelfFakeClient(get_responses={library_check.SHELVES_PATH: shelves})
     monkeypatch.setattr(library_check.httpx, "Client", lambda *a, **k: fake_client)
@@ -1040,11 +1678,9 @@ def test_get_or_create_shelf_by_name_matches_existing_shelf_case_insensitively(m
 
 
 def test_get_or_create_shelf_by_name_adopts_differently_cased_shelf_after_409(monkeypatch):
-    # Regression test: the initial GET sees nothing yet (e.g. a stale/incomplete list), the POST
-    # 409s because Grimmory's own case-insensitive collation considers "Want To Read" a duplicate
-    # of "Want to Read", and only the 409-retry GET actually returns the differently-cased shelf -
-    # that retry must still recognize it rather than looping forever (production bug: this left
-    # want_to_read_shelf_id permanently unresolved for a user whose shelf was "Want To Read").
+    # Regression test: the initial GET sees a stale/incomplete list, the POST 409s on Grimmory's
+    # case-insensitive collation, and only the 409-retry GET returns the differently-cased shelf -
+    # that retry must still recognize it rather than looping forever.
     class RacyCasedShelfClient:
         def __init__(self):
             self.get_call_count = 0
@@ -1115,11 +1751,9 @@ def test_get_or_create_shelf_by_name_raises_when_created_shelf_has_no_id(monkeyp
 
 
 def test_get_or_create_shelf_by_name_adopts_shelf_created_by_a_concurrent_sync(monkeypatch):
-    # Regression test: the manual /api/settings/sync trigger and the periodic background loop can
-    # both reach this function for the same user around the same time (e.g. while the library
-    # catalog cross-check isn't configured, the periodic loop runs every 60s) - whichever POSTs
-    # second gets Grimmory's 409 SHELF_ALREADY_EXISTS. That must be treated as "someone else just
-    # created it" and adopted, not surfaced as a sync failure.
+    # Regression test: the manual sync trigger and the periodic background loop can both reach
+    # this function for the same user at once - whichever POSTs second gets Grimmory's 409
+    # SHELF_ALREADY_EXISTS, which must be adopted, not surfaced as a sync failure.
     class RacyShelfClient:
         def __init__(self):
             self.get_call_count = 0

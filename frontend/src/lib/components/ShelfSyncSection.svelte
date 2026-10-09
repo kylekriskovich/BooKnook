@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { api, ApiError, unwrap } from '$lib/api/client';
+	import { api, describeError, unwrap } from '$lib/api/client';
 
 	let {
 		wantToReadShelfId: initialWantToReadShelfId,
@@ -16,9 +16,7 @@
 	let loadingShelves = $state(true);
 	let shelvesError = $state<string | null>(null);
 
-	// This component is remounted whenever its parent's `data.settings` is (the settings page has
-	// no route param — see +page.svelte's own svelte-ignore for the same reasoning), so capturing
-	// only the initial value here is fine.
+	// Remounted whenever the parent's `data.settings` is, so capturing the initial value is fine.
 	// svelte-ignore state_referenced_locally
 	let wantToReadShelfId = $state(initialWantToReadShelfId);
 	// svelte-ignore state_referenced_locally
@@ -32,10 +30,6 @@
 
 	let reconnectPassword = $state('');
 	let reconnecting = $state(false);
-
-	function describeError(err: unknown): string {
-		return err instanceof ApiError ? err.message : 'Could not reach the server — try again.';
-	}
 
 	async function loadShelves() {
 		loadingShelves = true;

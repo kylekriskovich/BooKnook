@@ -1,7 +1,5 @@
 // Spine/cover placeholder background gradients, keyed by book id % length — shared across every
-// shelf view so a given book always gets the same color. Mirrors app/main.py's
-// templates.env.globals["palette"] (same 7 values, same ordering) — keep the two in sync if this
-// ever changes, until app/templates/ is deleted in the Phase C cutover.
+// shelf view so a given book always gets the same color.
 export const PALETTE = [
 	'linear-gradient(160deg,#2b4570,#16233a)',
 	'linear-gradient(160deg,#7a2e2e,#3f1414)',
