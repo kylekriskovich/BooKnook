@@ -1,7 +1,16 @@
 <script lang="ts">
 	import { api } from '$lib/api/client';
 	import { auth } from '$lib/stores/auth.svelte';
-	import { goto } from '$app/navigation';
+	import { afterNavigate, goto } from '$app/navigation';
+
+	let sheet: HTMLDivElement;
+
+	// The rows below are <a href> links that SvelteKit intercepts for client-side navigation, so
+	// the browser never unloads the page and the native popover's light-dismiss never fires. Force
+	// it closed on every navigation instead (a no-op if it's already closed).
+	afterNavigate(() => {
+		sheet?.hidePopover();
+	});
 
 	async function logout() {
 		await api.POST('/api/logout');
@@ -10,7 +19,7 @@
 	}
 </script>
 
-<div id="account-sheet" popover class="sheet">
+<div id="account-sheet" popover class="sheet" bind:this={sheet}>
 	<div class="sheet-handle"></div>
 	<div class="sheet-title">ACCOUNT</div>
 	<div class="settings-list">
